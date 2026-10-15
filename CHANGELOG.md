@@ -10,7 +10,15 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **LibTrueHD can be left out.** The object-audio decoder library is now behind a package trait,
+  `TrueHDObjectAudio`, on by default, so a host that does nothing keeps today's build. A host that
+  cannot ship it turns the trait off (`.package(url:..., traits: [])`, or the package's traits in
+  Xcode): the library is neither linked nor resolved, and TrueHD Atmos keeps the channel bridge
+  whatever `objectAudioRendering` asks, with the reason in the session log. The manifest moves to
+  swift-tools-version 6.1, which traits need. CI also builds with the trait off. See README › Package
+  traits.
 
 ## [7.35.1] - 2026-10-12
 

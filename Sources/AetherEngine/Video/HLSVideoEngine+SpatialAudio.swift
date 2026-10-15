@@ -81,7 +81,16 @@ extension HLSVideoEngine {
 
         let bridge: SpatialAudioBridge
         do {
-            let decoder = try TrueHDObjectAudioDecoder()
+            let decoder: ObjectAudioDecoding
+            #if TrueHDObjectAudio
+            decoder = try TrueHDObjectAudioDecoder()
+            #else
+            EngineLog.emit(
+                "[HLSVideoEngine] built without the TrueHDObjectAudio trait (no LibTrueHD); keeping the channel bridge",
+                category: .session
+            )
+            return nil
+            #endif
             bridge = try SpatialAudioBridge(
                 srcTimeBase: audioStream.pointee.time_base, layout: layout, decoder: decoder)
         } catch {

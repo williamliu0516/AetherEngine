@@ -1,4 +1,4 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.1
 
 import PackageDescription
 
@@ -24,6 +24,17 @@ let package = Package(
         // exposing it would force SPM consumers to compile it on those
         // platforms. The target is preserved below so `swift build` on
         // macOS still produces the CLI for upstream development.
+    ],
+    // The object-audio decoder library sits behind a trait, on by default. A host that cannot ship it
+    // turns the trait off (`.package(url:..., traits: [])`, or the package's traits in Xcode): the library
+    // is then not linked, and TrueHD Atmos keeps the channel bridge whatever `objectAudioRendering` asks.
+    // LibDovi, FFmpeg and everything else are unaffected.
+    traits: [
+        .trait(
+            name: "TrueHDObjectAudio",
+            description: "Link LibTrueHD, so objectAudioRendering can render TrueHD Atmos objects to APAC."
+        ),
+        .default(enabledTraits: ["TrueHDObjectAudio"]),
     ],
     dependencies: [
         // Minimal FFmpeg build (avcodec, avformat, avutil, swresample only).
@@ -63,7 +74,7 @@ let package = Package(
             dependencies: [
                 .product(name: "AetherFFmpegBuild", package: "FFmpegBuild"),
                 .product(name: "Dovi", package: "LibDovi"),
-                .product(name: "TrueHD", package: "LibTrueHD"),
+                .product(name: "TrueHD", package: "LibTrueHD", condition: .when(traits: ["TrueHDObjectAudio"])),
             ],
             linkerSettings: [
                 .linkedFramework("AVFoundation"),
