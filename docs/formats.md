@@ -4,7 +4,7 @@ Depth behind the README's "What it handles" matrix: codec routing, HDR signaling
 
 ## Containers and codecs
 
-**Containers (demux side):** MKV, MP4, WebM, MPEG-TS, MPEG-PS (DVD VOB), AVI, OGG, FLV.
+**Containers (demux side):** MKV, MP4, WebM, MPEG-TS, MPEG-PS (DVD VOB), AVI, OGG, FLV, ASF, RealMedia (.rm / .rmvb), 3GP; VobSub (.idx + .sub) as an external subtitle.
 
 That list is the supported set, not the compiled set. The FFmpeg build also carries the HLS and DASH demuxers, and neither is a supported source shape: the build ships no network protocols (`file`, `pipe` and `data` only, since bytes come from the engine's own `AVIOReader` over `URLSession`), so libavformat cannot fetch what a manifest points at. Remote HLS is handled a level up instead, by AVPlayer on the bypass or by the live ingest; a remote DASH manifest has no such path and is not playable.
 
