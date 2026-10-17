@@ -31,6 +31,14 @@ the public-API contract.
 
 ### Fixed
 
+- **HDR10+ reaches the display on the software path.** The VideoToolbox decoder there never read the
+  ST 2094-40 SEI, so a PQ HEVC title played as plain HDR10 and `videoFormat` stayed `.hdr10`; it now
+  reports `.hdr10Plus` on the first message and hands each frame its payload as
+  `kCMSampleAttachmentKey_HDR10PlusPerFrameData`. The libavcodec decoder attached one per frame already,
+  but from `av_dynamic_hdr_plus_to_t35`, which leaves out the six T.35 header bytes the attachment must
+  start with (`0xB5 0x00 0x3C 0x00 0x01 0x04`); they are put back. The loopback path needed nothing:
+  the SEI is in every served fragment from MKV, MP4 and MPEG-TS sources, and AVPlayer's decoded buffers
+  carry the per-frame metadata (measured on macOS 27 with a two-scene fixture).
 - **A seek that misses the software path's packet cache no longer ends playback at its landing.**
   The miss empties the read-ahead store while holding the store's operation lock, and a demux-loop
   read that began inside the seek's window could leave its wait at once (its reader was not current
