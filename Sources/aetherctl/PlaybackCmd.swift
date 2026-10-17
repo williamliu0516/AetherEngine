@@ -69,6 +69,7 @@ enum LoadOptionChange {
     case decodePath(DecodePath)
     case dolbyVisionHandling(DolbyVisionHandling)
     case preferDualLayerDolbyVision(Bool)
+    case dialogueBoost(Bool)
     case isLive(Bool)
     case autoplay(Bool)
 
@@ -80,6 +81,7 @@ enum LoadOptionChange {
         case .decodePath(let path): return "preferredDecodePath=\(path.rawValue)"
         case .dolbyVisionHandling(let handling): return "dolbyVisionHandling=\(handling.rawValue)"
         case .preferDualLayerDolbyVision(let flag): return "preferDualLayerDolbyVision=\(flag)"
+        case .dialogueBoost(let flag): return "dialogueBoost=\(flag)"
         case .isLive(let value): return "isLive=\(value)"
         case .autoplay(let value): return "autoplay=\(value)"
         }
@@ -93,6 +95,7 @@ enum LoadOptionChange {
         case .decodePath(let path): options.preferredDecodePath = path
         case .dolbyVisionHandling(let handling): options.dolbyVisionHandling = handling
         case .preferDualLayerDolbyVision(let flag): options.preferDualLayerDolbyVision = flag
+        case .dialogueBoost(let flag): options.dialogueBoost = flag
         case .isLive(let value): options.isLive = value
         case .autoplay(let value): options.autoplay = value
         }

@@ -51,6 +51,11 @@ final class AudioDecoder: @unchecked Sendable {
     private(set) var sampleRate: Int32 = 0
     private(set) var channels: Int32 = 0
 
+    /// `LoadOptions.dialogueBoost`, set before `open`: the output is two channels, folded with the centre
+    /// raised and processed by `DialogueBoostProcessor`.
+    var dialogueBoost = false
+    private var boost: DialogueBoostProcessor?
+
     func open(stream: UnsafeMutablePointer<AVStream>) throws {
         guard let codecpar = stream.pointee.codecpar else {
             throw AudioDecoderError.noCodecParameters
@@ -59,7 +64,7 @@ final class AudioDecoder: @unchecked Sendable {
         timeBase = stream.pointee.time_base
         sampleRate = codecpar.pointee.sample_rate
         channels = codecpar.pointee.ch_layout.nb_channels
-        if channels <= 0 || channels > 8 { channels = 2 }
+        if channels <= 0 || channels > 8 || dialogueBoost { channels = 2 }
 
         guard let codec = avcodec_find_decoder(codecpar.pointee.codec_id) else {
             throw AudioDecoderError.unsupportedCodec
@@ -146,6 +151,11 @@ final class AudioDecoder: @unchecked Sendable {
         if frame.pointee.sample_rate > 0 { sampleRate = frame.pointee.sample_rate }
         let frameChannels = frame.pointee.ch_layout.nb_channels
         if frameChannels > 0 && frameChannels <= 8 { channels = frameChannels }
+        if dialogueBoost {
+            channels = 2
+            boost = DialogueBoostProcessor(
+                sampleRate: Int(sampleRate > 0 ? sampleRate : 48_000), stereoSource: frameChannels <= 2)
+        }
 
         var outLayout = AVChannelLayout()
         // #401: this is the order the stamped layout has to name, so both come from one place.
@@ -179,8 +189,9 @@ final class AudioDecoder: @unchecked Sendable {
             0,
             nil
         )
-        guard ret >= 0, swrContext != nil else { return false }
-        guard swr_init(swrContext) >= 0 else {
+        guard ret >= 0, let swr = swrContext else { return false }
+        if dialogueBoost { DialogueBoostProcessor.applyFold(to: swr) }
+        guard swr_init(swr) >= 0 else {
             swr_free(&swrContext)
             return false
         }
@@ -211,6 +222,7 @@ final class AudioDecoder: @unchecked Sendable {
         resetPending()
         // Re-anchor the gapless clock to the post-seek PTS on the next emitted buffer.
         clock.reset()
+        boost?.reset()
         #if DEBUG
         _loggedZeroConvert = false
         #endif
@@ -352,6 +364,11 @@ final class AudioDecoder: @unchecked Sendable {
         }
         #endif
         guard convertedSamples > 0 else { return }
+        if let boost, channels == 2 {
+            boost.process(
+                interleavedFloat: UnsafeMutableRawPointer(tempBuffer).assumingMemoryBound(to: Float.self),
+                frameCount: Int(convertedSamples))
+        }
 
         // First frame in a new accumulator captures the PTS; subsequent frames only extend the buffer.
         if pendingSampleCount == 0 {

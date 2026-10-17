@@ -274,7 +274,7 @@ extension HLSVideoEngine {
                     )
                 }
             }
-        } else if preferBridge && sourceIsAtmos {
+        } else if preferBridge && sourceIsAtmos && !dialogueBoost {
             // EAC3+JOC always stream-copies; a pre-bridge decision is a codec-table bug.
             EngineLog.emit(
                 "[HLSVideoEngine] WARNING: Atmos source pre-routed to FLAC bridge without stream-copy attempt, Atmos lost. Investigate the codec compatibility table.",
@@ -284,7 +284,7 @@ extension HLSVideoEngine {
 
         // #731: TrueHD Atmos or DTS:X with object rendering requested. Tried before the channel bridges,
         // which it falls back to on any failure (see buildSpatialAudioProducerIfEligible).
-        if !forcedDrop, let audioStream = sourceAudioStream, sourceAudioStreamIndex >= 0,
+        if !forcedDrop, !dialogueBoost, let audioStream = sourceAudioStream, sourceAudioStreamIndex >= 0,
            let prod = buildSpatialAudioProducerIfEligible(
                audioStream: audioStream,
                audioDemuxer: audioDemuxer,
@@ -304,7 +304,7 @@ extension HLSVideoEngine {
             // is pointless, so it stops immediately.
             let firstAttempt = AudioBridge.bridgeEncoder(
                 for: audioBridgeMode,
-                sourceChannels: audioStream.pointee.codecpar.pointee.ch_layout.nb_channels)
+                sourceChannels: dialogueBoost ? 2 : audioStream.pointee.codecpar.pointee.ch_layout.nb_channels)
             let cascade = Self.bridgeEncoderCascade(firstAttempt: firstAttempt)
             attempts: for (attemptIndex, encoderAttempt) in cascade.enumerated() {
                 let isLastAttempt = attemptIndex == cascade.count - 1
@@ -316,7 +316,8 @@ extension HLSVideoEngine {
                         mode: audioBridgeMode,
                         // The first attempt lets the bridge resolve, so a container that under-reports its
                         // channel count still gets the decoder-resolved answer; only the retry is forced.
-                        forcedEncoder: attemptIndex == 0 ? nil : encoderAttempt
+                        forcedEncoder: attemptIndex == 0 ? nil : encoderAttempt,
+                        dialogueBoost: dialogueBoost
                     )
                 } catch AudioBridge.AudioBridgeError.encoderNotFound(let missing) where !isLastAttempt {
                     EngineLog.emit(
@@ -364,6 +365,7 @@ extension HLSVideoEngine {
                     let isEAC3Out = bridge.outputCodecID == AV_CODEC_ID_EAC3
                     let hlsCodec = isEAC3Out ? "ec-3" : "fLaC"
                     let pipelineLabel = "\(sourceCodecLabel) → \(isEAC3Out ? "EAC3" : "FLAC") bridge"
+                        + (dialogueBoost ? " (dialogue boost)" : "")
                     audioHLSCodecs = hlsCodec
                     self.audioPipelineDescription = pipelineLabel
                     self.audioDelivery = .bridged

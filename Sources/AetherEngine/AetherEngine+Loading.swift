@@ -861,6 +861,7 @@ extension AetherEngine {
             undecodableAudioStreamIndices: undecodableLiveAudioStreamIndices,
             audioBridgeMode: audioBridgeMode,
             objectAudioRendering: loadedOptions.objectAudioRendering,
+            dialogueBoost: loadedOptions.dialogueBoost,
             stereoPresentation: loadedOptions.stereoPresentation,
             isLiveSession: isLive,
             dvrWindowSeconds: dvrWindowSeconds,
@@ -1997,6 +1998,7 @@ extension AetherEngine {
         host.preferDualLayerDolbyVision = loadedOptions.preferDualLayerDolbyVision
         host.elType = elType ?? sourceElType
         host.setAudioDelay(loadedOptions.audioDelaySeconds)   // AE#464: before the decoder opens
+        host.dialogueBoost = loadedOptions.dialogueBoost
         host.deinterlaceConfig = DeinterlaceConfig(
             mode: loadedOptions.deinterlaceMode,
             fieldRate: loadedOptions.deinterlaceFieldRate

@@ -577,6 +577,17 @@ public struct LoadOptions: Sendable, Equatable {
     /// `ObjectAudioRendering`.
     public var objectAudioRendering: ObjectAudioRendering
 
+    /// Dialogue boost (night mode), default `false`. On, every audio track goes through the bridge, even one
+    /// that would stream-copy, and is folded to two channels with the centre (where a film keeps its
+    /// dialogue) raised and the surrounds lowered, given a presence lift and compressed, so speech stays
+    /// clear at low volume on a phone's speakers or headphones; explosions and music lose their punch. It
+    /// replaces Atmos, `objectAudioRendering` and surround with that stereo mix, so a host sets it only for a
+    /// route the app decodes for (built-in speakers, wired or Bluetooth headphones), never for HDMI or
+    /// AirPlay, where the source's own bitstream should reach the receiver. Changing it takes a reload
+    /// (`reloadWithOptions`). Covers the loopback path and the software path; a native remote HLS session
+    /// (`nativeRemoteHLS`) is played by AVPlayer as served and ignores it. See `DialogueBoostProcessor`.
+    public var dialogueBoost: Bool = false
+
     /// How a 3D source is presented where the system shows stereo (visionOS; elsewhere every source plays
     /// 2D as before). `.automatic` (default) keeps an MV-HEVC stream's second view and presents the frame
     /// packing a container declares; `.sideBySide` / `.overUnder` say what the file's name alone says (a

@@ -12,6 +12,17 @@ the public-API contract.
 
 ### Added
 
+- **Dialogue boost (`LoadOptions.dialogueBoost`, default off).** For a film heard on a phone's speakers
+  or headphones at low volume: every audio track goes through the bridge, even one that would
+  stream-copy, folded to two channels with the centre 9 dB over the surrounds, a +3 dB presence lift at
+  2.5 kHz and a 3:1 compressor with 14 dB make-up, then FLAC. On a 5.1 AC-3 clip with a quiet centre tone
+  and noise bursts in the other channels, against the standard fold, the tone came up 14 dB in the quiet
+  parts, the bursts went down 4 dB and the range between them narrowed from 36 to 21 dB. It replaces Atmos
+  and surround with that stereo mix, so a host sets it only for a route it decodes for, never HDMI or
+  AirPlay. Covers the loopback and software paths (not native remote HLS); changing it takes a reload.
+  About 450x real time on one M1 Max core. `aetherctl audiotap --dialogue-boost` and
+  `play --reload-applying dialogue-boost=true` drive it.
+
 - **3D on visionOS: MV-HEVC keeps its second view, and side-by-side / over-under HEVC plays as stereo.**
   An MV-HEVC stream reached AVPlayer as plain `hvc1` (movenc writes `lhvC` only for a stream marked
   `AV_DISPOSITION_MULTILAYER`, and the muxer's new stream had no disposition), so only the base view

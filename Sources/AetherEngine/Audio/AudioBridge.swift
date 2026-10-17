@@ -217,6 +217,9 @@ final class AudioBridge: @unchecked Sendable {
 
     private let srcTimeBase: AVRational
     private let mode: Mode
+    /// `LoadOptions.dialogueBoost`: a centre-weighted fold to two channels, then `DialogueBoostProcessor` on
+    /// the resampled PCM before the FIFO. Nil when the option is off.
+    private var dialogueBoost: DialogueBoostProcessor?
     private var resampledFrame: UnsafeMutablePointer<AVFrame>?
 
     /// Encoder PTS counter in encoder time base, incremented by nb_samples/frame. FLAC demands monotonically
@@ -259,7 +262,8 @@ final class AudioBridge: @unchecked Sendable {
         srcCodecpar: UnsafeMutablePointer<AVCodecParameters>,
         srcTimeBase: AVRational,
         mode: Mode = .surroundCompat,
-        forcedEncoder: AVCodecID? = nil
+        forcedEncoder: AVCodecID? = nil,
+        dialogueBoost: Bool = false
     ) throws {
         self.srcTimeBase = srcTimeBase
         self.mode = mode
@@ -348,14 +352,17 @@ final class AudioBridge: @unchecked Sendable {
         // `.surroundCompat`, FLAC VBR max 8 otherwise. bit_rate is set below once the channel count is capped
         // (EAC3 scales 128 kbps x nChannels per DrHurt on AetherEngine#4: 256 stereo, 768 5.1, and scales
         // further if the cap is bumped per Nomis101's PR 21668). FLAC = 0 (VBR).
+        // Dialogue boost plays two channels whatever the source or the mode, so it takes the two-channel
+        // encoder (FLAC), and 24 bits whatever the source: the processing works in float and makes new
+        // low-order bits that S16 would round away.
         let encoderCodecID = forcedEncoder
-            ?? Self.bridgeEncoder(for: mode, sourceChannels: resolvedChannels)
+            ?? Self.bridgeEncoder(for: mode, sourceChannels: dialogueBoost ? 2 : resolvedChannels)
         outputCodecID = encoderCodecID
         if encoderCodecID == AV_CODEC_ID_EAC3 {
             pcmSampleFmt = AV_SAMPLE_FMT_FLTP
             pcmBytesPerSample = 4
             pcmBitsPerRawSample = 32
-        } else if isLosslessSource {
+        } else if isLosslessSource || dialogueBoost {
             pcmSampleFmt = AV_SAMPLE_FMT_S32
             pcmBytesPerSample = 4
             pcmBitsPerRawSample = 24
@@ -384,7 +391,10 @@ final class AudioBridge: @unchecked Sendable {
 
         // Cap to encoder max (EAC3 5.1, FLAC 7.1). Above-cap downmix happens automatically inside swr_convert
         // when source layout exceeds the encoder's; the resampler picks Apple-compatible ordering.
-        let nChannels: Int32 = min(resolvedChannels, Self.maxEncodedChannels(for: encoderCodecID))
+        let nChannels: Int32 = dialogueBoost
+            ? 2 : min(resolvedChannels, Self.maxEncodedChannels(for: encoderCodecID))
+        self.dialogueBoost = dialogueBoost
+            ? DialogueBoostProcessor(sampleRate: Int(sampleRate), stereoSource: resolvedChannels <= 2) : nil
         let encoderName = avcodec_get_name(encoderCodecID).map { String(cString: $0) } ?? "?"
         let logBitRate: String = encoderCodecID == AV_CODEC_ID_EAC3
             ? "\(Int64(nChannels) * 128) kbps"
@@ -397,6 +407,7 @@ final class AudioBridge: @unchecked Sendable {
             + " "
             + "sourceChannels=\(resolvedChannels) "
             + "encoderChannels=\(nChannels) bitRate=\(logBitRate) "
+            + (dialogueBoost ? "dialogueBoost=on " : "")
             + "(source=\(resolvedSource), container=\(containerChannels), decoder=\(decoderChannels))",
             category: .session
         )
@@ -471,6 +482,7 @@ final class AudioBridge: @unchecked Sendable {
             cleanup()
             throw AudioBridgeError.resamplerAllocFailed(code: swrRet)
         }
+        applyDialogueBoostMix(swrCtx)
         let initRet = swr_init(swrCtx)
         guard initRet >= 0 else {
             cleanup()
@@ -703,6 +715,7 @@ final class AudioBridge: @unchecked Sendable {
         if let swr = swrCtx {
             _ = swr_init(swr)
         }
+        dialogueBoost?.reset()
         rebaseFromNextSourcePTS = true
     }
 
@@ -817,6 +830,11 @@ final class AudioBridge: @unchecked Sendable {
             "[AudioBridge] encoder rebuilt after EOF drain (producer restart into a finished session)",
             category: .session
         )
+    }
+
+    private func applyDialogueBoostMix(_ swr: OpaquePointer?) {
+        guard dialogueBoost != nil, let swr else { return }
+        DialogueBoostProcessor.applyFold(to: swr)
     }
 
     private func cleanup() {
@@ -1045,6 +1063,7 @@ final class AudioBridge: @unchecked Sendable {
             0,
             nil
         )
+        if setRet >= 0 { applyDialogueBoostMix(scratch) }
         let initRet = setRet >= 0 && scratch != nil ? swr_init(scratch) : setRet
         guard initRet >= 0 else {
             swr_free(&scratch)
@@ -1152,6 +1171,18 @@ final class AudioBridge: @unchecked Sendable {
         guard producedSamples > 0 else {
             stats.framesDroppedBeforeFIFO += 1
             return
+        }
+        if let boost = dialogueBoost, nChannels == 2 {
+            if isPlanar {
+                boost.process(
+                    left: UnsafeMutableRawPointer(buffers[0]).assumingMemoryBound(to: Float.self),
+                    right: UnsafeMutableRawPointer(buffers[1]).assumingMemoryBound(to: Float.self),
+                    frameCount: Int(producedSamples))
+            } else {
+                boost.process(
+                    interleavedS32: UnsafeMutableRawPointer(buffers[0]).assumingMemoryBound(to: Int32.self),
+                    frameCount: Int(producedSamples))
+            }
         }
 
         // av_audio_fifo_write takes void **data; the same array works for both layouts (FIFO knows the format).

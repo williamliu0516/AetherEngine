@@ -1032,6 +1032,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         undecodableAudioStreamIndices: Set<Int32> = [],
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
         objectAudioRendering: ObjectAudioRendering = .off,
+        dialogueBoost: Bool = false,
         stereoPresentation: StereoPresentation = .automatic,
         stereoOnAnySystem: Bool = false,
         isLiveSession: Bool = false,
@@ -1086,6 +1087,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.undecodableAudioStreamIndices = undecodableAudioStreamIndices
         self.audioBridgeMode = audioBridgeMode
         self.objectAudioRendering = objectAudioRendering
+        self.dialogueBoost = dialogueBoost
         self.stereoPresentation = stereoPresentation
         self.stereoOnAnySystem = stereoOnAnySystem
         self.isLiveSession = isLiveSession
@@ -1200,6 +1202,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     /// TrueHD Atmos and DTS:X delivery (#731, see `ObjectAudioRendering`); consulted before `audioBridgeMode`.
     let objectAudioRendering: ObjectAudioRendering
+
+    /// `LoadOptions.dialogueBoost`: every audio track bridges, folded to stereo and processed for speech.
+    let dialogueBoost: Bool
 
     /// Pre-opened demuxer reused by `start()` to skip `avformat_find_stream_info` (~1-3 s on slow CDN).
     /// Consumed in `start()`; unconsumed instances are closed by `stop()`.
@@ -2091,6 +2096,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     category: .session
                 )
             }
+        }
+
+        // Dialogue boost re-mixes the audio, so nothing stream-copies; the host asked for it on a route it decodes for.
+        if dialogueBoost && audioStreamIndex >= 0 && !bridgePreferred {
+            bridgePreferred = true
+            EngineLog.emit(
+                "[HLSVideoEngine] audio: dialogue boost on, bridging instead of stream-copy (stereo, centre raised, compressed)",
+                category: .session
+            )
         }
 
         // 6b. Run the stream-copy / FLAC-bridge / video-only cascade.

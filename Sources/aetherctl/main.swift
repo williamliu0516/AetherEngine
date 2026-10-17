@@ -115,7 +115,7 @@ func printUsage() {
       aetherctl dvsurvey [--frames N] [--list K] <file>
       aetherctl extract [--at <sec>] [--snapshot] [--width <px>] [--loops <n>] <url>
       aetherctl audio [--seconds N] <url>
-      aetherctl audiotap [--duration S] [--out PATH.wav] [--remote | --software] <url>
+      aetherctl audiotap [--duration S] [--out PATH.wav] [--remote | --software] [--dialogue-boost] <url>
                          (#95: decode the loopback audio track to mono 48k WAV, print continuity stats;
                           --software runs a real session through the SW sink, exit 3 if it yields no audible PCM)
       aetherctl customio [--memory] [--forward-only] [--audio-only] [--reload] [--switch-audio] [--select-subs] [--extract] [--audio-index N] [--reload-decode-path automatic|software] <file>
@@ -532,15 +532,16 @@ if first == "audiotap" {
     rest.removeAll { $0 == "--remote" }
     let software = rest.contains("--software")
     rest.removeAll { $0 == "--software" }
+    let dialogueBoost = takeFlag("--dialogue-boost", from: &rest)
     guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
         print("ERROR: audiotap requires a <url> argument")
-        print("Usage: aetherctl audiotap [--duration S] [--out PATH.wav] [--remote | --software] <url>")
+        print("Usage: aetherctl audiotap [--duration S] [--out PATH.wav] [--remote | --software] [--dialogue-boost] <url>")
         exit(64)
     }
     rest.removeAll { $0 == urlArg }
     rejectStrayFlags(rest, subcommand: "audiotap")
     exit(runAudioTap(url: parseSourceURL(urlArg), duration: duration, outPath: outPath,
-                 remote: remote, software: software))
+                 remote: remote, software: software, dialogueBoost: dialogueBoost))
 }
 
 if first == "hlsfixture" {
@@ -894,6 +895,12 @@ if first == "play" {
                 exit(64)
             }
             optionChanges.append(.audioBridgeMode(mode))
+        } else if key == "dialogue-boost" {
+            guard let flag = Bool(value) else {
+                print("ERROR: --reload-applying dialogue-boost takes true|false, got '\(value)'")
+                exit(64)
+            }
+            optionChanges.append(.dialogueBoost(flag))
         } else if key == "preferred-audio" {
             optionChanges.append(.preferredAudioLanguages(
                 value.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }))

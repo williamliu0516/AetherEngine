@@ -24,8 +24,10 @@ public enum AudioTapProbe {
         public var errorDescription: String? { description }
     }
 
-    public static func run(url: URL, durationSeconds: Double, outPath: String) throws -> String {
-        let session = HLSVideoEngine(url: url, dvModeAvailable: false)
+    /// `dialogueBoost`: the session's `LoadOptions.dialogueBoost`, so the WAV holds the boosted mix.
+    public static func run(url: URL, durationSeconds: Double, outPath: String,
+                           dialogueBoost: Bool = false) throws -> String {
+        let session = HLSVideoEngine(url: url, dvModeAvailable: false, dialogueBoost: dialogueBoost)
         _ = try session.start()
         defer { session.stop() }
         guard let cache = session.cache, let provider = session.provider else {
@@ -134,10 +136,12 @@ public enum AudioTapProbe {
     /// through the public API and plays, so the sink runs exactly as it does in a host.
     /// Unlike the other two modes this is bound to wall clock: the SW host decodes in real time.
     @MainActor
-    public static func runSoftware(url: URL, durationSeconds: Double,
-                                   outPath: String) async throws -> SoftwareTapReport {
+    public static func runSoftware(url: URL, durationSeconds: Double, outPath: String,
+                                   dialogueBoost: Bool = false) async throws -> SoftwareTapReport {
         let engine = try AetherEngine()
-        try await engine.load(url: url)
+        var options = LoadOptions()
+        options.dialogueBoost = dialogueBoost
+        try await engine.load(url: url, options: options)
         guard engine.playbackBackend == .software else {
             throw ProbeError.notSoftwareRouted(engine.playbackBackend.rawValue)
         }

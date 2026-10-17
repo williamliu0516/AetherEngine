@@ -285,6 +285,18 @@ Either encoder opens at a sample rate it actually has, which is not always the s
 
 Two bridge lifecycle invariants (issue #99): the encoder PTS counter re-bases onto the first fed packet's (gate-shifted) source PTS on every session start and producer restart, so bridged audio always shares the video's output timeline, including a `load(startPosition:)` resume that anchors mid-file (a 0-based bridge timeline puts the audio track a full resume-offset away from video inside the same fragments, which AVPlayer silently discards). And the EOF tail flush leaves the encoder in FFmpeg's terminal draining state, so the bridge latches that and rebuilds the encoder on the next restart; a VOD pump that still dies with `muxerFailed` gets a bounded producer rebuild instead of stranding the session.
 
+### Dialogue boost
+
+`LoadOptions.dialogueBoost` is for the viewer the standard fold leaves behind: a 5.1 or 7.1 film on a phone's speakers or headphones at night, where ITU-R BS.775's −3 dB centre puts the dialogue under music and effects that six speakers would have spread around the room. With it on, the route prefers the bridge for every track, stream-copyable ones included, and the bridge (or the software path's decoder) does three things before the encoder (`DialogueBoostProcessor`):
+
+- The fold favours the centre: swresample's matrix with `center_mix_level` +3 dB, `surround_mix_level` −6 dB and the LFE left out, normalised (`rematrix_maxval` 1) so no output sums past full scale on either the bridge's S32 or the software path's float. A source of two channels or fewer has its mid raised 1.5 dB and its side lowered 1.5 dB instead.
+- A +3 dB peaking lift at 2.5 kHz (Q 0.9), where consonants carry intelligibility.
+- A feed-forward compressor, linked across both channels: a 10 ms mean-square detector, −36 dBFS threshold, 3:1, 6 dB soft knee, 10 ms attack, 200 ms release, 14 dB make-up, then the same `PeakLimiter` the APAC path uses. No lookahead, so the audio does not move against the picture.
+
+The output is two-channel FLAC at 24 bits whatever the source and `audioBridgeMode`, since the processing makes low-order bits S16 would round away. Measured with `aetherctl audiotap` on a 40 s 5.1 AC-3 clip (a 1 kHz tone at −48 dBFS RMS in the centre, pink noise in the other five channels switching every 5 s between two levels 38 dB apart), against the same clip folded by the standard matrix: quiet parts −46.9 → −35.5 dBFS overall and the tone −51.0 → −36.6, loud parts −10.6 → −14.6, so the loud-to-quiet range went from 36.3 to 20.9 dB. Decode, fold, compression and FLAC encode of ten minutes of 5.1 E-AC-3 took 1.3 s on one M1 Max core. The bridge produces ahead of playback, so the option adds no latency; turning it on or off is a session rebuild (`reloadAtCurrentPosition(applying:)`), as an audio-track change is.
+
+It is a trade the viewer chooses: Atmos objects, surround and `objectAudioRendering` give way to the stereo mix, and loud scenes lose their punch. The engine does not look at the route (AE#794 is why: it cannot tell what a route takes), so the host turns it on only for one it decodes for, built-in speakers and wired or Bluetooth headphones, and leaves HDMI and AirPlay to the source's own bitstream. A native remote HLS session (`nativeRemoteHLS`) is played by AVPlayer as served and ignores it.
+
 ### Audio a build has no decoder for
 
 AC-4 (ATSC 3.0 / NextGen TV) and MPEG-H 3D Audio have no decoder in the bundled FFmpeg, and there is
