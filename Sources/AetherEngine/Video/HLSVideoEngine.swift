@@ -1577,6 +1577,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
         )
         let measuredVideoNALFraming = framingNormalization.measuredFraming
 
+        // Resolved here, before the config record is rebuilt: an MV-HEVC session keeps one SEI the AE#187
+        // canonicalization would drop (`canonicalizeHEVCConfigRecord`).
+        let stereo = StereoVideoSignal.resolve(
+            presentation: stereoPresentation,
+            codecID: codecpar.pointee.codec_id,
+            multilayer: (videoStream.pointee.disposition & AV_DISPOSITION_MULTILAYER) != 0,
+            containerStereo: StereoVideoSignal.containerStereo(codecpar),
+            systemPresentsStereo: stereoOnAnySystem || StereoVideoSignal.systemPresentsStereo
+        )
         let hevcExtradataOverride: [UInt8]?
         if let normalized = framingNormalization.extradataOverride {
             hevcExtradataOverride = normalized
@@ -1595,7 +1604,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
         } else if codecpar.pointee.codec_id == AV_CODEC_ID_HEVC,
                   let ed = codecpar.pointee.extradata,
                   case let source = Array(UnsafeBufferPointer(start: ed, count: Int(codecpar.pointee.extradata_size))),
-                  let canonical = Self.canonicalizeHEVCConfigRecord(source) {
+                  let canonical = Self.canonicalizeHEVCConfigRecord(
+                      source, keepingSEIPayloadTypes: stereo.signal == .multiview
+                          ? [Self.stereoReferenceDisplaysSEIPayloadType] : []) {
             hevcExtradataOverride = canonical
             EngineLog.emit(
                 "[HLSVideoEngine] canonicalized hvcC (stripped non-parameter-set NAL arrays): "
@@ -1719,13 +1730,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // The extradata-derived framing is a claim, not a measurement.
         var framingMeasuredLengthPrefixed = false
         if case .lengthPrefixed? = measuredVideoNALFraming { framingMeasuredLengthPrefixed = true }
-        let stereo = StereoVideoSignal.resolve(
-            presentation: stereoPresentation,
-            codecID: codecpar.pointee.codec_id,
-            multilayer: (videoStream.pointee.disposition & AV_DISPOSITION_MULTILAYER) != 0,
-            containerStereo: StereoVideoSignal.containerStereo(codecpar),
-            systemPresentsStereo: stereoOnAnySystem || StereoVideoSignal.systemPresentsStereo
-        )
         stereoSignal = stereo.signal
         if stereo.signal != nil || stereoPresentation != .automatic
             || StereoVideoSignal.containerStereo(codecpar) != nil
