@@ -10,6 +10,15 @@ the public-API contract.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A forward seek a few segments ahead no longer pumps through them when a restart is quicker.** Within the
+  8-segment forward window the provider always waited for the producer's march, and on a slow source that is the
+  slow choice: three 18 MB segments of a 37 Mbit/s Dolby Vision file over a 40 Mbit/s SMB share took 10.8 s to
+  arrive (A12Z iPad). The segment cache now keeps the producer's pace (its quickest recent unparked step from one
+  segment to the next, within two minutes; parks on playback are left out), and the provider restarts when the
+  segments before the one asked for would take longer than a reopen (1.5 s). A fast source keeps waiting.
+
 ### Added
 
 - **One read of the source for subtitles (`setSubtitleLookahead(_:)`).** The forward prefetcher (#151) is a

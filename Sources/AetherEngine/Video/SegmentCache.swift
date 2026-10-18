@@ -340,6 +340,7 @@ final class SegmentCache: @unchecked Sendable {
             entryBytes[index] = data.count
             _totalBytes += data.count
             if index > _highestStoredIndex { _highestStoredIndex = index }
+            noteStoreLocked(index)
         }
         let doomed = pruneOutsideWindow()
         if !doomed.isEmpty { residentSetChanged = true }
@@ -401,6 +402,7 @@ final class SegmentCache: @unchecked Sendable {
             entryBytes[index] = byteCount
             _totalBytes += byteCount
             if index > _highestStoredIndex { _highestStoredIndex = index }
+            noteStoreLocked(index)
             // A later epoch produced what an earlier one passed over: a re-anchor moved the
             // boundaries and this index is no longer a hole (#358).
             foldCounts.removeValue(forKey: index)
@@ -434,6 +436,8 @@ final class SegmentCache: @unchecked Sendable {
         sealedStagingOrder.removeAll(keepingCapacity: false)
         _totalBytes = 0
         _highestStoredIndex = -1
+        lastStore = nil
+        paceSteps.removeAll()
         condition.broadcast()
         condition.unlock()
 
@@ -773,6 +777,41 @@ final class SegmentCache: @unchecked Sendable {
         condition.lock()
         defer { condition.unlock() }
         return _highestStoredIndex
+    }
+
+    /// The producer's pace, under `condition`: the last segment stored (nil after a park) and the recent steps from
+    /// one segment to the next, with when each was taken (`fastestRecentSegmentSeconds`).
+    private var lastStore: (index: Int, at: Double)?
+    private var paceSteps: [(seconds: Double, at: Double)] = []
+
+    private func noteStoreLocked(_ index: Int) {
+        let now = ProcessInfo.processInfo.systemUptime
+        if let last = lastStore, index == last.index + 1, now > last.at {
+            paceSteps.append((now - last.at, now))
+            if paceSteps.count > 4 { paceSteps.removeFirst(paceSteps.count - 4) }
+        }
+        lastStore = (index, now)
+    }
+
+    /// The producer parked: the step to the next segment it stores waited on playback, so it says nothing of the
+    /// source's pace and is left out.
+    func noteMarchParked() {
+        condition.lock()
+        lastStore = nil
+        condition.unlock()
+    }
+
+    /// How long the producer takes per segment when it is not waiting on playback: the quickest of its last few
+    /// steps from one segment to the next taken in the last two minutes. Nil when there is none.
+    var fastestRecentSegmentSeconds: Double? {
+        condition.lock()
+        defer { condition.unlock() }
+        return Self.fastestStep(paceSteps, now: ProcessInfo.processInfo.systemUptime)
+    }
+
+    nonisolated static func fastestStep(_ steps: [(seconds: Double, at: Double)], now: Double,
+                                        maxAge: Double = 120) -> Double? {
+        steps.filter { now - $0.at <= maxAge }.map(\.seconds).min()
     }
 
     /// Largest K such that every index in [startIdx ... K] is resident, walking forward until the first

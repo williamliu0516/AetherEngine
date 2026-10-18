@@ -857,6 +857,15 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// while keeping user-initiated 30+ s scrubs below the threshold. Tightened to 3 once;
     /// every AVPlayer prefetch above cache.max+3 cascaded into restarts and produced cache holes.
     private static let forwardWaitWindow = 8
+    /// What a restart costs beyond producing the segment asked for: reopening the source and seeking in it.
+    static let restartOverheadSeconds: Double = 1.5
+
+    /// Whether pumping through the segments before `segmentsAhead` (counting it as 1: the next one) takes longer at
+    /// `secondsPerSegment` than a restart's overhead. Unknown pace: no.
+    nonisolated static func forwardMarchSlowerThanRestart(segmentsAhead: Int, secondsPerSegment: Double?) -> Bool {
+        guard let pace = secondsPerSegment, pace > 0, segmentsAhead > 1 else { return false }
+        return Double(segmentsAhead - 1) * pace > restartOverheadSeconds
+    }
 
     /// #50: re-asserting reposition wait. Sliced waits re-fire restart only when lastRestartIndex
     /// changed (orphan signature: #35 coalescer's single slot was overwritten by a newer scrub).
@@ -1855,7 +1864,19 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                         )
                     }
                 }
-                needsRestart = index > front + Self.forwardWaitWindow || marchProvenDead
+                // A march is not always cheaper than a restart: three 18 MB segments of a 37 Mbit/s Dolby Vision
+                // file from a 40 Mbit/s SMB share took 10.8 s to pump through, where a restart costs its reopen
+                // and the one segment (2026-10-17, A12Z iPad). At the producer's own pace, restart when the
+                // segments before this one would take longer than that reopen.
+                let marchTooSlow = !isLive && Self.forwardMarchSlowerThanRestart(
+                    segmentsAhead: index - front, secondsPerSegment: cache.fastestRecentSegmentSeconds)
+                if marchTooSlow {
+                    EngineLog.emit(
+                        "[HLSVideoEngine] seg\(index): \(index - front) segments ahead of the march at "
+                        + String(format: "%.2f", cache.fastestRecentSegmentSeconds ?? 0)
+                        + " s each; restarting rather than pumping through", category: .session)
+                }
+                needsRestart = index > front + Self.forwardWaitWindow || marchProvenDead || marchTooSlow
             }
         } else {
             // Empty cache: cold start (producer at lastRestartIndex, hasn't written yet) vs. big scrub
