@@ -106,6 +106,13 @@ public struct ProbeDetail: OptionSet, Sendable {
     /// HDR Vivid (CUVA T/UWA 005.1) carriage in HEVC via the same bounded packet scan as `.hdr10Plus`,
     /// sharing its `HDR10PlusDetectionOptions` budget. See `SourceProbe.carriesHDRVividMetadata`.
     public static let hdrVivid = ProbeDetail(rawValue: 1 << 2)
+
+    /// The container's keyframe index (a Matroska file's Cues), loaded by the same bounded seek to the middle a
+    /// playback session makes as it starts. Answers nothing in `SourceProbe`: it is for a host warming a source
+    /// through a reader whose cache keeps what was read, so that a later `load()` of that reader finds the index
+    /// bytes there instead of fetching them (over a slow link the session's own index read took 0.6 to 1.2 s).
+    /// Skipped where the session skips it: a forward-only source, or a segmented one with no index to load.
+    public static let keyframeIndex = ProbeDetail(rawValue: 1 << 3)
 }
 
 extension AetherEngine {

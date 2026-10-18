@@ -254,6 +254,14 @@ extension AetherEngine {
             }
         }
 
+        if detecting.contains(.keyframeIndex), probe.durationSeconds > 0,
+           HLSVideoEngine.cuePrewarmMayRun(hasSegmentedReader: demuxer.timeSeekableReader != nil,
+                                           isSourceSeekable: demuxer.isSourceSeekable) {
+            try control?.check()
+            demuxer.seekBounded(to: probe.durationSeconds * 0.5, timeout: HLSVideoEngine.cuePrewarmTimeout)
+            try control?.check()
+        }
+
         closeInput()
         try control?.complete()
         return probe
