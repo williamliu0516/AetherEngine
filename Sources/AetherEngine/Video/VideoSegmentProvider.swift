@@ -1956,6 +1956,27 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             return logServed(index: index, source: nil, totalStart: totalStart, restarted: true)
         }
 
+        // The forward wait, a second at a time: a march whose pace was not known when the request came (a producer
+        // that had stored one segment so far) can turn out slower than a restart while the request waits; it then
+        // decides again, now with the pace (device: the first request for a DV clip's seg5 waited 8 s, the
+        // re-request restarted and was served 2.4 s later).
+        if tookForwardWait, !needsRestart, !isLive {
+            let deadline = DispatchTime.now() + forwardBackpressureWaitSeconds
+            while DispatchTime.now() < deadline, !cache.isClosed {
+                let left = Double(deadline.uptimeNanoseconds - DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
+                if let source = cache.fetchSource(index: index, timeout: min(1, max(0.05, left)),
+                                                  progressive: fetchesProgressively) {
+                    clearForwardWaitMiss()
+                    return logServed(index: index, source: source, totalStart: totalStart, restarted: false)
+                }
+                if Self.forwardMarchSlowerThanRestart(segmentsAhead: index - activeMarchFront,
+                                                      secondsPerSegment: cache.fastestRecentSegmentSeconds) {
+                    return serveSource(at: index)
+                }
+            }
+            recordForwardWaitMiss(index: index, front: activeMarchFront)
+            return logServed(index: index, source: nil, totalStart: totalStart, restarted: false)
+        }
         let source = cache.fetchSource(index: index, timeout: forwardBackpressureWaitSeconds,
                                        progressive: fetchesProgressively)
         if tookForwardWait, !needsRestart {
