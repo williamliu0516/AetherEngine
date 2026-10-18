@@ -1807,6 +1807,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         // for this same index). Bypasses the restart loop's producerCovers veto below, which
         // otherwise reads the dead producer's still-installed base and suppresses the fire.
         var marchProvenDead = false
+        // Set when the forward-wait branch finds the march slower than a restart at the producer's own pace: the
+        // restart must not then be vetoed for the march covering the index, since covering it slowly is the reason.
+        var marchTooSlow = false
         // AE#169 round 2: true when the fetch takes the VOD forward-window backpressure wait, so a
         // full-timeout miss records (index, front) for the frozen-march escalation above.
         var tookForwardWait = false
@@ -1868,7 +1871,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                 // file from a 40 Mbit/s SMB share took 10.8 s to pump through, where a restart costs its reopen
                 // and the one segment (2026-10-17, A12Z iPad). At the producer's own pace, restart when the
                 // segments before this one would take longer than that reopen.
-                let marchTooSlow = !isLive && Self.forwardMarchSlowerThanRestart(
+                marchTooSlow = !isLive && Self.forwardMarchSlowerThanRestart(
                     segmentsAhead: index - front, secondsPerSegment: cache.fastestRecentSegmentSeconds)
                 if marchTooSlow {
                     EngineLog.emit(
@@ -1913,7 +1916,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                     // AE#169 round 2: a march proven dead (finished pump / frozen front across a
                     // full wait) must not veto the fire; the still-installed dead producer's base
                     // covering the index is exactly the wedge being escaped.
-                    let producerCovers = !marchProvenDead && activeProducerCovers(index)
+                    let producerCovers = !marchProvenDead && !marchTooSlow && activeProducerCovers(index)
                     // A request superseded by a NEWER declared target is an orphan of a skip
                     // storm: AVPlayer's newest request is what it actually wants (the same
                     // newest-wins semantics the coalescer applies to immediate restarts).
