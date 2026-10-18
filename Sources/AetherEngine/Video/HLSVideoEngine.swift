@@ -516,6 +516,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
             subtitlePacketStore.harvest(streamIndex: idx, packet: pkt, timeBase: tb,
                                         assembleSplitDisplaySets: assemblyIndices.contains(idx))
         }
+        if !prod.subtitlePacketStreamIndices.isEmpty {
+            prod.harvestProgressSink = { [subtitlePacketStore] seconds in
+                subtitlePacketStore.noteHarvestProgress(.pump, through: seconds)
+            }
+        }
     }
 
     /// Pump-thread callback: decode the tapped packet into its ordinal's cue store. Text subtitle decode

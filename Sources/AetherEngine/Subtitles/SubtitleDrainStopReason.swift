@@ -33,4 +33,7 @@ enum SubtitleDrainStopReason: String, Sendable {
     /// `startSubtitleForwardPrefetcher` is replacing a running session with a new one (a changed
     /// lead, or a jump the in-place re-anchor cannot serve). The one reason that is not a loss.
     case prefetchRebuild
+    /// The host's subtitle lookahead (`setSubtitleLookahead`) asks for nothing the producer's own read
+    /// does not already harvest, so a second read of the source would buy nothing.
+    case lookaheadCovered
 }

@@ -1398,6 +1398,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// `subtitleTapObserver`, set at init BEFORE the discard block for the same reason.
     var subtitlePacketStreamIndices: Set<Int32>
     var subtitlePacketSink: (@Sendable (Int32, UnsafeMutablePointer<AVPacket>, AVRational) -> Void)?
+    /// #416: how far the pump has read, in source seconds, from each main-demuxer video packet. It reads
+    /// every subtitle packet on the way, so the store can tell a stretch it has read (and found nothing
+    /// in) from one nobody read, which is what lets the overlay run on this harvest alone, without the
+    /// forward prefetcher's second read (`setSubtitleLookahead`).
+    var harvestProgressSink: (@Sendable (Double) -> Void)?
     private var closedCaptionStreamTimeBase = AVRational(num: 1, den: 1)
 
     /// Set by engine live-reopen path so the fresh producer marks its first segment with #EXT-X-DISCONTINUITY.
@@ -3567,6 +3572,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
                    let sink = subtitlePacketSink {
                     sink(pktStreamIdx, packet,
                          subtitleTapTimeBases[pktStreamIdx] ?? AVRational(num: 1, den: 1000))
+                }
+                if isVideoPkt, let note = harvestProgressSink, packet.pointee.pts != Int64.min,
+                   sourceVideoTbSeconds > 0 {
+                    note(Double(packet.pointee.pts) * sourceVideoTbSeconds)
                 }
 
                 // AE#432: learn each stream's frame stride from its GENUINE timestamps, so a run

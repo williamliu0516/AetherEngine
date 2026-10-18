@@ -136,6 +136,10 @@ off, then `selected=German engineActive=2` after the on. `selected=German engine
 rendition nobody is filling any more, which on an AirPlay receiver is an empty caption box; and
 `selected=none engineActive=2` is subtitles that never came back.
 
+`lookahead@S` sets the host's subtitle lookahead before the load (`setSubtitleLookahead`): `lookahead@0` is a host
+that shows each cue at its own time, so the forward prefetcher's second read of the source does not run and the
+overlay is fed by the producer's harvest alone (its `#151 forward prefetch started` line is absent).
+
 `defernative` loads with `LoadOptions.deferNativeSubtitleWork` and `nativeback@N` (default 30) is the picture
 coming back (`setNativeSubtitleRendering(false)`). With a bitmap `--subs` pick, the `[SubtitleOCR] armed` /
 `disarmed` lines and the prefetcher's `lead=` show the OCR following the rendition; run against a shaped

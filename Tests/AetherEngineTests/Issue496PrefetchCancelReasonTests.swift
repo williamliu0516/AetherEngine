@@ -71,7 +71,7 @@ struct Issue496PrefetchCancelReasonTests {
         let all: [SubtitleDrainStopReason] = [
             .sidecarSelected, .secondarySidecarSelected, .externalStoreBackfill,
             .closedCaptionsSelected, .injectedRenditionSelected, .liveRenditionSelected,
-            .subtitlesCleared, .sessionStopped, .prefetchRebuild,
+            .subtitlesCleared, .sessionStopped, .prefetchRebuild, .lookaheadCovered,
         ]
         #expect(Set(all.map(\.rawValue)).count == all.count)
     }

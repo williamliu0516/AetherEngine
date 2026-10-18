@@ -12,6 +12,18 @@ the public-API contract.
 
 ### Added
 
+- **One read of the source for subtitles (`setSubtitleLookahead(_:)`).** The forward prefetcher (#151) is a
+  second demuxer over the source, and on Matroska it reads the whole interleaved file again: with any
+  embedded subtitle on, an 8 Mbit/s film over a 22 Mbit/s link read 437 MB in 150 s against 206 MB without,
+  and a 40 Mbit/s one on a fast link 1948 MB against 906 MB. A host that shows each cue at its own time
+  declares a lookahead of 0 and the prefetcher does not run: the overlay is fed by the producer's harvest,
+  which reaches every packet before the picture does, and the pump now notes how far it has read (#416
+  coverage), so a bitmap cue takes its end only from a successor across ground the pump read. Measured with
+  0: 206 MB and 958 MB, the same as with subtitles off, every cue delivered as before, VobSub ends identical,
+  and five far seeks read 448 MB instead of 483 (the app's own reader: 462 instead of 517, landings 3 to 4 s
+  instead of up to 12). A positive lookahead (an ADVANCE the host applies) prefetches that far; nil, the
+  default, keeps the drain window.
+
 - **Native subtitle renditions that cost nothing until they are shown (`LoadOptions.deferNativeSubtitleWork`,
   default off), and the host's subtitle timing in them (`setNativeSubtitleTiming(scale:offset:)`).** For a host
   that draws its own overlay and wants the WebVTT renditions only for PiP, AirPlay and an external display:

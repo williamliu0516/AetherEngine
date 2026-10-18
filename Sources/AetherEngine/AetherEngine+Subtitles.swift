@@ -616,14 +616,20 @@ extension AetherEngine {
             // Refusing there costs a tick or two of an open cue, which the next answer closes,
             // against an end that is wrong by a minute and that nothing downstream can tell from an
             // authored one.
+            // With a declared lookahead the prefetcher may not be running at all, so the horizon is not
+            // evidence that anyone read up to it: the end is taken only across ground a harvest has
+            // read (#416, the pump notes its progress), the rest waits for the read to get there.
             let derivationHorizon = window.through + Self.subtitleForwardPrefetchLeadMarginSeconds
-            if Self.alignCueEnds(&cues, toNextPacket: {
-                guard let pts = store.firstPTS(streamIndex: streamIndex, after: $0) else { return nil }
-                guard pts <= derivationHorizon else {
-                    tally.endsWithheld += 1
+            let requireRead = subtitleLookaheadSeconds != nil
+            if Self.alignCueEnds(&cues, toNextPacket: { start in
+                let next = store.firstPTS(streamIndex: streamIndex, after: start)
+                guard let end = Self.derivedCueEnd(
+                    start: start, nextPacket: next, horizon: derivationHorizon, requireRead: requireRead,
+                    hasRead: { store.hasReadSpan(from: $0, through: $1) }) else {
+                    if next != nil { tally.endsWithheld += 1 }
                     return nil
                 }
-                return pts
+                return end
             }) {
                 didMutate = true
             }
@@ -707,13 +713,14 @@ extension AetherEngine {
     /// drainer keeps working off the pump's harvest exactly as before.
     func startSubtitleForwardPrefetcher(startAt: Double? = nil) {
         let anchor = max(0, startAt ?? sourceTime)
-        // Phase D: while the OCR worker is armed the prefetcher must out-run the worker's
-        // 240 s window, or the packet store never holds what the worker wants to decode.
-        // #362: otherwise it parks a margin BEYOND the drain window, so the set at the window's
-        // forward edge has its own clear stored and can be closed where the author closed it.
-        let lead = subtitleOCRArmedOrdinal != nil
-            ? Self.subtitleOCRPrefetchLeadSeconds
-            : Self.subtitleDrainLeadSeconds + Self.subtitleForwardPrefetchLeadMarginSeconds
+        // A host that reads no cues ahead (`setSubtitleLookahead(0)`) is served by the producer's own
+        // harvest, and the prefetcher, a second demuxer over the same source, would read an interleaved
+        // container (Matroska) through a second time for nothing.
+        guard let lead = Self.subtitleForwardPrefetchLead(
+            ocrArmed: subtitleOCRArmedOrdinal != nil, lookahead: subtitleLookaheadSeconds) else {
+            cancelSubtitleForwardPrefetcher(reason: .lookaheadCovered)
+            return
+        }
         // #240: a live session moves its own cursor. Only a changed lead still needs a rebuild
         // (the loop captures it at start), and only a live task can be handed the request at all.
         if let reanchor = subtitleForwardPrefetchReanchor,
@@ -809,6 +816,53 @@ extension AetherEngine {
                     category: .engine)
             }
         }
+    }
+
+    /// #362: a bitmap cue's end from the next packet stored on its stream, or nil to wait: none stored,
+    /// past the horizon the harvest is designed to lead to, or (with `requireRead`) across ground no
+    /// harvest has read, where the next stored packet may be the far side of a hole rather than the
+    /// cue's own clear.
+    nonisolated static func derivedCueEnd(start: Double, nextPacket: Double?, horizon: Double, requireRead: Bool,
+                                          hasRead: (Double, Double) -> Bool) -> Double? {
+        guard let next = nextPacket, next <= horizon else { return nil }
+        guard !requireRead || hasRead(start, next) else { return nil }
+        return next
+    }
+
+    /// How far the forward prefetcher reads ahead of the playhead, or nil when it should not run.
+    /// Phase D: while the OCR worker is armed it must out-run the worker's 240 s window, or the packet
+    /// store never holds what the worker wants to decode. Otherwise the host's lookahead decides: none
+    /// declared is the drain window (upstream's default, for a host that applies an ADVANCE offset to
+    /// `subtitleCues` without saying so), zero is none at all (the producer's harvest feeds the overlay at
+    /// the playhead), and a positive one is that far. #362: either way it parks a margin BEYOND what it
+    /// must hold, so the set at the forward edge has its own clear stored and closes where the author
+    /// closed it.
+    nonisolated static func subtitleForwardPrefetchLead(ocrArmed: Bool, lookahead: Double?) -> Double? {
+        if ocrArmed { return subtitleOCRPrefetchLeadSeconds }
+        guard let lookahead else { return subtitleDrainLeadSeconds + subtitleForwardPrefetchLeadMarginSeconds }
+        guard lookahead > 0 else { return nil }
+        return min(lookahead, subtitleDrainLeadSeconds) + subtitleForwardPrefetchLeadMarginSeconds
+    }
+
+    /// How far ahead of the playhead the host reads `subtitleCues`: an ADVANCE offset it applies to them
+    /// (subtitles shown earlier than authored), in seconds; 0 when it shows each cue at its own time. The
+    /// forward prefetcher (#151) exists to fill that lookahead past the producer's park, and it is a second
+    /// demuxer over the source: on an interleaved container such as Matroska it reads the whole file a
+    /// second time (measured: 434 MB against 206 MB in 150 s of an 8 Mbit/s film over a 22 Mbit/s link). So
+    /// with 0 it does not run (only for the OCR of a shown native rendition, `deferNativeSubtitleWork`), and
+    /// the overlay is fed by the producer's own harvest, which reaches the playhead before the picture
+    /// does; with a positive value it runs that far ahead (up to the drain window). nil, the default, keeps
+    /// the drain window always, for a host that applies an ADVANCE without saying so. Kept across loads,
+    /// like `setSoftwareSubtitleDelay`; set it whenever the host's offset changes. Negative and non-finite
+    /// values read as 0.
+    public func setSubtitleLookahead(_ seconds: Double?) {
+        let value = seconds.map { $0.isFinite ? max(0, $0) : 0 }
+        guard value != subtitleLookaheadSeconds else { return }
+        subtitleLookaheadSeconds = value
+        EngineLog.emit("[AetherEngine] subtitle lookahead=\(value.map { "\($0)s" } ?? "drain window")",
+                       category: .engine)
+        guard !subtitleDrainTargets.isEmpty else { return }
+        startSubtitleForwardPrefetcher()
     }
 
     /// Cancel the prefetcher + markClosed its side demuxer so a parked AVIO read cannot survive
