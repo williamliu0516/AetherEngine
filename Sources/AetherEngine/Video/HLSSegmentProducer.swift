@@ -1878,8 +1878,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
         // than at the call sites so it is balanced whatever the park returns.
         sideReaderLinkGate?.videoFetchEnded()
         defer { sideReaderLinkGate?.videoFetchBegan() }
-        // The step across a park is playback's pace, not the source's (`fastestRecentSegmentSeconds`).
-        cache.noteMarchParked()
+        // A step that waited here is playback's pace, not the source's (`fastestRecentSegmentSeconds`). The call
+        // comes at every segment and returns at once when the consumer is near; only a real wait counts.
+        let entered = DispatchTime.now().uptimeNanoseconds
+        defer { if DispatchTime.now().uptimeNanoseconds - entered > 50_000_000 { cache.noteMarchParked() } }
         var parked = 0
         var nextLogAt = Self.backpressureWedgeLogThresholdSeconds
         // AE#528: the wait below returns on ANY cache broadcast (a consumer GET that moves the fetch
@@ -2050,7 +2052,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
         // #240: same release as the backpressure park; a parked pump is not using the link.
         sideReaderLinkGate?.videoFetchEnded()
         defer { sideReaderLinkGate?.videoFetchBegan() }
-        cache.noteMarchParked()
+        let entered = DispatchTime.now().uptimeNanoseconds
+        defer { if DispatchTime.now().uptimeNanoseconds - entered > 50_000_000 { cache.noteMarchParked() } }
         var parked = 0
         var nextLogAt = Self.prefetchDiskParkLogThresholdSeconds
         // AE#528: same wakeup-is-not-a-second correction as the advance park; this loop's own doc
