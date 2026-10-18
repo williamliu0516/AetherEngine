@@ -169,6 +169,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
     // var (not let): SSAI ad creative arrives on a new video PID mid-pump; re-pointed at the new stream.
     private var videoStreamIndex: Int32
     private let cache: SegmentCache
+    /// The pump's read rate between parks (`SegmentCache.notePumpRate`): bytes read and the uptime its stretch began,
+    /// on the pump thread.
+    private var pumpRateBytes = 0
+    private var pumpRateSince = DispatchTime.now().uptimeNanoseconds
     /// Segment index offset; 0 for initial-start, non-zero for restart sessions.
     private let baseIndex: Int
     /// The segment index this producer is anchored at (#93 residual: the provider skips firing
@@ -1871,6 +1875,23 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// index tuple once, then every 10 s, so a VOD wedge (cacheTarget frozen below target with no watchdog to break
     /// it) is distinguishable from healthy backpressure (cacheTarget climbing toward target). VOD only; live keeps
     /// its own watchdogs.
+    /// Counts what the pump read toward its rate, handed to the cache every half second of reading.
+    private func notePumpRead(bytes: Int) {
+        pumpRateBytes += max(0, bytes)
+        let now = DispatchTime.now().uptimeNanoseconds
+        let elapsed = Double(now - pumpRateSince) / 1_000_000_000
+        guard elapsed >= 0.5 else { return }
+        cache.notePumpRate(bytesPerSecond: Double(pumpRateBytes) / elapsed)
+        pumpRateBytes = 0
+        pumpRateSince = now
+    }
+
+    /// A park is not reading: the rate starts over after it.
+    private func restartPumpRate() {
+        pumpRateBytes = 0
+        pumpRateSince = DispatchTime.now().uptimeNanoseconds
+    }
+
     private func awaitBackpressureRelease(target: Int, head: Int, context: String) -> Bool {
         // Already broken on this session (e.g. a teardown-flush ensureMuxer call): stay broken, don't re-park.
         if isBackpressureWedgeBroken() { return false }
@@ -1881,7 +1902,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
         // A step that waited here is playback's pace, not the source's (`fastestRecentSegmentSeconds`). The call
         // comes at every segment and returns at once when the consumer is near; only a real wait counts.
         let entered = DispatchTime.now().uptimeNanoseconds
-        defer { if DispatchTime.now().uptimeNanoseconds - entered > 50_000_000 { cache.noteMarchParked() } }
+        defer {
+            if DispatchTime.now().uptimeNanoseconds - entered > 50_000_000 {
+                cache.noteMarchParked()
+                restartPumpRate()
+            }
+        }
         var parked = 0
         var nextLogAt = Self.backpressureWedgeLogThresholdSeconds
         // AE#528: the wait below returns on ANY cache broadcast (a consumer GET that moves the fetch
@@ -2053,7 +2079,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
         sideReaderLinkGate?.videoFetchEnded()
         defer { sideReaderLinkGate?.videoFetchBegan() }
         let entered = DispatchTime.now().uptimeNanoseconds
-        defer { if DispatchTime.now().uptimeNanoseconds - entered > 50_000_000 { cache.noteMarchParked() } }
+        defer {
+            if DispatchTime.now().uptimeNanoseconds - entered > 50_000_000 {
+                cache.noteMarchParked()
+                restartPumpRate()
+            }
+        }
         var parked = 0
         var nextLogAt = Self.prefetchDiskParkLogThresholdSeconds
         // AE#528: same wakeup-is-not-a-second correction as the advance park; this loop's own doc
@@ -3583,6 +3614,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                    sourceVideoTbSeconds > 0 {
                     note(Double(packet.pointee.pts) * sourceVideoTbSeconds)
                 }
+                notePumpRead(bytes: Int(packet.pointee.size))
 
                 // AE#432: learn each stream's frame stride from its GENUINE timestamps, so a run
                 // that arrives without any can be advanced by a plausible interval instead of a

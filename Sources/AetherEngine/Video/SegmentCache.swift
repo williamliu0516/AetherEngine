@@ -809,6 +809,38 @@ final class SegmentCache: @unchecked Sendable {
         return Self.fastestStep(paceSteps, now: ProcessInfo.processInfo.systemUptime)
     }
 
+    /// The pump's read rate while it is not parked, in bytes a second, and when it was taken (`notePumpRate`).
+    private var pumpRate: (bytesPerSecond: Double, at: Double)?
+
+    /// The producer read `bytesPerSecond` over its last stretch without a park.
+    func notePumpRate(bytesPerSecond: Double) {
+        guard bytesPerSecond.isFinite, bytesPerSecond > 0 else { return }
+        condition.lock()
+        pumpRate = (bytesPerSecond, ProcessInfo.processInfo.systemUptime)
+        condition.unlock()
+    }
+
+    /// How long the producer takes per segment: its quickest recent step (`fastestRecentSegmentSeconds`), else,
+    /// before it has two consecutive stores, the segments stored so far at its current read rate. The second is what
+    /// a request coming right after a start or a restart has (a DV clip's first seg5 request waited 3 s for the
+    /// second store on the device). Nil when neither is known.
+    var estimatedSecondsPerSegment: Double? {
+        condition.lock()
+        defer { condition.unlock() }
+        let now = ProcessInfo.processInfo.systemUptime
+        if let step = Self.fastestStep(paceSteps, now: now) { return step }
+        return Self.secondsPerSegment(storedBytes: Array(entryBytes.values), pumpRate: pumpRate, now: now)
+    }
+
+    nonisolated static func secondsPerSegment(storedBytes: [Int], pumpRate: (bytesPerSecond: Double, at: Double)?,
+                                              now: Double, maxAge: Double = 5) -> Double? {
+        guard let rate = pumpRate, now - rate.at <= maxAge, rate.bytesPerSecond > 0, !storedBytes.isEmpty else {
+            return nil
+        }
+        let average = Double(storedBytes.reduce(0, +)) / Double(storedBytes.count)
+        return average / rate.bytesPerSecond
+    }
+
     nonisolated static func fastestStep(_ steps: [(seconds: Double, at: Double)], now: Double,
                                         maxAge: Double = 120) -> Double? {
         steps.filter { now - $0.at <= maxAge }.map(\.seconds).min()

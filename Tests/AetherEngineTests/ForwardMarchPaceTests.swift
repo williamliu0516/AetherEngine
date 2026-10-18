@@ -39,4 +39,21 @@ struct ForwardMarchPaceTests {
         let pace = try #require(cache.fastestRecentSegmentSeconds)
         #expect(pace >= 0 && pace < 5)
     }
+
+    @Test("before two consecutive stores, the pace is the stored segments at the pump's read rate")
+    func paceFromReadRate() throws {
+        #expect(SegmentCache.secondsPerSegment(storedBytes: [18_000_000, 18_000_000],
+                                               pumpRate: (6_000_000, 100), now: 101) == 3)
+        #expect(SegmentCache.secondsPerSegment(storedBytes: [18_000_000], pumpRate: (6_000_000, 100), now: 110) == nil,
+                "a rate older than five seconds says nothing of now")
+        #expect(SegmentCache.secondsPerSegment(storedBytes: [], pumpRate: (6_000_000, 100), now: 100) == nil)
+
+        let cache = SegmentCache(forwardWindow: 10, backwardWindow: 10)
+        defer { cache.close() }
+        cache.store(index: 0, data: Data(count: 4_000))
+        #expect(cache.estimatedSecondsPerSegment == nil, "one store and no rate")
+        cache.notePumpRate(bytesPerSecond: 2_000)
+        let pace = try #require(cache.estimatedSecondsPerSegment)
+        #expect(abs(pace - 2) < 0.001)
+    }
 }

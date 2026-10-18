@@ -1872,11 +1872,11 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                 // and the one segment (2026-10-17, A12Z iPad). At the producer's own pace, restart when the
                 // segments before this one would take longer than that reopen.
                 marchTooSlow = !isLive && Self.forwardMarchSlowerThanRestart(
-                    segmentsAhead: index - front, secondsPerSegment: cache.fastestRecentSegmentSeconds)
+                    segmentsAhead: index - front, secondsPerSegment: cache.estimatedSecondsPerSegment)
                 if marchTooSlow {
                     EngineLog.emit(
                         "[HLSVideoEngine] seg\(index): \(index - front) segments ahead of the march at "
-                        + String(format: "%.2f", cache.fastestRecentSegmentSeconds ?? 0)
+                        + String(format: "%.2f", cache.estimatedSecondsPerSegment ?? 0)
                         + " s each; restarting rather than pumping through", category: .session)
                 }
                 needsRestart = index > front + Self.forwardWaitWindow || marchProvenDead || marchTooSlow
@@ -1970,7 +1970,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                     return logServed(index: index, source: source, totalStart: totalStart, restarted: false)
                 }
                 if Self.forwardMarchSlowerThanRestart(segmentsAhead: index - activeMarchFront,
-                                                      secondsPerSegment: cache.fastestRecentSegmentSeconds) {
+                                                      secondsPerSegment: cache.estimatedSecondsPerSegment) {
                     return serveSource(at: index)
                 }
             }
