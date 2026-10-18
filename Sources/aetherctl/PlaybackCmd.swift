@@ -550,7 +550,7 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         }
         .store(in: &cancellables)
 
-    let options = LoadOptions(
+    var options = LoadOptions(
         suppressDisplayCriteria: true,
         httpHeaders: httpHeaders,
         // AE#493: the Dolby Vision claim a macOS host has to make itself, because there is no per-mode
@@ -598,6 +598,9 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         nativeVideoFrameDiagnostics: nativeVideoFrameDiagnostics,
         nativeVideoFrameRecovery: nativeVideoFrameRecovery
     )
+    // `defernative`: the renditions' OCR and its prefetch lead only while `nativerender` stands, ended by
+    // `nativeback@N`; netbench measures what a remote source reads with and without it.
+    options.deferNativeSubtitleWork = hostCalls.contains("defernative")
     // AE#629: the rescue a host used to see only as a route change.
     let escalationSub = engine.softwarePathEscalations.sink { event in
         let failure = event.absorbedFailure
@@ -760,13 +763,13 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
             engine.pause()
         case "reloadlive", "reloadnext", "seekback", "overlapseek", "ratehold-tail", "pauseseek", "pausehold", "still", "stallclock", "pausereload", "playreload", "extplayreload":
             break  // reloadlive handled at load time, seekback/overlapseek/pauseseek in the telemetry loop
-        case "nativesubs":
-            break  // Sodalite#156, read at load time into LoadOptions.prepareNativeSubtitles
+        case "nativesubs", "defernative":
+            break  // Sodalite#156, read at load time into LoadOptions.prepareNativeSubtitles / deferNativeSubtitleWork
         case let call where call.hasPrefix("seekfar") || call.hasPrefix("subsoff")
-            || call.hasPrefix("subson") || call.hasPrefix("nativerender"):
+            || call.hasPrefix("subson") || call.hasPrefix("nativerender") || call.hasPrefix("nativeback"):
             break  // #433 / Sodalite#156, all in the telemetry loop; `@N` picks the tick
         default:
-            print("  HOSTCALL unknown '\(call)' (use play,extractor,setrate,ratehold,pausestart,reloadlive,reloadnext,seekback,seekfar,overlapseek,pauseseek,pausehold,still,stallclock,pausereload,playreload,extplayreload,nativesubs,nativerender,subsoff,subson)")
+            print("  HOSTCALL unknown '\(call)' (use play,extractor,setrate,ratehold,pausestart,reloadlive,reloadnext,seekback,seekfar,overlapseek,pauseseek,pausehold,still,stallclock,pausereload,playreload,extplayreload,nativesubs,defernative,nativerender,nativeback,subsoff,subson)")
         }
     }
     defer { if let frameExtractor { Task { await frameExtractor.shutdown() } } }
@@ -958,6 +961,10 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
     let nativeRenderTick: Int? = hostCalls.first(where: { $0.hasPrefix("nativerender") }).map { call in
         let parts = call.split(separator: "@")
         return parts.count == 2 ? (Int(parts[1]) ?? 8) : 8
+    }
+    let nativeBackTick: Int? = hostCalls.first(where: { $0.hasPrefix("nativeback") }).map { call in
+        let parts = call.split(separator: "@")
+        return parts.count == 2 ? (Int(parts[1]) ?? 30) : 30
     }
     let subsOffTick: Int? = hostCalls.first(where: { $0.hasPrefix("subsoff") }).map { call in
         let parts = call.split(separator: "@")
@@ -1368,6 +1375,10 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         if let t = nativeRenderTick, tick == t + 2 {
             await reportLegibleSelection(engine, "after render on")
             await reportServedVTT(engine, "after render on", around: engine.currentTime, sessionStart: startPosition ?? 0)
+        }
+        if let t = nativeBackTick, tick == t {
+            print("  HOSTCALL setNativeSubtitleRendering(false)")
+            engine.setNativeSubtitleRendering(false)
         }
         if let subsOffTick, tick == subsOffTick {
             print("  HOSTCALL subtitles off")

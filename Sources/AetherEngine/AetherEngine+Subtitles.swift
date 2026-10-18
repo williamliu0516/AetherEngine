@@ -127,7 +127,7 @@ extension AetherEngine {
         // Phase D: a bitmap track additionally arms the OCR worker feeding its native rendition.
         // Armed BEFORE the prefetcher start so the raised lead is picked up.
         if let ordinal = Self.nativeSubtitleOrdinal(forActiveTrack: index, in: nativeSubtitleTrackTable),
-           nativeSubtitleTrackTable[ordinal].needsOCR {
+           nativeSubtitleTrackTable[ordinal].needsOCR, nativeSubtitleOCRWanted {
             startSubtitleOCRWorker(ordinal: ordinal, streamIndex: Int32(index))
         }
         startSubtitleDrainer()
@@ -2354,6 +2354,7 @@ extension AetherEngine {
             pendingNativeRenderingRequest = active
             return
         }
+        followDeferredNativeSubtitleWork()
         guard active, let activeIdx = activeSubtitleTrackIndex,
               let ordinal = Self.nativeSubtitleOrdinal(forActiveTrack: activeIdx, in: nativeSubtitleTrackTable)
         else {
@@ -2361,6 +2362,35 @@ extension AetherEngine {
             return
         }
         setNativeSubtitleSelected(track: ordinal)
+    }
+
+    /// Retime the native renditions the way the host retimes its own overlay: a cue timed `t` seconds in the
+    /// source is served at `scale * t + offset`. A subtitle delay is the `offset`; a subtitle file made for another
+    /// frame rate is the `scale` (25 / 23.976 and the like) with its `offset`. So the timing the viewer set, or a
+    /// speech alignment the host found, reaches the PiP window, an AirPlay receiver and an external display, where
+    /// the rendition is the display. Identity (1, 0) by default, kept across loads like `setSoftwareSubtitleDelay`:
+    /// set it for each title. AVKit keeps a rendition segment it has fetched, so a change made while a rendition is
+    /// shown is replayed through the selection (the same deselect and reselect that brings a rendition back after a
+    /// skip); set it before `setNativeSubtitleRendering(true)` where you can. Ignored when not finite or when
+    /// `scale` is not positive. The host's overlay and `subtitleCues` are not affected.
+    public func setNativeSubtitleTiming(scale: Double = 1, offset: Double) {
+        guard scale.isFinite, offset.isFinite, scale > 0 else { return }
+        guard scale != nativeSubtitleTimingScale || offset != nativeSubtitleTimingOffset else { return }
+        nativeSubtitleTimingScale = scale
+        nativeSubtitleTimingOffset = offset
+        applyNativeSubtitleTiming()
+        EngineLog.emit("[AetherEngine] native subtitle timing scale=\(scale) offset=\(offset)s", category: .engine)
+        if nativeSubtitleRenderingRequested, let ordinal = nativeSubtitleReapplyOrdinal {
+            setNativeSubtitleSelected(track: ordinal)
+        }
+    }
+
+    /// Hands the host's timing to every native store of the session (text, closed captions, OCR).
+    func applyNativeSubtitleTiming() {
+        let stores = nativeVideoSession?.nativeSubtitleCueStoresForSession ?? []
+        for store in stores {
+            store.setTiming(scale: nativeSubtitleTimingScale, offset: nativeSubtitleTimingOffset)
+        }
     }
 
     // MARK: - Session-preserving reload carryover (#170)

@@ -1373,6 +1373,7 @@ extension AetherEngine {
             if !stores.isEmpty {
                 let shift = session.playlistShiftSeconds
                 stores.forEach { $0.setShiftSeconds(shift) }
+                applyNativeSubtitleTiming()
                 nativeSubtitleReaderParams = (url: url, stores: stores)
                 // #88: load-declared external tracks fill their stores with one whole-file decode
                 // each (no side demuxer); embedded tracks keep the pump-tap / reader paths below.

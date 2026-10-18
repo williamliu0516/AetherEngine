@@ -60,6 +60,7 @@ extension AetherEngine {
     /// Load/stop teardown: forget covered-region state too (new session, new axis).
     func resetSubtitleOCRState() {
         cancelSubtitleOCRWorker()
+        deferredSidecarOCRFill = nil
         subtitleOCRCursors.removeAll()
         subtitleOCRPendingStates.removeAll()
     }
@@ -153,12 +154,59 @@ extension AetherEngine {
               nativeSubtitleTrackTable[ordinal].needsOCR,
               let store = nativeStore(atOrdinal: ordinal),
               !store.isFinished else { return }
+        guard nativeSubtitleOCRWanted else {
+            deferredSidecarOCRFill = (id, cues)
+            EngineLog.emit("[SubtitleOCR] sidecar fill deferred until a rendition is shown: track=\(id)",
+                           category: .engine)
+            return
+        }
         let language = nativeSubtitleTrackTable[ordinal].language
         subtitleOCRSidecarFillTask?.cancel()
         EngineLog.emit("[SubtitleOCR] sidecar fill starting: track=\(id) cues=\(cues.count)", category: .engine)
         subtitleOCRSidecarFillTask = BlockingWork.detached(priority: .utility) {
             await SubtitleImageOCR.appendRecognized(cues: cues, language: language, to: store)
             if !Task.isCancelled { store.markFinished() }
+        }
+    }
+}
+
+extension AetherEngine {
+
+    /// Whether the OCR feeding a bitmap track's rendition should run now: always, unless
+    /// `LoadOptions.deferNativeSubtitleWork` holds it to the host's standing rendering request.
+    var nativeSubtitleOCRWanted: Bool {
+        Self.nativeSubtitleOCRWanted(deferWork: loadedOptions.deferNativeSubtitleWork,
+                                     renderingRequested: nativeSubtitleRenderingRequested)
+    }
+
+    nonisolated static func nativeSubtitleOCRWanted(deferWork: Bool, renderingRequested: Bool) -> Bool {
+        !deferWork || renderingRequested
+    }
+
+    /// `LoadOptions.deferNativeSubtitleWork`: arm what only the renditions need when the host's rendering
+    /// request comes (the active embedded bitmap track's OCR worker, with the prefetcher re-led to the OCR's
+    /// window, and a held sidecar fill), and disarm it when the request goes, the prefetcher back on the
+    /// overlay's lead. The worker's cursors persist, so a second PiP does not recognize the covered region again.
+    func followDeferredNativeSubtitleWork() {
+        guard loadedOptions.deferNativeSubtitleWork else { return }
+        if nativeSubtitleRenderingRequested {
+            if subtitleOCRArmedOrdinal == nil, let index = activeSubtitleTrackIndex,
+               let ordinal = Self.nativeSubtitleOrdinal(forActiveTrack: index, in: nativeSubtitleTrackTable),
+               nativeSubtitleTrackTable[ordinal].needsOCR,
+               nativeSubtitleTrackTable[ordinal].sourceStreamIndex == index {
+                startSubtitleOCRWorker(ordinal: ordinal, streamIndex: Int32(index))
+                startSubtitleForwardPrefetcher()
+                EngineLog.emit("[SubtitleOCR] armed for the rendition being shown: stream=\(index)",
+                               category: .engine)
+            }
+            if let held = deferredSidecarOCRFill, held.externalTrackID == activeSubtitleTrackIndex,
+               subtitleOCRSidecarFillTask == nil {
+                startSidecarOCRFillIfNeeded(externalTrackID: held.externalTrackID, cues: held.cues)
+            }
+        } else if subtitleOCRArmedOrdinal != nil || subtitleOCRSidecarFillTask != nil {
+            cancelSubtitleOCRWorker()
+            startSubtitleForwardPrefetcher()
+            EngineLog.emit("[SubtitleOCR] disarmed: no rendition is shown", category: .engine)
         }
     }
 }

@@ -136,6 +136,16 @@ off, then `selected=German engineActive=2` after the on. `selected=German engine
 rendition nobody is filling any more, which on an AirPlay receiver is an empty caption box; and
 `selected=none engineActive=2` is subtitles that never came back.
 
+`defernative` loads with `LoadOptions.deferNativeSubtitleWork` and `nativeback@N` (default 30) is the picture
+coming back (`setNativeSubtitleRendering(false)`). With a bitmap `--subs` pick, the `[SubtitleOCR] armed` /
+`disarmed` lines and the prefetcher's `lead=` show the OCR following the rendition; run against a shaped
+remote origin, the bytes it served are what the option saves:
+
+```bash
+aetherctl play --subs pgs --seconds 120 \
+  --host-calls nativesubs,defernative,nativerender@40,nativeback@80 https://host/film.mkv
+```
+
 `--sidecar <lang>=<path-or-url>[,<lang>=<path>...]` fills `LoadOptions.externalSubtitles`, the load-time
 declaration a host makes. On a remote `m3u8` this is what makes the engine stand up its rewritten master
 (#316), so it is the way to see the whole chain from the CLI: the served `master.m3u8` body is logged, the

@@ -3621,6 +3621,14 @@ public final class AetherEngine: ObservableObject {
     /// selection looked like it had been followed.
     var nativeSubtitleRenderingRequested = false
 
+    /// `LoadOptions.deferNativeSubtitleWork`: a declared `.sup` sidecar's OCR fill, held until the host's
+    /// rendering request stands. Cleared with the OCR state on load and stop.
+    var deferredSidecarOCRFill: (externalTrackID: Int, cues: [SubtitleCue])?
+
+    /// `setNativeSubtitleTiming`: the host's retiming of every native rendition, kept across loads.
+    var nativeSubtitleTimingScale: Double = 1
+    var nativeSubtitleTimingOffset: Double = 0
+
     /// AE#464 round 2: the position the load currently in flight was handed, parked across the window
     /// in which `load` has already zeroed the clock but the rebuilt session has not reached it yet.
     /// Written at the two sites that raise `state = .loading` for a load, retired by an accepted seek;

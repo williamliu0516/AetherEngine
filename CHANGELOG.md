@@ -12,6 +12,19 @@ the public-API contract.
 
 ### Added
 
+- **Native subtitle renditions that cost nothing until they are shown (`LoadOptions.deferNativeSubtitleWork`,
+  default off), and the host's subtitle timing in them (`setNativeSubtitleTiming(scale:offset:)`).** For a host
+  that draws its own overlay and wants the WebVTT renditions only for PiP, AirPlay and an external display:
+  with the option, a bitmap pick no longer OCRs every picture and leads the forward prefetcher 270 s ahead
+  from the moment it is selected; the OCR worker (and a declared `.sup` sidecar's fill) starts when
+  `setNativeSubtitleRendering(true)` arrives and stops on `false`, the prefetcher back on the overlay's 75 s.
+  Text renditions were already free at rest. Measured on a 600 s, 8 Mbit/s Matroska over a 22 Mbit/s,
+  35 ms link with a VobSub track picked: 993 MB read in 420 s with the option, 1085 MB without (the 270 s
+  lead); a minute of PiP added nothing measurable in 150 s, text or bitmap. The timing serves each cue at `scale * t + offset`, so a
+  subtitle delay or a frame-rate correction the viewer sees on the overlay is also what a receiver shows;
+  a change while a rendition is shown is replayed through the selection, since AVKit keeps the segments it
+  fetched.
+
 - **Dialogue boost (`LoadOptions.dialogueBoost`, default off).** For a film heard on a phone's speakers
   or headphones at low volume: every audio track goes through the bridge, even one that would
   stream-copy, folded to two channels with the centre 9 dB over the surrounds, a +3 dB presence lift at

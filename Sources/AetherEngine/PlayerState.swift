@@ -745,6 +745,19 @@ public struct LoadOptions: Sendable, Equatable {
     /// Start the native WebVTT subtitle readers eagerly at load (instead of lazily on `setNativeSubtitleSelected`), so the `/subs_N_M.vtt` segments are already populated when AVKit fetches them under a host-independent selection (e.g. an `EXT-X-MEDIA ... DEFAULT=YES` rendition that AVKit auto-selects). Equivalent to a fully-populated static VOD subtitle file. Only meaningful with `prepareNativeSubtitles`. Default `false` (Sodalite#32 probe).
     public var eagerNativeSubtitleReaders: Bool = false
 
+    /// With `prepareNativeSubtitles`, hold back the work only the native renditions need until the host's
+    /// `setNativeSubtitleRendering(true)` stands (a PiP window, an AirPlay receiver, an external display), and stop
+    /// it again on `false`: the OCR of a selected bitmap track (PGS / DVB / DVD), with the 270 s forward-prefetch
+    /// lead it raises (the overlay's is 75 s), and the OCR of a declared `.sup` sidecar. Without it a bitmap pick
+    /// reads a remote source about three more minutes ahead for the whole session, and OCRs every picture, though
+    /// the host draws the overlay itself and the rendition is seen only while the picture is elsewhere. The text
+    /// renditions are unchanged: the producer's pump tap fills them from its own read, and their side readers start
+    /// only when a rendition is selected. The OCR starts from the overlay's packet store, so the first rendition
+    /// covers about the overlay's lead and grows from there. Leave it off when AVKit may select a rendition by itself
+    /// (`DEFAULT=YES`, `nativeSubtitlePreferredLanguages`) without the host asking. A tuning field: correctable
+    /// through `reloadAtCurrentPosition(applying:)`. Default `false`.
+    public var deferNativeSubtitleWork: Bool = false
+
     /// Serve an I-frame rendition (`EXT-X-I-FRAME-STREAM-INF`) next to the master, so a stock `AVPlayerViewController` shows its own scrub thumbnails and can scan on I-frames, with no host code (AE#682). One still per served segment: the source's own keyframe at full resolution for SDR, and for HDR10, HLG and Dolby Vision a tone-mapped SDR Motion JPEG 640 pixels wide, since AVKit shows no scrub thumbnail from a PQ or Dolby Vision keyframe. Costs a second reader on the source for the whole session, opened shortly after load because AVKit asks for the first keyframe before anyone scrubs. Silently absent, with one log line naming the reason, when the session cannot answer every listed keyframe: live, a source without a trustworthy keyframe index (MPEG-TS), `sequentialOrigin`, `heldSourceConnection`, an origin limited to one request, a disc source, a custom reader that cannot clone, or media-playlist routing. A host with its own transport bar wants `scrubThumbnail` instead. A tuning field: correctable through `reloadAtCurrentPosition(applying:)`. Default `false`.
     public var serveIFramePlaylist: Bool = false
 
