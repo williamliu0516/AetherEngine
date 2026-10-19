@@ -2638,6 +2638,9 @@ public final class AetherEngine: ObservableObject {
     var masterFallbackUsed = false
     /// The recovery master (renditions kept) was loaded after a refusal; its own refusal goes to the media playlist.
     var recoveryMasterUsed = false
+    /// What a refusal taught this viewing session about its master; survives session-preserving rebuilds, so they
+    /// start where the ladder ended (`MasterFallbackDecision.Verdict`).
+    var sessionMasterVerdict = MasterFallbackDecision.Verdict.untested
 
     /// #93 PiP skips: AVKit-side seeks (PiP +-15s buttons) bypass the engine seek API, so a far
     /// playhead jump is detected on $renderedTime and, once settled, the native subtitle readers
@@ -2859,6 +2862,7 @@ public final class AetherEngine: ObservableObject {
             return
         }
         if step == .mediaPlaylist { masterFallbackUsed = true }
+        sessionMasterVerdict = sessionMasterVerdict.after(step)
         // AE#459: the display answered. Display-rejection codes only, never the -1002 parse failure.
         // AE#535: and only for an HDR master on an HDR-eligible display, or the answer is about the window.
         if MasterFallbackDecision.isDisplayRejectionCode(rejection.code), !Self.panelRefusedHDRMaster {
@@ -2893,7 +2897,7 @@ public final class AetherEngine: ObservableObject {
                 + "master (subtitle renditions kept, object-audio CHANNELS and DV signaling dropped) at "
                 + (isLive ? "the live edge" : "\(String(format: "%.2f", position))s"),
                 category: .session)
-            host.swapItem(url: airPlayHostSwapped(recoveryURL),
+            host.swapItem(url: airPlayActive ? airPlayHostSwapped(recoveryURL) : recoveryURL,
                           startPosition: isLive ? nil : position,
                           skipInitialSeek: LiveReloadPolicy.skipInitialSeek(isLive: isLive, isRejoin: true))
             if host.transportIntentIsPlaying { host.play() }
@@ -4393,6 +4397,7 @@ public final class AetherEngine: ObservableObject {
             undecodableLiveAudioStreamIndices, sessionPreservingReload: sessionPreservingReloadInFlight)
         masterFallbackUsed = false
         recoveryMasterUsed = false
+        sessionMasterVerdict = sessionMasterVerdict.atLoad(sessionPreserving: sessionPreservingReloadInFlight)
         nativeSubtitleReanchorTask?.cancel()
         nativeSubtitleReanchorTask = nil
         setPendingRecoverySeekTarget(nil)

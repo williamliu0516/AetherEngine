@@ -1336,8 +1336,40 @@ extension AetherEngine {
         // the receiver reaches the engine-processed stream (DV/Atmos/subtitles preserved). An HDR/DV master
         // is downgraded to the media playlist there (an SDR receiver rejects it, DrHurt); an SDR master is
         // kept so its subtitle renditions survive the trip (#227). Reverts on the reload when AirPlay ends.
-        let served = airPlayAdjustedPlayback(url: playbackURL, session: session)
+        var served = airPlayAdjustedPlayback(url: playbackURL, session: session)
         playbackURL = served.url
+        // Each item gets the refusal ladder afresh; a session-preserving rebuild starts where this session's
+        // ladder ended instead of offering AVPlayer a master it already refused (`MasterFallbackDecision.Verdict`).
+        masterFallbackUsed = false
+        recoveryMasterUsed = false
+        switch MasterFallbackDecision.mount(
+            verdict: sessionMasterVerdict, servingMasterPlaylist: session.servingMasterPlaylist,
+            airPlayActive: airPlayActive,
+            recoveryMasterDiffers: session.recoveryMasterPlaylistURL != nil && session.recoveryMasterDiffersFromPrimary) {
+        case .primary:
+            break
+        case .recoveryMaster:
+            if let recoveryURL = session.recoveryMasterPlaylistURL {
+                recoveryMasterUsed = true
+                playbackURL = recoveryURL
+                EngineLog.emit(
+                    "[AetherEngine] this session's master was refused before; the rebuild starts on the recovery "
+                    + "master (subtitle renditions kept, object-audio CHANNELS and DV signaling dropped)",
+                    category: .session)
+            }
+        case .mediaPlaylist:
+            if let mediaURL = session.mediaPlaylistURL {
+                recoveryMasterUsed = true
+                masterFallbackUsed = true
+                session.markServingMediaAfterFallback()
+                playbackURL = mediaURL
+                served.subtitleRenditionsServed = false
+                EngineLog.emit(
+                    "[AetherEngine] this session's master was refused before; the rebuild starts on the media "
+                    + "playlist (no CC/subtitle renditions)",
+                    category: .session)
+            }
+        }
         // Superseded while starting: stop and unwind before touching shared state.
         if loadGeneration != generation {
             session.stop()

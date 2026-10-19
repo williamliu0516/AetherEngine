@@ -12,6 +12,18 @@ the public-API contract.
 
 ### Fixed
 
+- **A session-preserving rebuild starts on the playlist the session's refused master settled on.** On an M5 iPad
+  (iPadOS 27.0.1) every master of a Dolby Vision Profile 7 film was refused with -11868 and the session played from
+  the media playlist; a rebuild (a host's `reloadAtCurrentPosition` for an audio option, the audio pick, a route
+  change) served the full master again, AVPlayer refused it, and the single-shot fallback latch the rebuild had
+  carried over from the previous item surfaced the refusal, which left the item failed until the host reopened the
+  film (about 10 s for one switch). The session now keeps what the refusal ladder settled on (the recovery master or
+  the media playlist) across rebuilds and mounts it directly, logging the choice; each item starts with a fresh
+  ladder, and a new load asks AVPlayer again. The recovery master is loaded on the loopback address unless AirPlay
+  is active (it went to the LAN address).
+
+- **The audio tap's per-segment demuxer opens log as `tap`**, not as the pump's.
+
 - **A file with PGS subtitle tracks opens without reading the whole stream probe.** A PGS track the container
   declares without a size never satisfies `find_stream_info` ("unspecified size") until a display set falls inside
   the probe, so on a Blu-ray remux the probe read its full 50 MiB: 6.8 s of an A12Z iPad's 13.9 s start on

@@ -125,4 +125,55 @@ enum MasterFallbackDecision {
         if renditionsServed, recoveryMasterDiffers, !recoveryMasterTried { return .recoveryMaster }
         return .mediaPlaylist
     }
+
+    /// What this viewing session learnt about its master from a refusal: the step that followed it. Kept across the
+    /// session-preserving rebuilds (`reloadAtCurrentPosition`, the audio pick, a route change), so a rebuild does
+    /// not offer AVPlayer the master it already refused. Zool on an M5 iPad (iPadOS 27.0.1, 2026-10-19, a DV P7
+    /// TrueHD film): every master was refused with -11868 and the session played from the media playlist; turning
+    /// Boost Dialogue off rebuilt the session behind the full master again, AVPlayer refused it, and the ladder,
+    /// whose single-shot latch the rebuild had carried over from the previous item, surfaced the refusal instead
+    /// of falling back. The host's watchdog reopened the film 4 s later: about 10 s for one switch.
+    enum Verdict: Equatable {
+        case untested
+        case recoveryMaster
+        case mediaPlaylist
+
+        /// After a refusal led to `step`.
+        func after(_ step: Step) -> Verdict {
+            switch step {
+            case .recoveryMaster: self == .mediaPlaylist ? self : .recoveryMaster
+            case .mediaPlaylist: .mediaPlaylist
+            case .surface: self
+            }
+        }
+
+        /// At a load: a session-preserving rebuild keeps what the session learnt, a new load asks again.
+        func atLoad(sessionPreserving: Bool) -> Verdict {
+            sessionPreserving ? self : .untested
+        }
+    }
+
+    /// The playlist a session's new item starts on.
+    enum Mount: Equatable {
+        /// What the session chose (its master, or the media playlist it serves anyway).
+        case primary
+        /// The recovery master this session's refusal settled on.
+        case recoveryMaster
+        /// The media playlist this session's refusal settled on.
+        case mediaPlaylist
+    }
+
+    /// Where a new item starts: the step this session's refusal settled on, when the new session serves a master
+    /// again. AirPlay keeps its own receiver decision (`AirPlayPlaylistDecision`). A recovery master that would say
+    /// nothing less than the primary (no DV, no object audio in the rebuilt session) is the primary, which is what
+    /// was accepted.
+    static func mount(verdict: Verdict, servingMasterPlaylist: Bool, airPlayActive: Bool,
+                      recoveryMasterDiffers: Bool) -> Mount {
+        guard servingMasterPlaylist, !airPlayActive else { return .primary }
+        switch verdict {
+        case .untested: return .primary
+        case .mediaPlaylist: return .mediaPlaylist
+        case .recoveryMaster: return recoveryMasterDiffers ? .recoveryMaster : .primary
+        }
+    }
 }
