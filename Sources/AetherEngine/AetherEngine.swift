@@ -2673,7 +2673,29 @@ public final class AetherEngine: ObservableObject {
 
     /// Single write path for the recovery seek intent: the MainActor field and its off-main mirror
     /// must never diverge (a stale mirror would teleport a wedge re-anchor to a retired target).
+    /// A restart the provider fired for a segment ahead has served it (`VideoSegmentProvider.restartServedHandler`).
+    /// When that is the pending seek's target, the seek's deadline ends now, so its recovery re-issues the seek at once:
+    /// on the device AVPlayer sat on the served target until the 8 s deadline did that (a DV clip's near-end seek,
+    /// A12Z iPad, 2.3 s of 8.2). The restart has put the producer at the target, so the recovery re-seeks without a
+    /// re-anchor.
+    func restartServedSegment(start: Double, end: Double) {
+        guard programmaticSeekInFlight, let target = pendingRecoverySeekClockTarget,
+              Self.restartServedSegmentHoldsSeekTarget(start: start, end: end, target: target),
+              let host = nativeHost else { return }
+        pendingSeekTargetServedAfterRestart = true
+        guard host.expireSeekDeadlineNow() else { return }
+        EngineLog.emit(
+            "[AetherEngine] seek target \(String(format: "%.2f", target))s served after a restart "
+            + "(segment \(String(format: "%.2f", start))-\(String(format: "%.2f", end))s); re-seeking now",
+            category: .engine)
+    }
+
+    nonisolated static func restartServedSegmentHoldsSeekTarget(start: Double, end: Double, target: Double) -> Bool {
+        target >= start - 0.5 && target < end + 0.5
+    }
+
     func setPendingRecoverySeekTarget(_ target: Double?) {
+        pendingSeekTargetServedAfterRestart = false
         pendingRecoverySeekDeadlineExpired = false
         pendingRecoverySeekSubtitlesReanchored = false
         pendingRecoverySeekClockTarget = target
@@ -3623,6 +3645,10 @@ public final class AetherEngine: ObservableObject {
     /// missing, and they hid each other: nothing deselected, so a pick made against a standing
     /// selection looked like it had been followed.
     var nativeSubtitleRenderingRequested = false
+
+    /// The pending seek's target was served by a restart the provider fired (`restartServedSegment`): the deadline
+    /// recovery re-seeks without re-anchoring the producer again. Cleared with each new pending target.
+    var pendingSeekTargetServedAfterRestart = false
 
     /// `LoadOptions.deferNativeSubtitleWork`: a declared `.sup` sidecar's OCR fill, held until the host's
     /// rendering request stands. Cleared with the OCR state on load and stop.
@@ -6323,8 +6349,11 @@ public final class AetherEngine: ObservableObject {
                     let recoveryAnchor = Self.recoveryAnchorPosition(
                         frozenPosition: avpReal, pendingSeekTarget: clockTarget,
                         currentRendered: avpReal)
-                    let didReanchor = Self.shouldReanchorProducerAfterSeekDeadline(
-                        isStarved: wasStarved, targetBeyondProducerCoverage: targetBeyondCoverage)
+                    // A target the producer has just served after its own restart needs the seek again, not another
+                    // re-anchor (`restartServedSegment`).
+                    let didReanchor = !pendingSeekTargetServedAfterRestart
+                        && Self.shouldReanchorProducerAfterSeekDeadline(
+                            isStarved: wasStarved, targetBeyondProducerCoverage: targetBeyondCoverage)
                     if didReanchor {
                         reanchorProducerToPlaylistTime(recoveryAnchor)
                         // The playhead will jump when the restarted producer lets the pending seek land.

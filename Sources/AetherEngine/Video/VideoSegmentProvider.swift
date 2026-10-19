@@ -828,6 +828,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// True while the engine's restart coalescer has an in-flight run (#93 residual): waiting
     /// fetches ride it instead of burning fixed retry budgets, and never re-fire at stale indices.
     private let restartActivity: (() -> Bool)?
+    /// A segment a restart this provider fired has just served, with its window on the item axis: the engine re-seeks
+    /// on it at once instead of at its seek deadline (`AetherEngine.restartServedSegment`). Set once by the session.
+    var restartServedHandler: (@Sendable (_ start: Double, _ end: Double) -> Void)?
     /// Base index of the active producer (#93 residual): a fetch for an index within the
     /// producer's forward march window waits for the march instead of tearing it down.
     private let activeProducerBase: (() -> Int?)?
@@ -2018,6 +2021,10 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
 
     private func logServed(index: Int, source: SegmentSource?, totalStart: DispatchTime,
                            restarted: Bool) -> SegmentSource? {
+        // VOD only (live fires no restarts), whose plan never changes, so the window is read as it stands.
+        if restarted, source != nil, !isLive, let served = restartServedHandler, index >= 0, index < segments.count {
+            served(segments[index].startSeconds, segments[index].startSeconds + segments[index].durationSeconds)
+        }
         let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - totalStart.uptimeNanoseconds) / 1_000_000
         if case .data(let bytes) = source {
             EngineLog.emit(

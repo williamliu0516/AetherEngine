@@ -1969,6 +1969,21 @@ final class NativeAVPlayerHost {
         _ = await seek(to: seconds, deadlineSeconds: nil)
     }
 
+    /// The running seek's deadline, to end early (`expireSeekDeadlineNow`), with the generation it belongs to.
+    private var seekDeadlineExpiry: (generation: UInt64, expire: @MainActor () -> Void)?
+
+    /// Ends the running seek's deadline now, as if it had run out: the engine's deadline recovery then re-issues the
+    /// seek. For a target the producer has just served after a restart, which AVPlayer otherwise sat on until the
+    /// deadline (2.3 s of a DV clip's near-end seek on an A12Z iPad). A no-op when the seek has landed or a newer one
+    /// runs. Returns whether there was a deadline to end.
+    @discardableResult
+    func expireSeekDeadlineNow() -> Bool {
+        guard seekInFlight, let pending = seekDeadlineExpiry, pending.generation == seekGeneration else { return false }
+        seekDeadlineExpiry = nil
+        pending.expire()
+        return true
+    }
+
     /// Deadline-bounded seek (#65). Returns `true` only for a successful completion near the target,
     /// `false` for an interrupted/clamped seek or a deadline with the seek still pending. On a deadline expiry the in-flight
     /// `avPlayer.seek` is NOT cancelled (it lands later if it ever can), but `seekInFlight` is cleared for the
@@ -1986,13 +2001,17 @@ final class NativeAVPlayerHost {
         let resumeGuard = SeekResumeGuard()
         return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
             if let deadlineSeconds, deadlineSeconds > 0 {
-                Task { @MainActor [weak self] in
-                    try? await Task.sleep(nanoseconds: UInt64(deadlineSeconds * 1_000_000_000))
+                let expire: @MainActor () -> Void = { [weak self] in
                     guard resumeGuard.claim() else { return } // landing already won the race
                     // Clear seekInFlight for the latest generation so the periodic observer un-gates and the
                     // engine can fold AVPlayer's real position back in. Do not cancel the underlying seek.
                     if let self, gen == self.seekGeneration { self.seekInFlight = false }
                     cont.resume(returning: false)
+                }
+                seekDeadlineExpiry = (gen, expire)
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: UInt64(deadlineSeconds * 1_000_000_000))
+                    expire()
                 }
             }
             // Zero tolerances: unbounded tolerances caused AVPlayer to land on arbitrary sync samples for loopback HLS-fMP4 (openradar 44904505).
