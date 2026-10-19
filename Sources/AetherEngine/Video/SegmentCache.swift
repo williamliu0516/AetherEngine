@@ -162,8 +162,7 @@ final class SegmentCache: @unchecked Sendable {
         self.onResidentSetChanged = onResidentSetChanged
 
         // aether-segments/ prefix lets sweepStaleSessionDirs() find sibling dirs from crashed sessions.
-        let baseDir = baseDirectory ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            .appendingPathComponent("aether-segments", isDirectory: true)
+        let baseDir = baseDirectory ?? Self.defaultBaseDirectory
         let sessionID = UUID().uuidString
         self.sessionDir = baseDir.appendingPathComponent(sessionID, isDirectory: true)
         do {
@@ -177,8 +176,8 @@ final class SegmentCache: @unchecked Sendable {
         }
 
         // Before the sweep, so a sibling constructed in the same breath cannot read this session
-        // as unheld. The age check covers the remaining microseconds: a directory this young is
-        // never a sweep candidate.
+        // as unheld. Until the marker is in place the directory reads as unmarked, and an unmarked
+        // directory this young is never a sweep candidate.
         self.lockFD = Self.acquireLiveMarker(sessionDir: sessionDir)
 
         Self.sweepStaleSessionDirs(baseDir: baseDir, currentSession: sessionID)
@@ -201,7 +200,13 @@ final class SegmentCache: @unchecked Sendable {
         if fd >= 0 { Darwin.close(fd) }
     }
 
-    private static func sweepStaleSessionDirs(baseDir: URL, currentSession: String) {
+    static let defaultBaseDirectory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("aether-segments", isDirectory: true)
+
+    /// A held marker keeps its directory at any age; a free one (owner killed or crashed) goes at any
+    /// age; an unmarked directory goes after an hour, as before markers. Run by every new cache and,
+    /// through `AetherEngine.sweepStaleSessionDirectories()`, once at the host's launch.
+    static func sweepStaleSessionDirs(baseDir: URL = defaultBaseDirectory, currentSession: String? = nil) {
         let fm = FileManager.default
         guard let entries = try? fm.contentsOfDirectory(at: baseDir,
                                                         includingPropertiesForKeys: [.creationDateKey],
@@ -210,13 +215,15 @@ final class SegmentCache: @unchecked Sendable {
         }
         let cutoff = Date().addingTimeInterval(-3600)
         for entry in entries where entry.lastPathComponent != currentSession {
-            let created = (try? entry.resourceValues(forKeys: [.creationDateKey]))?.creationDate
-            guard created == nil || created! < cutoff else { continue }
-            // AE#451: age says how long it has been there, not whether anyone is still using it.
-            if SessionDirectoryLiveness.isLive(entry) {
-                EngineLog.emit("[SegmentCache] sweep spared live session dir \(entry.lastPathComponent)",
-                               category: .session)
+            switch SessionDirectoryLiveness.state(entry) {
+            case .held:
+                // AE#451: age says how long it has been there, not whether anyone is still using it.
                 continue
+            case .free:
+                break
+            case .unmarked:
+                let created = (try? entry.resourceValues(forKeys: [.creationDateKey]))?.creationDate
+                guard created == nil || created! < cutoff else { continue }
             }
             try? fm.removeItem(at: entry)
         }

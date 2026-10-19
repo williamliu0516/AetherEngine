@@ -1578,6 +1578,14 @@ public final class AetherEngine: ObservableObject {
 
     // MARK: - Capabilities
 
+    /// Removes the segment-cache folders (`tmp/aether-segments/`) that a killed or crashed process left
+    /// behind, 100 MB and more each. A folder whose session is still live stays. Every new playback
+    /// sweeps too; a host calls this once at launch, off the main thread, so the space comes back
+    /// without waiting for the next play.
+    public nonisolated static func sweepStaleSessionDirectories() {
+        SegmentCache.sweepStaleSessionDirs()
+    }
+
     /// TEST-ONLY: forces every source through SoftwarePlaybackHost so the SW live+DVR path can be exercised
     /// against H.264 fixtures. Set only via `setForceSoftwarePathForTesting(_:)` from `aetherctl`.
     nonisolated(unsafe) static var forceSoftwarePathForTesting = false
