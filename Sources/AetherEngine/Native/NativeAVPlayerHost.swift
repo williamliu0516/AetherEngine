@@ -1997,13 +1997,20 @@ final class NativeAVPlayerHost {
     /// The running seek's deadline, to end early (`expireSeekDeadlineNow`), with the generation it belongs to.
     private var seekDeadlineExpiry: (generation: UInt64, expire: @MainActor () -> Void)?
 
+    /// The generation of the seek whose deadline is running, nil when none is.
+    var runningSeekDeadlineGeneration: UInt64? {
+        guard seekInFlight, let pending = seekDeadlineExpiry, pending.generation == seekGeneration else { return nil }
+        return pending.generation
+    }
+
     /// Ends the running seek's deadline now, as if it had run out: the engine's deadline recovery then re-issues the
     /// seek. For a target the producer has just served after a restart, which AVPlayer otherwise sat on until the
     /// deadline (2.3 s of a DV clip's near-end seek on an A12Z iPad). A no-op when the seek has landed or a newer one
     /// runs. Returns whether there was a deadline to end.
     @discardableResult
-    func expireSeekDeadlineNow() -> Bool {
-        guard seekInFlight, let pending = seekDeadlineExpiry, pending.generation == seekGeneration else { return false }
+    func expireSeekDeadlineNow(ifGeneration generation: UInt64? = nil) -> Bool {
+        guard seekInFlight, let pending = seekDeadlineExpiry, pending.generation == seekGeneration,
+              generation == nil || generation == pending.generation else { return false }
         seekDeadlineExpiry = nil
         pending.expire()
         return true

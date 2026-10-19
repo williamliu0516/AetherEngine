@@ -21,8 +21,10 @@ the public-API contract.
 
 - **A seek target that a restart serves is sought again at once, not at the seek's deadline.** After the
   producer restarted for a seek and served the segment holding the target, AVPlayer sat on it until the 8 s
-  deadline ran out (2.3 s of a Dolby Vision clip's near-end seek on an A12Z iPad). The deadline now ends when
-  that segment is served, and the deadline recovery re-issues the seek without reanchoring the producer again.
+  deadline ran out (2.3 s of a Dolby Vision clip's near-end seek on an A12Z iPad). The deadline now ends 1 s after
+  that segment is served if the same seek is still waiting, and the deadline recovery re-issues the seek without
+  reanchoring the producer again. (zool.10 ended it at once, which sent seeks that land within a few hundred
+  milliseconds through the recovery and a rebuffering flicker: 0 to 2 stalls on 8 of 9 release-check files.)
 
 - **Picture in Picture keeps its subtitles when AVPlayer refuses a reload of the master.** On an iPad in PiP, a
   Dolby Vision film with Atmos (`CHANNELS="16/JOC"`) and WebVTT renditions died after an audio route change,

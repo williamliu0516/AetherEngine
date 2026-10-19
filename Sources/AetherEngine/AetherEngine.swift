@@ -2685,12 +2685,23 @@ public final class AetherEngine: ObservableObject {
               Self.restartServedSegmentHoldsSeekTarget(start: start, end: end, target: target),
               let host = nativeHost else { return }
         pendingSeekTargetServedAfterRestart = true
-        guard host.expireSeekDeadlineNow() else { return }
-        EngineLog.emit(
-            "[AetherEngine] seek target \(String(format: "%.2f", target))s served after a restart "
-            + "(segment \(String(format: "%.2f", start))-\(String(format: "%.2f", end))s); re-seeking now",
-            category: .engine)
+        // Only a seek AVPlayer still sits on a while after the segment was served: most land within a few hundred
+        // milliseconds of it, and ending their deadline sent them through the recovery's re-seek and a rebuffering
+        // flicker (releasecheck at zool.10: 0 -> 2 stalls on 8 of 9 files).
+        guard let generation = host.runningSeekDeadlineGeneration else { return }
+        Task { @MainActor [weak host] in
+            try? await Task.sleep(for: .seconds(Self.restartServedReseekGraceSeconds))
+            guard let host, host.expireSeekDeadlineNow(ifGeneration: generation) else { return }
+            EngineLog.emit(
+                "[AetherEngine] seek target \(String(format: "%.2f", target))s served after a restart "
+                + "(segment \(String(format: "%.2f", start))-\(String(format: "%.2f", end))s) and not landed "
+                + "\(Self.restartServedReseekGraceSeconds) s later; re-seeking now",
+                category: .engine)
+        }
     }
+
+    /// How long a seek may wait on a target a restart has served before its deadline is ended (2.3 s measured).
+    nonisolated static let restartServedReseekGraceSeconds: Double = 1.0
 
     nonisolated static func restartServedSegmentHoldsSeekTarget(start: Double, end: Double, target: Double) -> Bool {
         target >= start - 0.5 && target < end + 0.5
