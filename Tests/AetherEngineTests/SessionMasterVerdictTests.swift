@@ -50,4 +50,27 @@ struct SessionMasterVerdictTests {
         #expect(Decision.mount(verdict: .recoveryMaster, servingMasterPlaylist: true, airPlayActive: false,
                                recoveryMasterDiffers: false) == .primary)
     }
+
+    /// Diagnostics 74 and 76: the M5 iPad refused PQ masters only while the user screen-recorded (panelIsHDR=false);
+    /// without a recording it took SDR and HDR10 masters at once. A verdict learnt under capture holds while capture
+    /// lasts and lapses after it, so a rebuild offers the master again.
+    @Test func aVerdictLearntWhileCapturedLapsesWithTheCapture() {
+        #expect(Decision.mount(verdict: .mediaPlaylist, servingMasterPlaylist: true, airPlayActive: false,
+                               recoveryMasterDiffers: true, learntWhileCaptured: true, capturedNow: true)
+                == .mediaPlaylist)
+        #expect(Decision.mount(verdict: .mediaPlaylist, servingMasterPlaylist: true, airPlayActive: false,
+                               recoveryMasterDiffers: true, learntWhileCaptured: true, capturedNow: false)
+                == .primary)
+        #expect(Decision.mount(verdict: .mediaPlaylist, servingMasterPlaylist: true, airPlayActive: false,
+                               recoveryMasterDiffers: true, learntWhileCaptured: false, capturedNow: false)
+                == .mediaPlaylist)
+    }
+
+    /// A refusal under capture is about the capture: it does not latch the process's panel refusal.
+    @Test func aRefusalWhileCapturedDoesNotLatchThePanel() {
+        #expect(!Decision.shouldLatchPanelRefusal(code: -11868, servedMasterIsHDR: true, displayEligibleForHDRNow: true,
+                                                  displaySwitchInProgress: false, screenCaptured: true))
+        #expect(Decision.shouldLatchPanelRefusal(code: -11868, servedMasterIsHDR: true, displayEligibleForHDRNow: true,
+                                                 displaySwitchInProgress: false, screenCaptured: false))
+    }
 }

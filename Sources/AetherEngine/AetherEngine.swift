@@ -2641,6 +2641,8 @@ public final class AetherEngine: ObservableObject {
     /// What a refusal taught this viewing session about its master; survives session-preserving rebuilds, so they
     /// start where the ladder ended (`MasterFallbackDecision.Verdict`).
     var sessionMasterVerdict = MasterFallbackDecision.Verdict.untested
+    /// The verdict came from a refusal while the screen was captured (`ScreenCapture`); it lapses when capture ends.
+    var sessionMasterVerdictWhileCaptured = false
 
     /// #93 PiP skips: AVKit-side seeks (PiP +-15s buttons) bypass the engine seek API, so a far
     /// playhead jump is detected on $renderedTime and, once settled, the native subtitle readers
@@ -2862,20 +2864,28 @@ public final class AetherEngine: ObservableObject {
             return
         }
         if step == .mediaPlaylist { masterFallbackUsed = true }
+        let captured = ScreenCapture.isActive
+        if sessionMasterVerdict == .untested || !captured { sessionMasterVerdictWhileCaptured = captured }
         sessionMasterVerdict = sessionMasterVerdict.after(step)
         // AE#459: the display answered. Display-rejection codes only, never the -1002 parse failure.
         // AE#535: and only for an HDR master on an HDR-eligible display, or the answer is about the window.
         if MasterFallbackDecision.isDisplayRejectionCode(rejection.code), !Self.panelRefusedHDRMaster {
             let eligibleNow = AVPlayer.eligibleForHDRPlayback
             let switching = displayCriteria.displayModeSwitchInProgress
-            if !session.servedSourceIsHDR {
+            if captured, session.servedSourceIsHDR {
+                EngineLog.emit(
+                    "[DisplayCriteria] HDR master refused (code=\(rejection.code)) while the screen is captured "
+                    + "(recording or mirroring); this item falls back, the process does not latch the refusal and "
+                    + "the session asks again once capture ends",
+                    category: .engine)
+            } else if !session.servedSourceIsHDR {
                 EngineLog.emit(
                     "[DisplayCriteria] SDR master refused (code=\(rejection.code)); this item falls back, "
                     + "an SDR refusal does not latch the HDR route (#535)",
                     category: .engine)
             } else if MasterFallbackDecision.shouldLatchPanelRefusal(
                 code: rejection.code, servedMasterIsHDR: true, displayEligibleForHDRNow: eligibleNow,
-                displaySwitchInProgress: switching) {
+                displaySwitchInProgress: switching, screenCaptured: captured) {
                 Self.panelRefusedHDRMaster = true
                 EngineLog.emit(
                     "[DisplayCriteria] panel refused an HDR master (code=\(rejection.code)); this process "
@@ -4398,6 +4408,7 @@ public final class AetherEngine: ObservableObject {
         masterFallbackUsed = false
         recoveryMasterUsed = false
         sessionMasterVerdict = sessionMasterVerdict.atLoad(sessionPreserving: sessionPreservingReloadInFlight)
+        if sessionMasterVerdict == .untested { sessionMasterVerdictWhileCaptured = false }
         nativeSubtitleReanchorTask?.cancel()
         nativeSubtitleReanchorTask = nil
         setPendingRecoverySeekTarget(nil)

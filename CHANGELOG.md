@@ -22,6 +22,12 @@ the public-API contract.
   ladder, and a new load asks AVPlayer again. The recovery master is loaded on the loopback address unless AirPlay
   is active (it went to the LAN address).
 
+- **A master refused while the screen is captured is about the capture.** The M5 iPad refused PQ masters only while
+  the user screen-recorded (the panel left HDR, `eligibleForHDRPlayback` still true); without a recording it took
+  SDR and HDR10 masters at once. Such a refusal (`UITraitCollection.sceneCaptureState == .active`) no longer latches
+  the process's panel refusal, and the session's verdict from it lapses when capture ends, so the next rebuild offers
+  the master again.
+
 - **The audio tap's per-segment demuxer opens log as `tap`**, not as the pump's.
 
 - **A file with PGS subtitle tracks opens without reading the whole stream probe.** A PGS track the container

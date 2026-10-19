@@ -1342,12 +1342,23 @@ extension AetherEngine {
         // ladder ended instead of offering AVPlayer a master it already refused (`MasterFallbackDecision.Verdict`).
         masterFallbackUsed = false
         recoveryMasterUsed = false
+        let capturedNow = ScreenCapture.isActive
+        if sessionMasterVerdict != .untested, sessionMasterVerdictWhileCaptured, !capturedNow {
+            EngineLog.emit(
+                "[AetherEngine] this session's master was refused while the screen was captured; capture has ended, "
+                + "so the rebuild offers the master again",
+                category: .session)
+        }
         switch MasterFallbackDecision.mount(
             verdict: sessionMasterVerdict, servingMasterPlaylist: session.servingMasterPlaylist,
             airPlayActive: airPlayActive,
-            recoveryMasterDiffers: session.recoveryMasterPlaylistURL != nil && session.recoveryMasterDiffersFromPrimary) {
+            recoveryMasterDiffers: session.recoveryMasterPlaylistURL != nil && session.recoveryMasterDiffersFromPrimary,
+            learntWhileCaptured: sessionMasterVerdictWhileCaptured, capturedNow: capturedNow) {
         case .primary:
-            break
+            if sessionMasterVerdictWhileCaptured, !capturedNow {
+                sessionMasterVerdict = .untested
+                sessionMasterVerdictWhileCaptured = false
+            }
         case .recoveryMaster:
             if let recoveryURL = session.recoveryMasterPlaylistURL {
                 recoveryMasterUsed = true

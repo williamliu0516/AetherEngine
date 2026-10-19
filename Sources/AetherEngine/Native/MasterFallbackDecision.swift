@@ -46,9 +46,13 @@ enum MasterFallbackDecision {
     /// AE#535 (2026-10-11): nor when the refused master advertised `VIDEO-RANGE=SDR`. A refusal of an SDR
     /// master says nothing about HDR presentation, yet it latched the HDR route for every later title
     /// (cmcpherson274, two SDR titles' -11848 refusals at 7.15.1 and 7.17.1).
+    ///
+    /// Nor while the screen is captured (`ScreenCapture`): a recording took an M5 iPad's panel out of HDR and
+    /// AVPlayer refused the PQ master while `eligibleForHDRPlayback` read true, an answer about the recording.
     static func shouldLatchPanelRefusal(code: Int, servedMasterIsHDR: Bool, displayEligibleForHDRNow: Bool,
-                                        displaySwitchInProgress: Bool) -> Bool {
+                                        displaySwitchInProgress: Bool, screenCaptured: Bool = false) -> Bool {
         isDisplayRejectionCode(code) && servedMasterIsHDR && displayEligibleForHDRNow && !displaySwitchInProgress
+            && !screenCaptured
     }
 
     /// Any code that means "AVPlayer rejected the served master itself": the display-rejection pair
@@ -167,9 +171,14 @@ enum MasterFallbackDecision {
     /// again. AirPlay keeps its own receiver decision (`AirPlayPlaylistDecision`). A recovery master that would say
     /// nothing less than the primary (no DV, no object audio in the rebuilt session) is the primary, which is what
     /// was accepted.
+    ///
+    /// A verdict learnt while the screen was captured holds only while it still is: the refusal was about the
+    /// recording (`ScreenCapture`), and once it stops the rebuild offers AVPlayer the master again.
     static func mount(verdict: Verdict, servingMasterPlaylist: Bool, airPlayActive: Bool,
-                      recoveryMasterDiffers: Bool) -> Mount {
+                      recoveryMasterDiffers: Bool, learntWhileCaptured: Bool = false,
+                      capturedNow: Bool = false) -> Mount {
         guard servingMasterPlaylist, !airPlayActive else { return .primary }
+        if learntWhileCaptured, !capturedNow { return .primary }
         switch verdict {
         case .untested: return .primary
         case .mediaPlaylist: return .mediaPlaylist
