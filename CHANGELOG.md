@@ -19,7 +19,26 @@ the public-API contract.
   segment to the next, within two minutes; parks on playback are left out), and the provider restarts when the
   segments before the one asked for would take longer than a reopen (1.5 s). A fast source keeps waiting.
 
+- **A seek target that a restart serves is sought again at once, not at the seek's deadline.** After the
+  producer restarted for a seek and served the segment holding the target, AVPlayer sat on it until the 8 s
+  deadline ran out (2.3 s of a Dolby Vision clip's near-end seek on an A12Z iPad). The deadline now ends when
+  that segment is served, and the deadline recovery re-issues the seek without reanchoring the producer again.
+
+- **Picture in Picture keeps its subtitles when AVPlayer refuses a reload of the master.** On an iPad in PiP, a
+  Dolby Vision film with Atmos (`CHANNELS="16/JOC"`) and WebVTT renditions died after an audio route change,
+  and the #93 reload of the same master was refused (-11868, CoreMedia -17223); the media-playlist fallback
+  has no renditions, so the subtitles left the PiP window for the rest of the session. A refusal of a master
+  with renditions now reloads `master_safe.m3u8` first: the same variant and SUBTITLES group without the DV
+  `SUPPLEMENTAL-CODECS` and the object-audio `CHANNELS` (the audio itself is unchanged); only its refusal goes
+  on to the media playlist. A refused or dead item also logs AVPlayer's error log and the last access-log
+  entries, which the report lacked. `Tests/Integration/master-variants-check.sh` opens every master a session
+  serves (SDR, HDR10, DV P8.1, DV P5; JOC or bed audio; with and without renditions) with AVFoundation.
+
 ### Added
+
+- **`ProbeDetail.keyframeIndex`.** `AetherEngine.probe` loads the container's keyframe index through the same
+  seek a session's start makes, so a host that probes on its own `.custom` reader (and keeps that reader's
+  block cache) has the index read before the session opens.
 
 - **One read of the source for subtitles (`setSubtitleLookahead(_:)`).** The forward prefetcher (#151) is a
   second demuxer over the source, and on Matroska it reads the whole interleaved file again: with any

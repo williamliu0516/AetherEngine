@@ -2463,6 +2463,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// HDR-preserving reduced master URL (#98), subtitle-preserving fallback for the #35 cold-DV gate.
     public var reducedHDRMasterPlaylistURL: URL? { server?.reducedHDRMasterPlaylistURL }
 
+    /// The recovery master (renditions kept, JOC and DV signaling dropped) a mid-session rejection reloads first.
+    var recoveryMasterPlaylistURL: URL? { server?.recoveryMasterPlaylistURL }
+
+    /// Whether the recovery master says less than the primary one: DV SUPPLEMENTAL-CODECS or object-audio CHANNELS
+    /// to drop. Otherwise it would be the refused master again.
+    var recoveryMasterDiffersFromPrimary: Bool {
+        guard let provider else { return false }
+        return provider.masterSupplementalCodecs != nil || provider.masterAudioChannels?.contains("JOC") == true
+    }
+
     /// True once the loopback server has handed out an init or media segment this session (#227). The
     /// AirPlay watchdog reads it: a receiver that refuses the manifest asks for playlists and never for a
     /// segment, which separates a refusal from a clock that is merely paused.

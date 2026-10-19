@@ -248,9 +248,15 @@ enum HLSVideoRange: String {
 /// SUPPLEMENTAL-CODECS (DV signaling) but keeps the source range and the SUBTITLES renditions, for the
 /// #35 cold-DV-start gate on an HDR TV. (An SDR-forcing variant was tried and reverted: VIDEO-RANGE=SDR
 /// does not fool the external-display compatibility gate, so HDR/DV on an SDR display stays media-only.)
+///
+/// `.recoveryWithRenditions` is the step after AVPlayer refused the master mid-session (#93 reload after an
+/// audio route change, The Pitt 2026-10-17: -11868 / CoreMedia -17223 on a DV + `16/JOC` + WebVTT master).
+/// It drops SUPPLEMENTAL-CODECS and an object-audio `CHANNELS` value but keeps the range and the SUBTITLES
+/// group, so Picture in Picture keeps its subtitles where the bare media playlist would lose them.
 enum MasterPlaylistVariant: Equatable {
     case primary
     case reducedHDR
+    case recoveryWithRenditions
 }
 
 // MARK: - Local HLS Server
@@ -393,6 +399,15 @@ final class HLSLocalServer: @unchecked Sendable {
         defer { stateLock.unlock() }
         guard port > 0, provider?.masterCodecs != nil else { return nil }
         return URL(string: "http://127.0.0.1:\(port)/\(pathToken)/\(livePlaylistPrefix)master_hdr.m3u8")
+    }
+
+    /// The master a mid-session rejection reloads before the bare media playlist: no SUPPLEMENTAL-CODECS,
+    /// no object-audio CHANNELS, SUBTITLES renditions kept (`MasterPlaylistVariant.recoveryWithRenditions`).
+    var recoveryMasterPlaylistURL: URL? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard port > 0, provider?.masterCodecs != nil else { return nil }
+        return URL(string: "http://127.0.0.1:\(port)/\(pathToken)/\(livePlaylistPrefix)master_safe.m3u8")
     }
 
     /// Numeric address of the peer on an accepted connection, or nil if the socket is already gone (#227 diag).
@@ -546,6 +561,7 @@ final class HLSLocalServer: @unchecked Sendable {
     }
 
     private var loggedReducedMasterPlaylist = false
+    private var loggedRecoveryMasterPlaylist = false
     private var loggedMediaPlaylist = false
     private var loggedRequestHeaders = false
     /// #227 diag: every distinct client address seen this session, logged once each. AirPlay is supposed to
@@ -732,6 +748,7 @@ final class HLSLocalServer: @unchecked Sendable {
         port = 0
         loggedMasterPlaylist = false
         loggedReducedMasterPlaylist = false
+        loggedRecoveryMasterPlaylist = false
         loggedMediaPlaylist = false
         mediaPlaylistBuildCount = 0
         // Under the lock: a handler removes its fd here before it closes it, so a number still in the
@@ -1147,6 +1164,24 @@ final class HLSLocalServer: @unchecked Sendable {
                 stateLock.lock()
                 let firstTime = !loggedReducedMasterPlaylist
                 if firstTime { loggedReducedMasterPlaylist = true }
+                stateLock.unlock()
+                if firstTime {
+                    EngineLog.emit("[HLSLocalServer] \(normalizedPath) body:\n\(body)",
+                                   category: .hlsServer)
+                }
+                return send200(fd: fd, path: normalizedPath,
+                               data: Data(body.utf8),
+                               contentType: "application/vnd.apple.mpegurl")
+            }
+            return send404(fd: fd, path: normalizedPath, reason: "no masterCodecs")
+
+        case "/master_safe.m3u8":
+            // The recovery master after a mid-session rejection: renditions kept, JOC and DV signaling dropped.
+            if provider?.masterCodecs != nil {
+                let body = buildReducedMasterPlaylist(.recoveryWithRenditions)
+                stateLock.lock()
+                let firstTime = !loggedRecoveryMasterPlaylist
+                if firstTime { loggedRecoveryMasterPlaylist = true }
                 stateLock.unlock()
                 if firstTime {
                     EngineLog.emit("[HLSLocalServer] \(normalizedPath) body:\n\(body)",
@@ -1838,7 +1873,10 @@ final class HLSLocalServer: @unchecked Sendable {
             // so this tag is the only place the master can say the rendition is Atmos. Dolby's DD+
             // Online Delivery Kit and the Apple HLS Authoring Spec both spell it
             // `CHANNELS="16/JOC"`; a non-JOC track gets its plain bed count.
-            if let channels = provider.masterAudioChannels {
+            // The recovery master leaves object audio undeclared (the attribute is optional): the refused
+            // reload in the PiP report was the only master that combined it with DV and renditions.
+            if let channels = provider.masterAudioChannels,
+               !(variant == .recoveryWithRenditions && channels.contains("JOC")) {
                 audioAttrs.append("CHANNELS=\"\(channels)\"")
             }
             lines.append("#EXT-X-MEDIA:\(audioAttrs.joined(separator: ","))")

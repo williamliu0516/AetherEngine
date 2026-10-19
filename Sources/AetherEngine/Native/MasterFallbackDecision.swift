@@ -100,4 +100,29 @@ enum MasterFallbackDecision {
     ) -> Bool {
         isMasterRejectionCode(errorCode) && servingMasterPlaylist && !alreadyFellBack
     }
+
+    /// What a refused master leads to.
+    enum Step: Equatable {
+        /// The recovery master: SUBTITLES renditions kept, object-audio CHANNELS and DV SUPPLEMENTAL-CODECS dropped.
+        case recoveryMaster
+        /// The bare media playlist (no renditions).
+        case mediaPlaylist
+        /// Nothing left to try: the refusal is published.
+        case surface
+    }
+
+    /// The step after AVPlayer refused the served master. The Pitt (2026-10-17, iPad, PiP): the #93 reload after
+    /// an audio route change was refused with -11868 and the media fallback took the subtitles out of the PiP
+    /// window for the rest of the session. A master that still carries the renditions but none of the
+    /// attributes only that master combined (`16/JOC` with DV and WebVTT) is tried once first, when renditions
+    /// were served and it differs from the refused one; its own refusal goes on to the media playlist.
+    static func nextStep(
+        errorCode: Int, servingMasterPlaylist: Bool, alreadyFellBack: Bool,
+        renditionsServed: Bool, recoveryMasterDiffers: Bool, recoveryMasterTried: Bool
+    ) -> Step {
+        guard shouldFallBackToMediaPlaylist(errorCode: errorCode, servingMasterPlaylist: servingMasterPlaylist,
+                                            alreadyFellBack: alreadyFellBack) else { return .surface }
+        if renditionsServed, recoveryMasterDiffers, !recoveryMasterTried { return .recoveryMaster }
+        return .mediaPlaylist
+    }
 }

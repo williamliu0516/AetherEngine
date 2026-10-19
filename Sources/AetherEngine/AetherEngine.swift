@@ -2636,6 +2636,8 @@ public final class AetherEngine: ObservableObject {
     /// Single-shot latch for the reactive master->media fallback (#98): fall back at most once per
     /// session so a media reload that also fails cannot loop. Reset on each load.
     var masterFallbackUsed = false
+    /// The recovery master (renditions kept) was loaded after a refusal; its own refusal goes to the media playlist.
+    var recoveryMasterUsed = false
 
     /// #93 PiP skips: AVKit-side seeks (PiP +-15s buttons) bypass the engine seek API, so a far
     /// playhead jump is detected on $renderedTime and, once settled, the native subtitle readers
@@ -2814,15 +2816,19 @@ public final class AetherEngine: ObservableObject {
             publishError(PlaybackErrorInfo(kind: .masterPlaylistRejected, message: rejection.message, underlyingDomain: rejection.domain, underlyingCode: rejection.code))
             return
         }
-        guard MasterFallbackDecision.shouldFallBackToMediaPlaylist(
+        let recoveryURL = session.recoveryMasterPlaylistURL
+        let step = MasterFallbackDecision.nextStep(
             errorCode: rejection.code,
             servingMasterPlaylist: session.servingMasterPlaylist,
-            alreadyFellBack: masterFallbackUsed),
-              let mediaURL = session.mediaPlaylistURL else {
+            alreadyFellBack: masterFallbackUsed,
+            renditionsServed: nativeSubtitleRenditionsServed,
+            recoveryMasterDiffers: recoveryURL != nil && session.recoveryMasterDiffersFromPrimary,
+            recoveryMasterTried: recoveryMasterUsed)
+        guard step != .surface, let mediaURL = session.mediaPlaylistURL else {
             publishError(PlaybackErrorInfo(kind: .masterPlaylistRejected, message: rejection.message, underlyingDomain: rejection.domain, underlyingCode: rejection.code))
             return
         }
-        masterFallbackUsed = true
+        if step == .mediaPlaylist { masterFallbackUsed = true }
         // AE#459: the display answered. Display-rejection codes only, never the -1002 parse failure.
         // AE#535: and only for an HDR master on an HDR-eligible display, or the answer is about the window.
         if MasterFallbackDecision.isDisplayRejectionCode(rejection.code), !Self.panelRefusedHDRMaster {
@@ -2849,6 +2855,25 @@ public final class AetherEngine: ObservableObject {
                     category: .engine)
             }
         }
+        let position = host.mountedStartPosition ?? 0
+        if step == .recoveryMaster, let recoveryURL {
+            recoveryMasterUsed = true
+            EngineLog.emit(
+                "[AetherEngine] AVPlayer rejected the master (code=\(rejection.code)); reloading the recovery "
+                + "master (subtitle renditions kept, object-audio CHANNELS and DV signaling dropped) at "
+                + (isLive ? "the live edge" : "\(String(format: "%.2f", position))s"),
+                category: .session)
+            host.swapItem(url: airPlayHostSwapped(recoveryURL),
+                          startPosition: isLive ? nil : position,
+                          skipInitialSeek: LiveReloadPolicy.skipInitialSeek(isLive: isLive, isRejoin: true))
+            if host.transportIntentIsPlaying { host.play() }
+            if let ordinal = nativeSubtitleReapplyOrdinal {
+                EngineLog.emit("[AetherEngine] re-applying native subtitle ordinal=\(ordinal) on the recovery master",
+                               category: .engine)
+                setNativeSubtitleSelected(track: ordinal)
+            }
+            return
+        }
         session.markServingMediaAfterFallback()
         nativeSubtitleRenditionsServed = false
         // #227: while AirPlaying, the item under the rejection is the LAN-IP URL; `mediaPlaylistURL` is the
@@ -2861,7 +2886,6 @@ public final class AetherEngine: ObservableObject {
         // VOD reloads where the rejected item was placed. That is not always where the session
         // started: the #93/#65 stage-2 recovery swaps a fresh item in at the position it held, and a
         // rejection of THAT item has to come back there, not rewind to the first mount.
-        let position = host.mountedStartPosition ?? 0
         EngineLog.emit(
             "[AetherEngine] AVPlayer rejected the master (code=\(rejection.code)); falling back to "
             + "media playlist (no CC/subtitle renditions) at "
@@ -4338,6 +4362,7 @@ public final class AetherEngine: ObservableObject {
         undecodableLiveAudioStreamIndices = Self.undecodableAudioStreamIndicesAcrossLoad(
             undecodableLiveAudioStreamIndices, sessionPreservingReload: sessionPreservingReloadInFlight)
         masterFallbackUsed = false
+        recoveryMasterUsed = false
         nativeSubtitleReanchorTask?.cancel()
         nativeSubtitleReanchorTask = nil
         setPendingRecoverySeekTarget(nil)

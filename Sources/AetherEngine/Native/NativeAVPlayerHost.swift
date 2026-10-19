@@ -671,6 +671,11 @@ final class NativeAVPlayerHost {
                    let underlying = nsErr.userInfo[NSUnderlyingErrorKey] as? NSError {
                     EngineLog.emit("[NativeAVPlayerHost] #\(sid) item.error.underlying=\(underlying.domain)/\(underlying.code) '\(underlying.localizedDescription)'", category: .engine)
                 }
+                // What AVPlayer itself recorded before refusing (the PiP report's -11868 / -17223 said nothing
+                // else): its error log, and the access log's last entries for the URIs it was on.
+                for line in Self.itemLogLines(item) {
+                    EngineLog.emit("[NativeAVPlayerHost] #\(sid) \(line)", category: .engine)
+                }
                 Task { @MainActor [weak self] in
                     guard let self, self.sessionID == sid else { return }
                     // The KVO callback may be running inside AVFoundation notification delivery.
@@ -839,6 +844,9 @@ final class NativeAVPlayerHost {
             MainActor.assumeIsolated {
                 guard let self = self, self.sessionID == sid,
                       let current = self.playerItem else { return }
+                for line in Self.itemLogLines(current) {
+                    EngineLog.emit("[NativeAVPlayerHost] #\(sid) \(line)", category: .engine)
+                }
                 if self.surfaceEndFailures {
                     // AVPlayer gave up on this item (rate 0, no more segments) and `.failed` may never fire
                     // (item.status can stay readyToPlay). Route into the same deferred confirmation as a .failed
@@ -999,6 +1007,23 @@ final class NativeAVPlayerHost {
         if isPlaying { return false }
         if clockNow > clockAtFailure + threshold { return false }
         return true
+    }
+
+    /// An item's error log in full (AVPlayer keeps a handful of entries) and the last three access-log entries,
+    /// one line each, for the log of a refused or dead item.
+    static func itemLogLines(_ item: AVPlayerItem) -> [String] {
+        var lines: [String] = []
+        for event in item.errorLog()?.events ?? [] {
+            lines.append("errorLog \(event.errorDomain)/\(event.errorStatusCode) '\(event.errorComment ?? "")' "
+                         + "uri=\(event.uri ?? "-")")
+        }
+        for event in (item.accessLog()?.events ?? []).suffix(3) {
+            lines.append("accessLog uri=\(event.uri ?? "-") requests=\(event.numberOfMediaRequests) "
+                         + "stalls=\(event.numberOfStalls) watched=\(String(format: "%.1f", event.durationWatched))s "
+                         + "indicated=\(Int(event.indicatedBitrate))")
+        }
+        if lines.isEmpty { lines.append("errorLog/accessLog empty") }
+        return lines
     }
 
     /// #93 round 3, pure decision: does a `failedToPlayToEndTime` count toward the loopback
