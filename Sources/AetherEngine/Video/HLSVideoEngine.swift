@@ -362,7 +362,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     let subtitlePacketStore = SubtitlePacketStore()
     /// A segment a provider-fired restart has just served, with its window on the item axis
     /// (`VideoSegmentProvider.restartServedHandler`); the engine re-seeks on it. Called off the main actor.
-    var onRestartServedSegment: (@Sendable (_ start: Double, _ end: Double) -> Void)?
+    var onRestartServedSegment: (@Sendable (_ start: Double, _ end: Double, _ event: RestartServedEvent) -> Void)?
 
     /// #112 rework: every embedded subtitle stream in the session demuxer, text AND bitmap.
     /// These all stay in the producer keep-set so late track enables need no restart.
@@ -2249,7 +2249,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             segmentServedHandler: segmentServedHandler
         )
         self.provider = prov
-        prov.restartServedHandler = { [weak self] start, end in self?.onRestartServedSegment?(start, end) }
+        prov.restartServedHandler = { [weak self] start, end, event in self?.onRestartServedSegment?(start, end, event) }
         // AE#520 round 2: the close reads it on the playlist-build thread, so it is a closure over a
         // mirror rather than a read of the item.
         prov.consumerBufferedSecondsProvider = consumerBufferedSecondsProvider

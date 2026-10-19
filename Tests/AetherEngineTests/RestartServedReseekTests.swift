@@ -16,3 +16,25 @@ struct RestartServedReseekTests {
         #expect(!holds(20.95, 24.95, 3))
     }
 }
+
+/// A restart-served target whose bytes never reached AVPlayer (it gave up on the request first) is re-sought at once
+/// (A12Z iPad, 2026-10-19: -12889 at 4.0 s, the segment served at 5.3 s into a closed socket, a second waited for
+/// nothing).
+@Suite("Re-seek when the served target was not delivered")
+struct RestartServedUndeliveredTests {
+
+    @Test("only a failed send of the segment the restart served counts")
+    func event() {
+        let event = VideoSegmentProvider.restartServedEvent
+        #expect(event(1921, 1921, false) == .undelivered)
+        #expect(event(1921, 1921, true) == nil, "delivered: AVPlayer may still land from it")
+        #expect(event(1922, 1921, false) == nil, "another segment says nothing about the target")
+        #expect(event(1921, nil, false) == nil)
+    }
+
+    @Test("an undelivered target is re-sought at once, a delivered one after the grace")
+    func delay() {
+        #expect(AetherEngine.restartServedReseekDelay(.undelivered) == 0)
+        #expect(AetherEngine.restartServedReseekDelay(.served) == AetherEngine.restartServedReseekGraceSeconds)
+    }
+}

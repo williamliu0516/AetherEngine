@@ -902,8 +902,8 @@ extension AetherEngine {
         // #240: the pump claims the source link through this gate while it is fetching, so the
         // subtitle side readers can stay out of its way. Set before start().
         session.sideReaderLinkGate = sideReaderLinkGate
-        session.onRestartServedSegment = { [weak self] start, end in
-            Task { @MainActor in self?.restartServedSegment(start: start, end: end) }
+        session.onRestartServedSegment = { [weak self] start, end, event in
+            Task { @MainActor in self?.restartServedSegment(start: start, end: end, event: event) }
         }
         // AE#682: set before start(), where the session decides whether it can serve the rendition.
         // A custom-IO source is not reopenable by URL, so the side reader gets a clone of its own;

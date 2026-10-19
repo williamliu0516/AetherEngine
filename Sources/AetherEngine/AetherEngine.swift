@@ -2680,28 +2680,47 @@ public final class AetherEngine: ObservableObject {
     /// on the device AVPlayer sat on the served target until the 8 s deadline did that (a DV clip's near-end seek,
     /// A12Z iPad, 2.3 s of 8.2). The restart has put the producer at the target, so the recovery re-seeks without a
     /// re-anchor.
-    func restartServedSegment(start: Double, end: Double) {
+    func restartServedSegment(start: Double, end: Double, event: RestartServedEvent) {
         guard programmaticSeekInFlight, let target = pendingRecoverySeekClockTarget,
               Self.restartServedSegmentHoldsSeekTarget(start: start, end: end, target: target),
               let host = nativeHost else { return }
         pendingSeekTargetServedAfterRestart = true
+        guard let generation = host.runningSeekDeadlineGeneration else { return }
+        let window = "(segment \(String(format: "%.2f", start))-\(String(format: "%.2f", end))s)"
+        let delay = Self.restartServedReseekDelay(event)
+        guard delay > 0 else {
+            // AVPlayer gave up on the request (its own 4 s timeout, -12889) before the bytes came: nothing will land
+            // from it, so the seek goes again now, onto the segment now in the cache.
+            if host.expireSeekDeadlineNow(ifGeneration: generation) {
+                EngineLog.emit(
+                    "[AetherEngine] seek target \(String(format: "%.2f", target))s served after a restart \(window) "
+                    + "but AVPlayer had dropped the request; re-seeking now", category: .engine)
+            }
+            return
+        }
         // Only a seek AVPlayer still sits on a while after the segment was served: most land within a few hundred
         // milliseconds of it, and ending their deadline sent them through the recovery's re-seek and a rebuffering
         // flicker (releasecheck at zool.10: 0 -> 2 stalls on 8 of 9 files).
-        guard let generation = host.runningSeekDeadlineGeneration else { return }
         Task { @MainActor [weak host] in
-            try? await Task.sleep(for: .seconds(Self.restartServedReseekGraceSeconds))
+            try? await Task.sleep(for: .seconds(delay))
             guard let host, host.expireSeekDeadlineNow(ifGeneration: generation) else { return }
             EngineLog.emit(
-                "[AetherEngine] seek target \(String(format: "%.2f", target))s served after a restart "
-                + "(segment \(String(format: "%.2f", start))-\(String(format: "%.2f", end))s) and not landed "
-                + "\(Self.restartServedReseekGraceSeconds) s later; re-seeking now",
-                category: .engine)
+                "[AetherEngine] seek target \(String(format: "%.2f", target))s served after a restart \(window) "
+                + "and not landed \(delay) s later; re-seeking now", category: .engine)
         }
     }
 
     /// How long a seek may wait on a target a restart has served before its deadline is ended (2.3 s measured).
     nonisolated static let restartServedReseekGraceSeconds: Double = 1.0
+
+    /// The wait before re-seeking on a restart-served target: the grace while AVPlayer may still land from the bytes
+    /// it is being sent, none once they could not be delivered.
+    nonisolated static func restartServedReseekDelay(_ event: RestartServedEvent) -> Double {
+        switch event {
+        case .served: return restartServedReseekGraceSeconds
+        case .undelivered: return 0
+        }
+    }
 
     nonisolated static func restartServedSegmentHoldsSeekTarget(start: Double, end: Double, target: Double) -> Bool {
         target >= start - 0.5 && target < end + 0.5

@@ -12,6 +12,12 @@ the public-API contract.
 
 ### Fixed
 
+- **A seek target that a restart served but AVPlayer never received is sought again at once.** On an A12Z iPad
+  over a 62 Mbit/s link, a restart's 17 MB segment took 5.3 s; AVPlayer gave up on the request at 4.0 s (-12889,
+  "No response for media file") and the bytes went into a closed socket (errno 54), after which the seek still
+  waited the 1 s grace for a landing that could not come. The server's report of an undelivered segment now ends
+  the seek's deadline for that target at once; a delivered one keeps the grace.
+
 - **A forward seek a few segments ahead no longer pumps through them when a restart is quicker.** Within the
   8-segment forward window the provider always waited for the producer's march, and on a slow source that is the
   slow choice: three 18 MB segments of a 37 Mbit/s Dolby Vision file over a 40 Mbit/s SMB share took 10.8 s to

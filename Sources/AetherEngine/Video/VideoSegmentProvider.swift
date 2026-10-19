@@ -828,9 +828,12 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// True while the engine's restart coalescer has an in-flight run (#93 residual): waiting
     /// fetches ride it instead of burning fixed retry budgets, and never re-fire at stale indices.
     private let restartActivity: (() -> Bool)?
-    /// A segment a restart this provider fired has just served, with its window on the item axis: the engine re-seeks
-    /// on it at once instead of at its seek deadline (`AetherEngine.restartServedSegment`). Set once by the session.
-    var restartServedHandler: (@Sendable (_ start: Double, _ end: Double) -> Void)?
+    /// A segment a restart this provider fired has just served, with its window on the item axis, and then, if its
+    /// bytes never reached AVPlayer, that it went undelivered: the engine re-seeks on it instead of waiting out its
+    /// seek deadline (`AetherEngine.restartServedSegment`). Set once by the session.
+    var restartServedHandler: (@Sendable (_ start: Double, _ end: Double, _ event: RestartServedEvent) -> Void)?
+    /// The last segment `restartServedHandler` was told about, so its delivery can be reported too.
+    private var restartServedIndex: Int?
     /// Base index of the active producer (#93 residual): a fetch for an index within the
     /// producer's forward march window waits for the march instead of tearing it down.
     private let activeProducerBase: (() -> Int?)?
@@ -1600,6 +1603,24 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// a placement can tell a request still being answered from one that never will be.
     func didServeMediaSegment(index: Int, delivered: Bool) {
         segmentServedHandler?(index, delivered)
+        stateLock.lock()
+        let restartServed = restartServedIndex
+        if restartServed == index { restartServedIndex = nil }
+        stateLock.unlock()
+        if Self.restartServedEvent(index: index, restartServedIndex: restartServed, delivered: delivered) == .undelivered,
+           let served = restartServedHandler, index >= 0, index < segments.count {
+            served(segments[index].startSeconds, segments[index].startSeconds + segments[index].durationSeconds,
+                   .undelivered)
+        }
+    }
+
+    /// What a finished serve of `index` says about the segment a restart served last: nothing for another segment
+    /// or a delivered one; `.undelivered` when its bytes never reached AVPlayer. On the A12Z iPad (2026-10-19) AVPlayer
+    /// gave up on a restart's 17 MB segment after 4.0 s (-12889) and the bytes served at 5.3 s went into a closed
+    /// socket (errno 54), so waiting on AVPlayer to land from that request cost a second for nothing.
+    static func restartServedEvent(index: Int, restartServedIndex: Int?, delivered: Bool) -> RestartServedEvent? {
+        guard index == restartServedIndex, !delivered else { return nil }
+        return .undelivered
     }
 
     /// AE#418 round 2: whether this request puts a segment into AVPlayer's timeline anew.
@@ -2023,7 +2044,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                            restarted: Bool) -> SegmentSource? {
         // VOD only (live fires no restarts), whose plan never changes, so the window is read as it stands.
         if restarted, source != nil, !isLive, let served = restartServedHandler, index >= 0, index < segments.count {
-            served(segments[index].startSeconds, segments[index].startSeconds + segments[index].durationSeconds)
+            stateLock.lock(); restartServedIndex = index; stateLock.unlock()
+            served(segments[index].startSeconds, segments[index].startSeconds + segments[index].durationSeconds, .served)
         }
         let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - totalStart.uptimeNanoseconds) / 1_000_000
         if case .data(let bytes) = source {
@@ -3207,4 +3229,12 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             return (c.start, c.end, plain)
         }
     }
+}
+
+/// What became of a segment a seek's restart produced (`VideoSegmentProvider.restartServedHandler`).
+enum RestartServedEvent: Equatable, Sendable {
+    /// Its bytes are in hand and being sent.
+    case served
+    /// The send failed: AVPlayer had given up on the request, so it cannot land from it.
+    case undelivered
 }
