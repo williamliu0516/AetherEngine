@@ -189,8 +189,7 @@ final class SegmentCache: @unchecked Sendable {
         self.onResidentSetChanged = onResidentSetChanged
 
         // aether-segments/ prefix lets sweepStaleSessionDirs() find sibling dirs from crashed sessions.
-        let baseDir = baseDirectory ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            .appendingPathComponent("aether-segments", isDirectory: true)
+        let baseDir = baseDirectory ?? Self.defaultBaseDirectory
         self.sessionDir = baseDir.appendingPathComponent(sessionID, isDirectory: true)
         do {
             try FileManager.default.createDirectory(at: sessionDir,
@@ -204,8 +203,8 @@ final class SegmentCache: @unchecked Sendable {
         }
 
         // Before the sweep, so a sibling constructed in the same breath cannot read this session
-        // as unheld (AE#451). The age check covers the remaining microseconds: a directory this
-        // young is never a sweep candidate.
+        // as unheld (AE#451). Until the marker is in place the directory reads as unmarked, and an
+        // unmarked directory this young is never a sweep candidate.
         self.lockFD = Self.acquireLiveMarker(sessionDir: sessionDir)
         let sweep = Self.sweepStaleSessionDirs(baseDir: baseDir, currentSession: sessionID, now: now)
         if sweep.failureCount > 0 {
@@ -235,13 +234,20 @@ final class SegmentCache: @unchecked Sendable {
         if fd >= 0 { Darwin.close(fd) }
     }
 
-    /// Bounded crash-remnant cleanup. Only expired sibling directories are eligible; the current
-    /// UUID and fresh sessions are never removed. Preserve upstream creation-time age and held-lock
-    /// liveness checks. Both directory inspection and deletion are capped
-    /// so a cache root with many crash remnants cannot create an unbounded startup I/O burst.
+    static let defaultBaseDirectory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("aether-segments", isDirectory: true)
+
+    /// Bounded crash-remnant cleanup; the current UUID is never removed. A sibling whose marker is
+    /// held stays at any age (AE#451); one whose marker is free (the kernel dropped a killed or
+    /// crashed owner's lock) goes at any age; an unmarked one (a build without markers, a DVR ring's
+    /// directory before it locks) goes once it is an hour old, as before markers. Run by every new
+    /// cache and, through `AetherEngine.sweepStaleSessionDirectories()`, once at the host's launch.
+    /// Both directory inspection and deletion are capped so a cache root with many crash remnants
+    /// cannot create an unbounded startup I/O burst.
+    @discardableResult
     static func sweepStaleSessionDirs(
-        baseDir: URL,
-        currentSession: String,
+        baseDir: URL = defaultBaseDirectory,
+        currentSession: String? = nil,
         now: Date = Date(),
         maxEntries: Int = 128,
         maxRemovals: Int = 16
@@ -269,13 +275,22 @@ final class SegmentCache: @unchecked Sendable {
             let values: URLResourceValues
             do { values = try entry.resourceValues(forKeys: [.isDirectoryKey, .creationDateKey]) }
             catch { failures += 1; continue }
-            // An unreadable creation date counts as old, as before; liveness still spares a held one.
-            guard values.isDirectory == true, (values.creationDate.map { $0 < cutoff } ?? true) else { continue }
-            // Old does not mean abandoned: spare sessions whose marker is held (AE#451).
-            if SessionDirectoryLiveness.isLive(entry) {
-                EngineLog.emit("[SegmentCache] sweep spared live session dir \(entry.lastPathComponent)",
-                               category: .session)
+            guard values.isDirectory == true else { continue }
+            // An unreadable creation date counts as old, as before.
+            let old = values.creationDate.map { $0 < cutoff } ?? true
+            switch SessionDirectoryLiveness.state(entry) {
+            case .held:
+                // Old does not mean abandoned: spare sessions whose marker is held (AE#451).
+                if old {
+                    EngineLog.emit("[SegmentCache] sweep spared live session dir \(entry.lastPathComponent)",
+                                   category: .session)
+                }
                 continue
+            case .free:
+                // The marker is there and nobody holds it: its owner was killed or crashed. At any age.
+                break
+            case .unmarked:
+                guard old else { continue }
             }
             do {
                 try fm.removeItem(at: entry)
