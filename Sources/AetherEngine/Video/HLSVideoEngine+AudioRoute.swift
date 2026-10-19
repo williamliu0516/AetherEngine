@@ -274,7 +274,7 @@ extension HLSVideoEngine {
                     )
                 }
             }
-        } else if preferBridge && sourceIsAtmos && !dialogueBoost {
+        } else if preferBridge && sourceIsAtmos && !audioIsProcessed {
             // EAC3+JOC always stream-copies; a pre-bridge decision is a codec-table bug.
             EngineLog.emit(
                 "[HLSVideoEngine] WARNING: Atmos source pre-routed to FLAC bridge without stream-copy attempt, Atmos lost. Investigate the codec compatibility table.",
@@ -284,7 +284,7 @@ extension HLSVideoEngine {
 
         // #731: TrueHD Atmos or DTS:X with object rendering requested. Tried before the channel bridges,
         // which it falls back to on any failure (see buildSpatialAudioProducerIfEligible).
-        if !forcedDrop, !dialogueBoost, let audioStream = sourceAudioStream, sourceAudioStreamIndex >= 0,
+        if !forcedDrop, !audioIsProcessed, let audioStream = sourceAudioStream, sourceAudioStreamIndex >= 0,
            let prod = buildSpatialAudioProducerIfEligible(
                audioStream: audioStream,
                audioDemuxer: audioDemuxer,
@@ -317,7 +317,8 @@ extension HLSVideoEngine {
                         // The first attempt lets the bridge resolve, so a container that under-reports its
                         // channel count still gets the decoder-resolved answer; only the retry is forced.
                         forcedEncoder: attemptIndex == 0 ? nil : encoderAttempt,
-                        dialogueBoost: dialogueBoost
+                        dialogueBoost: dialogueBoost,
+                        volumeBoost: volumeBoost
                     )
                 } catch AudioBridge.AudioBridgeError.encoderNotFound(let missing) where !isLastAttempt {
                     EngineLog.emit(

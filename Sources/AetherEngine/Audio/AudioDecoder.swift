@@ -55,6 +55,9 @@ final class AudioDecoder: @unchecked Sendable {
     /// raised and processed by `DialogueBoostProcessor`.
     var dialogueBoost = false
     private var boost: DialogueBoostProcessor?
+    /// `LoadOptions.volumeBoost`, set before `open`: over 1, the output is raised by it under a limiter.
+    var volumeBoost: Double = 1
+    private var gainStage: VolumeBoostProcessor?
 
     func open(stream: UnsafeMutablePointer<AVStream>) throws {
         guard let codecpar = stream.pointee.codecpar else {
@@ -191,6 +194,8 @@ final class AudioDecoder: @unchecked Sendable {
         )
         guard ret >= 0, let swr = swrContext else { return false }
         if dialogueBoost { DialogueBoostProcessor.applyFold(to: swr) }
+        gainStage = VolumeBoostProcessor.isActive(volumeBoost)
+            ? VolumeBoostProcessor(gain: volumeBoost, sampleRate: Int(sampleRate > 0 ? sampleRate : 48_000)) : nil
         guard swr_init(swr) >= 0 else {
             swr_free(&swrContext)
             return false
@@ -223,6 +228,7 @@ final class AudioDecoder: @unchecked Sendable {
         // Re-anchor the gapless clock to the post-seek PTS on the next emitted buffer.
         clock.reset()
         boost?.reset()
+        gainStage?.reset()
         #if DEBUG
         _loggedZeroConvert = false
         #endif
@@ -369,6 +375,9 @@ final class AudioDecoder: @unchecked Sendable {
                 interleavedFloat: UnsafeMutableRawPointer(tempBuffer).assumingMemoryBound(to: Float.self),
                 frameCount: Int(convertedSamples))
         }
+        gainStage?.process(
+            interleavedFloat: UnsafeMutableRawPointer(tempBuffer).assumingMemoryBound(to: Float.self),
+            channels: Int(channels), frameCount: Int(convertedSamples))
 
         // First frame in a new accumulator captures the PTS; subsequent frames only extend the buffer.
         if pendingSampleCount == 0 {

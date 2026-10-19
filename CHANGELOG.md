@@ -38,6 +38,17 @@ the public-API contract.
 
 ### Added
 
+- **Volume boost (`LoadOptions.volumeBoost`, 1 to 3, default 1).** For a film still too quiet on a phone's or a
+  tablet's speakers, or on headphones, with the volume all the way up: over 1, every audio track goes through the
+  bridge and its PCM is raised by the gain, then held under full scale by the engine's peak limiter. Channels are
+  kept (Atmos objects give way to the bed, as with `dialogueBoost`, which it stacks after). On a 16 s 5.1 E-AC-3
+  clip: mean level +6.0 dB at 2 and +9.2 dB at 3 (+9.5 asked; the limiter took the rest), per-channel peaks of the
+  served E-AC-3 0.98 and 0.99, none over full scale. Like `dialogueBoost`, a host sets it only for a route the app
+  decodes for, never HDMI or AirPlay. A change takes a reload (`reloadAtCurrentPosition { $0.volumeBoost = g }`,
+  0.7 s without a picture on a local file): AVPlayer's buffered audio was produced at the old gain and its own
+  volume stops at 1. `aetherctl audiotap --volume-boost G`, `serve --volume-boost G` and
+  `play --reload-applying volume-boost=G` drive it.
+
 - **`ProbeDetail.keyframeIndex`.** `AetherEngine.probe` loads the container's keyframe index through the same
   seek a session's start makes, so a host that probes on its own `.custom` reader (and keeps that reader's
   block cache) has the index read before the session opens.

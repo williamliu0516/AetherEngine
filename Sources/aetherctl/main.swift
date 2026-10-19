@@ -67,7 +67,7 @@ func printUsage() {
 
     Usage:
       aetherctl probe [--detect-hdr10plus] [--detect-hdr-vivid] [--detect-atmos] <url>
-      aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] [--iframes] [--atmos-bed 7.1.4] [--audio-index N] [--stereo auto|mono|sbs|ou] <url>
+      aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] [--iframes] [--atmos-bed 7.1.4] [--audio-index N] [--stereo auto|mono|sbs|ou] [--volume-boost G] <url>
       aetherctl validate [--no-dv] [--force-dv] [--dv-base-layer] <url>
       aetherctl swdecode [--frames N] <url>
       aetherctl play [--fel] [--surface | --window] [--cycle-el SECONDS] [--dv-pin SPEC] [--seconds N] [--live] [--no-sw-escalation] [--fast-zap] [--live-start-immediately] [--dvr-window N] [--subs <codec-or-lang>]
@@ -101,7 +101,8 @@ func printUsage() {
                       --reload-applying corrects a LoadOption on the playing
                       session through #460's session-preserving reload, repeatable;
                       keys header.<Name>, audio-bridge, preferred-audio,
-                      decode-path, dolby-vision, prefer-dual-layer-dv, is-live
+                      decode-path, dolby-vision, prefer-dual-layer-dv, dialogue-boost,
+                      volume-boost (a gain, 1 to 3), is-live
                       (is-live is there to show the refusal: a field that names the
                       session is refused, not silently ignored), default +20 s;
                       --sequential-origin declares a fake-range origin (one unranged
@@ -115,7 +116,7 @@ func printUsage() {
       aetherctl dvsurvey [--frames N] [--list K] <file>
       aetherctl extract [--at <sec>] [--snapshot] [--width <px>] [--loops <n>] <url>
       aetherctl audio [--seconds N] <url>
-      aetherctl audiotap [--duration S] [--out PATH.wav] [--remote | --software] [--dialogue-boost] <url>
+      aetherctl audiotap [--duration S] [--out PATH.wav] [--remote | --software] [--dialogue-boost] [--volume-boost G] <url>
                          (#95: decode the loopback audio track to mono 48k WAV, print continuity stats;
                           --software runs a real session through the SW sink, exit 3 if it yields no audible PCM)
       aetherctl customio [--memory] [--forward-only] [--audio-only] [--reload] [--switch-audio] [--select-subs] [--extract] [--audio-index N] [--reload-decode-path automatic|software] <file>
@@ -533,15 +534,16 @@ if first == "audiotap" {
     let software = rest.contains("--software")
     rest.removeAll { $0 == "--software" }
     let dialogueBoost = takeFlag("--dialogue-boost", from: &rest)
+    let volumeBoost = takeDoubleFlag("--volume-boost", from: &rest) ?? 1
     guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
         print("ERROR: audiotap requires a <url> argument")
-        print("Usage: aetherctl audiotap [--duration S] [--out PATH.wav] [--remote | --software] [--dialogue-boost] <url>")
+        print("Usage: aetherctl audiotap [--duration S] [--out PATH.wav] [--remote | --software] [--dialogue-boost] [--volume-boost G] <url>")
         exit(64)
     }
     rest.removeAll { $0 == urlArg }
     rejectStrayFlags(rest, subcommand: "audiotap")
     exit(runAudioTap(url: parseSourceURL(urlArg), duration: duration, outPath: outPath,
-                 remote: remote, software: software, dialogueBoost: dialogueBoost))
+                 remote: remote, software: software, dialogueBoost: dialogueBoost, volumeBoost: volumeBoost))
 }
 
 if first == "hlsfixture" {
@@ -901,6 +903,12 @@ if first == "play" {
                 exit(64)
             }
             optionChanges.append(.dialogueBoost(flag))
+        } else if key == "volume-boost" {
+            guard let gain = Double(value), gain.isFinite else {
+                print("ERROR: --reload-applying volume-boost takes a gain (1 to 3), got '\(value)'")
+                exit(64)
+            }
+            optionChanges.append(.volumeBoost(gain))
         } else if key == "preferred-audio" {
             optionChanges.append(.preferredAudioLanguages(
                 value.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }))
@@ -1109,6 +1117,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     let audioSeconds = secondsFlag ?? 10
     // --native-subs: diagnostics affordance for mov_text subtitle track (#55); serve only.
     let nativeSubsIndex = takeIntFlag("--native-subs", from: &rest)
+    let serveVolumeBoost = takeDoubleFlag("--volume-boost", from: &rest) ?? 1
     // AE#682: list an I-frame rendition in the master; serve only.
     let serveIFrames = takeFlag("--iframes", from: &rest)
     // --throttle-kbps: slow-CDN simulation; starves the producer below real-time to provoke rebuffers.
@@ -1154,7 +1163,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
                  audioDelayMs: serveAudioDelayMs, iFrames: serveIFrames,
                  objectAudioRendering: serveObjectAudioRendering,
                  // `--audio-index` (parsed once above, shared with customio): serve that source stream.
-                 audioStreamIndex: customAudioIndex, stereo: serveStereo)
+                 audioStreamIndex: customAudioIndex, stereo: serveStereo, volumeBoost: serveVolumeBoost)
     case "validate":
         exit(runValidate(url: url, dvModeAvailable: dvModeAvailable, forceDVWithoutDisplay: forceDV,
                          dolbyVisionHandling: dvHandling))

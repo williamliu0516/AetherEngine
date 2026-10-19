@@ -1041,6 +1041,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
         objectAudioRendering: ObjectAudioRendering = .off,
         dialogueBoost: Bool = false,
+        volumeBoost: Double = 1,
         stereoPresentation: StereoPresentation = .automatic,
         stereoOnAnySystem: Bool = false,
         isLiveSession: Bool = false,
@@ -1096,6 +1097,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.audioBridgeMode = audioBridgeMode
         self.objectAudioRendering = objectAudioRendering
         self.dialogueBoost = dialogueBoost
+        self.volumeBoost = VolumeBoostProcessor.clampedGain(volumeBoost)
         self.stereoPresentation = stereoPresentation
         self.stereoOnAnySystem = stereoOnAnySystem
         self.isLiveSession = isLiveSession
@@ -1213,6 +1215,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     /// `LoadOptions.dialogueBoost`: every audio track bridges, folded to stereo and processed for speech.
     let dialogueBoost: Bool
+
+    /// `LoadOptions.volumeBoost`, clamped: over 1, every audio track bridges and is raised by it under a limiter.
+    let volumeBoost: Double
+
+    /// The bridge reworks the audio (dialogue boost or volume boost), so nothing stream-copies or renders objects.
+    var audioIsProcessed: Bool { dialogueBoost || VolumeBoostProcessor.isActive(volumeBoost) }
 
     /// Pre-opened demuxer reused by `start()` to skip `avformat_find_stream_info` (~1-3 s on slow CDN).
     /// Consumed in `start()`; unconsumed instances are closed by `stop()`.
@@ -2106,11 +2114,17 @@ public final class HLSVideoEngine: @unchecked Sendable {
             }
         }
 
-        // Dialogue boost re-mixes the audio, so nothing stream-copies; the host asked for it on a route it decodes for.
-        if dialogueBoost && audioStreamIndex >= 0 && !bridgePreferred {
+        // Dialogue boost re-mixes the audio and volume boost raises it, so nothing stream-copies; the host asked
+        // for either on a route it decodes for.
+        if audioIsProcessed && audioStreamIndex >= 0 && !bridgePreferred {
             bridgePreferred = true
             EngineLog.emit(
-                "[HLSVideoEngine] audio: dialogue boost on, bridging instead of stream-copy (stereo, centre raised, compressed)",
+                "[HLSVideoEngine] audio: "
+                + [dialogueBoost ? "dialogue boost on (stereo, centre raised, compressed)" : nil,
+                   VolumeBoostProcessor.isActive(volumeBoost)
+                       ? "volume boost \(Int((volumeBoost * 100).rounded())) % (limited)" : nil]
+                    .compactMap { $0 }.joined(separator: ", ")
+                + ", bridging instead of stream-copy",
                 category: .session
             )
         }

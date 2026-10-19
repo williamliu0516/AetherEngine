@@ -4,9 +4,11 @@ import AetherEngine
 // MARK: - audiotap (#95): decode the loopback audio track to a WAV, print continuity stats.
 
 func runAudioTap(url: URL, duration: Double, outPath: String,
-                 remote: Bool = false, software: Bool = false, dialogueBoost: Bool = false) -> Int32 {
+                 remote: Bool = false, software: Bool = false, dialogueBoost: Bool = false,
+                 volumeBoost: Double = 1) -> Int32 {
     if software {
-        return runSoftwareAudioTap(url: url, duration: duration, outPath: outPath, dialogueBoost: dialogueBoost)
+        return runSoftwareAudioTap(url: url, duration: duration, outPath: outPath, dialogueBoost: dialogueBoost,
+                                   volumeBoost: volumeBoost)
     }
     EngineLog.handler = { print($0) }
     let mode = remote ? "remote-HLS" : "loopback"
@@ -15,7 +17,7 @@ func runAudioTap(url: URL, duration: Double, outPath: String,
         let report = remote
             ? try AudioTapProbe.runRemote(url: url, durationSeconds: duration, outPath: outPath)
             : try AudioTapProbe.run(url: url, durationSeconds: duration, outPath: outPath,
-                                    dialogueBoost: dialogueBoost)
+                                    dialogueBoost: dialogueBoost, volumeBoost: volumeBoost)
         print(report)
         return 0
     } catch {
@@ -27,14 +29,16 @@ func runAudioTap(url: URL, duration: Double, outPath: String,
 /// #400: the software sink runs inside a real session, so this mode needs the whole engine, not
 /// a reader. CFRunLoopRun rather than a blocking wait: AetherEngine is @MainActor and parking the
 /// main thread would deadlock its executor (same shape as `bgaudio`).
-private func runSoftwareAudioTap(url: URL, duration: Double, outPath: String, dialogueBoost: Bool) -> Int32 {
+private func runSoftwareAudioTap(url: URL, duration: Double, outPath: String, dialogueBoost: Bool,
+                                 volumeBoost: Double) -> Int32 {
     EngineLog.handler = { print($0) }
     print(EngineLog.redacted("aetherctl audiotap (software): \(url.absoluteString) duration=\(duration)s out=\(outPath)"))
     let box = UncheckedBox<Int32?>(nil)
     Task { @MainActor in
         do {
             let report = try await AudioTapProbe.runSoftware(
-                url: url, durationSeconds: duration, outPath: outPath, dialogueBoost: dialogueBoost)
+                url: url, durationSeconds: duration, outPath: outPath, dialogueBoost: dialogueBoost,
+                volumeBoost: volumeBoost)
             print(report)
             // A tap that yields nothing, and one that yields silence, both look like a working
             // run in a report nobody reads to the end. Make them their own exit code.

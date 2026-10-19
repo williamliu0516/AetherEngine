@@ -862,6 +862,7 @@ extension AetherEngine {
             audioBridgeMode: audioBridgeMode,
             objectAudioRendering: loadedOptions.objectAudioRendering,
             dialogueBoost: loadedOptions.dialogueBoost,
+            volumeBoost: loadedOptions.volumeBoost,
             stereoPresentation: loadedOptions.stereoPresentation,
             isLiveSession: isLive,
             dvrWindowSeconds: dvrWindowSeconds,
@@ -2003,6 +2004,7 @@ extension AetherEngine {
         host.elType = elType ?? sourceElType
         host.setAudioDelay(loadedOptions.audioDelaySeconds)   // AE#464: before the decoder opens
         host.dialogueBoost = loadedOptions.dialogueBoost
+        host.volumeBoost = loadedOptions.volumeBoost
         host.deinterlaceConfig = DeinterlaceConfig(
             mode: loadedOptions.deinterlaceMode,
             fieldRate: loadedOptions.deinterlaceFieldRate

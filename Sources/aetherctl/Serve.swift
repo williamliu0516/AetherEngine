@@ -8,7 +8,7 @@ func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = fal
               nativeSubsIndex: Int? = nil, startPosition: Double? = nil,
               audioDelayMs: Int = 0, iFrames: Bool = false,
               objectAudioRendering: ObjectAudioRendering = .off, audioStreamIndex: Int32? = nil,
-              stereo: StereoPresentation? = nil) -> Never {
+              stereo: StereoPresentation? = nil, volumeBoost: Double = 1) -> Never {
     EngineLog.handler = { line in
         let timestamp = ISO8601DateFormatter.string(
             from: Date(),
@@ -28,6 +28,7 @@ func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = fal
     if case .apac(let layout) = objectAudioRendering { flagSuffix += " [--atmos-bed \(layout.rawValue)]" }
     if let audioStreamIndex { flagSuffix += " [--audio-index \(audioStreamIndex)]" }
     if let stereo { flagSuffix += " [--stereo \(stereo)]" }
+    if volumeBoost != 1 { flagSuffix += " [--volume-boost \(volumeBoost)]" }
     print(EngineLog.redacted("aetherctl serve: \(url.absoluteString)\(flagSuffix)"))
     print("")
 
@@ -41,6 +42,7 @@ func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = fal
         dolbyVisionRPUProfile: DolbyVisionRecordAudit.rpuCorrection(url: url),
         audioSourceStreamIndexOverride: audioStreamIndex,
         objectAudioRendering: objectAudioRendering,
+        volumeBoost: volumeBoost,
         // nil (no flag) is the session as this system gets it; a flag resolves it as visionOS would.
         stereoPresentation: stereo ?? .automatic,
         stereoOnAnySystem: stereo != nil

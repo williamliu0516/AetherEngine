@@ -588,6 +588,18 @@ public struct LoadOptions: Sendable, Equatable {
     /// (`nativeRemoteHLS`) is played by AVPlayer as served and ignores it. See `DialogueBoostProcessor`.
     public var dialogueBoost: Bool = false
 
+    /// Volume boost: a gain over the system's maximum, `1` (default, off) to `3` (300 %, +9.5 dB); values outside
+    /// are clamped. For a film still too quiet on built-in speakers or headphones with the volume all the way up.
+    /// Over `1`, every audio track goes through the bridge, even one that would stream-copy, and its PCM is raised
+    /// by the gain and held under full scale by a peak limiter (`VolumeBoostProcessor`); channels are kept (a
+    /// surround track re-encodes with the bridge's encoder), but Atmos objects and `objectAudioRendering` give way
+    /// to the decoded bed, as with `dialogueBoost`, which it stacks after. Like `dialogueBoost`, set it only for a
+    /// route the app decodes for, never HDMI or AirPlay, where the receiver's own volume is the control and the
+    /// source's bitstream should pass through. Changing it takes a reload (`reloadAtCurrentPosition(_:)`): the
+    /// audio AVPlayer has buffered ahead was produced at the old gain, and AVPlayer's own volume stops at 1.
+    /// Covers the loopback and software paths; a native remote HLS session ignores it.
+    public var volumeBoost: Double = 1
+
     /// How a 3D source is presented where the system shows stereo (visionOS; elsewhere every source plays
     /// 2D as before). `.automatic` (default) keeps an MV-HEVC stream's second view and presents the frame
     /// packing a container declares; `.sideBySide` / `.overUnder` say what the file's name alone says (a

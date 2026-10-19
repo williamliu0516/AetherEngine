@@ -220,6 +220,8 @@ final class AudioBridge: @unchecked Sendable {
     /// `LoadOptions.dialogueBoost`: a centre-weighted fold to two channels, then `DialogueBoostProcessor` on
     /// the resampled PCM before the FIFO. Nil when the option is off.
     private var dialogueBoost: DialogueBoostProcessor?
+    /// `LoadOptions.volumeBoost`: the gain and limiter on the resampled PCM, after the dialogue boost. Nil when off.
+    private var volumeBoost: VolumeBoostProcessor?
     private var resampledFrame: UnsafeMutablePointer<AVFrame>?
 
     /// Encoder PTS counter in encoder time base, incremented by nb_samples/frame. FLAC demands monotonically
@@ -263,7 +265,8 @@ final class AudioBridge: @unchecked Sendable {
         srcTimeBase: AVRational,
         mode: Mode = .surroundCompat,
         forcedEncoder: AVCodecID? = nil,
-        dialogueBoost: Bool = false
+        dialogueBoost: Bool = false,
+        volumeBoost: Double = 1
     ) throws {
         self.srcTimeBase = srcTimeBase
         self.mode = mode
@@ -362,7 +365,7 @@ final class AudioBridge: @unchecked Sendable {
             pcmSampleFmt = AV_SAMPLE_FMT_FLTP
             pcmBytesPerSample = 4
             pcmBitsPerRawSample = 32
-        } else if isLosslessSource || dialogueBoost {
+        } else if isLosslessSource || dialogueBoost || VolumeBoostProcessor.isActive(volumeBoost) {
             pcmSampleFmt = AV_SAMPLE_FMT_S32
             pcmBytesPerSample = 4
             pcmBitsPerRawSample = 24
@@ -395,6 +398,8 @@ final class AudioBridge: @unchecked Sendable {
             ? 2 : min(resolvedChannels, Self.maxEncodedChannels(for: encoderCodecID))
         self.dialogueBoost = dialogueBoost
             ? DialogueBoostProcessor(sampleRate: Int(sampleRate), stereoSource: resolvedChannels <= 2) : nil
+        self.volumeBoost = VolumeBoostProcessor.isActive(volumeBoost)
+            ? VolumeBoostProcessor(gain: volumeBoost, sampleRate: Int(sampleRate)) : nil
         let encoderName = avcodec_get_name(encoderCodecID).map { String(cString: $0) } ?? "?"
         let logBitRate: String = encoderCodecID == AV_CODEC_ID_EAC3
             ? "\(Int64(nChannels) * 128) kbps"
@@ -408,6 +413,7 @@ final class AudioBridge: @unchecked Sendable {
             + "sourceChannels=\(resolvedChannels) "
             + "encoderChannels=\(nChannels) bitRate=\(logBitRate) "
             + (dialogueBoost ? "dialogueBoost=on " : "")
+            + (self.volumeBoost.map { "volumeBoost=\(Int((Double($0.gain) * 100).rounded()))% " } ?? "")
             + "(source=\(resolvedSource), container=\(containerChannels), decoder=\(decoderChannels))",
             category: .session
         )
@@ -716,6 +722,7 @@ final class AudioBridge: @unchecked Sendable {
             _ = swr_init(swr)
         }
         dialogueBoost?.reset()
+        volumeBoost?.reset()
         rebaseFromNextSourcePTS = true
     }
 
@@ -1182,6 +1189,19 @@ final class AudioBridge: @unchecked Sendable {
                 boost.process(
                     interleavedS32: UnsafeMutableRawPointer(buffers[0]).assumingMemoryBound(to: Int32.self),
                     frameCount: Int(producedSamples))
+            }
+        }
+        if let gainStage = volumeBoost {
+            if isPlanar {
+                gainStage.process(
+                    planes: (0..<Int(nChannels)).map {
+                        UnsafeMutableRawPointer(buffers[$0]).assumingMemoryBound(to: Float.self)
+                    },
+                    frameCount: Int(producedSamples))
+            } else {
+                gainStage.process(
+                    interleavedS32: UnsafeMutableRawPointer(buffers[0]).assumingMemoryBound(to: Int32.self),
+                    channels: Int(nChannels), frameCount: Int(producedSamples))
             }
         }
 

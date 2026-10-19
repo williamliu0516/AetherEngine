@@ -1177,6 +1177,7 @@ final class SoftwarePlaybackHost {
             }
             let aDec = AudioDecoder()
             aDec.dialogueBoost = dialogueBoost
+            aDec.volumeBoost = volumeBoost
             do {
                 // AE#462 harness (TEST-ONLY): same forced drop the loopback cascade honors.
                 if AetherEngine.forceAudioPipelineFailureForTesting {
@@ -1406,6 +1407,8 @@ final class SoftwarePlaybackHost {
     var deinterlaceConfig = DeinterlaceConfig()
     /// `LoadOptions.dialogueBoost`, handed to the audio decoder when it opens.
     var dialogueBoost = false
+    /// `LoadOptions.volumeBoost`, handed to the audio decoder when it opens.
+    var volumeBoost: Double = 1
 
     /// #112 rework: build an overlay decoder for any embedded subtitle stream, seeded from the
     /// session's video dims like the HLS tap routes. The drainer owns the returned decoder.

@@ -24,10 +24,11 @@ public enum AudioTapProbe {
         public var errorDescription: String? { description }
     }
 
-    /// `dialogueBoost`: the session's `LoadOptions.dialogueBoost`, so the WAV holds the boosted mix.
+    /// `dialogueBoost` and `volumeBoost`: the session's `LoadOptions` fields, so the WAV holds the boosted mix.
     public static func run(url: URL, durationSeconds: Double, outPath: String,
-                           dialogueBoost: Bool = false) throws -> String {
-        let session = HLSVideoEngine(url: url, dvModeAvailable: false, dialogueBoost: dialogueBoost)
+                           dialogueBoost: Bool = false, volumeBoost: Double = 1) throws -> String {
+        let session = HLSVideoEngine(url: url, dvModeAvailable: false, dialogueBoost: dialogueBoost,
+                                     volumeBoost: volumeBoost)
         _ = try session.start()
         defer { session.stop() }
         guard let cache = session.cache, let provider = session.provider else {
@@ -137,10 +138,12 @@ public enum AudioTapProbe {
     /// Unlike the other two modes this is bound to wall clock: the SW host decodes in real time.
     @MainActor
     public static func runSoftware(url: URL, durationSeconds: Double, outPath: String,
-                                   dialogueBoost: Bool = false) async throws -> SoftwareTapReport {
+                                   dialogueBoost: Bool = false,
+                                   volumeBoost: Double = 1) async throws -> SoftwareTapReport {
         let engine = try AetherEngine()
         var options = LoadOptions()
         options.dialogueBoost = dialogueBoost
+        options.volumeBoost = volumeBoost
         try await engine.load(url: url, options: options)
         guard engine.playbackBackend == .software else {
             throw ProbeError.notSoftwareRouted(engine.playbackBackend.rawValue)
