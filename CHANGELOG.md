@@ -12,6 +12,14 @@ the public-API contract.
 
 ### Fixed
 
+- **A 7.1 source folded into the E-AC-3 bridge's 5.1 no longer clips.** libswresample does not normalize a float
+  rematrix, so each back channel was added to its side channel at full weight: on 环太平洋's climax (TrueHD 7.1)
+  the side channels reached 1.36 to 1.43 of full scale, E-AC-3 carried the overs to the decoder, and the device
+  clipped them (a MacBook's speakers crackled). The bridge now runs its peak limiter at unity whenever it folds
+  channels into E-AC-3 (`AudioBridge.foldNeedsLimiter`, logged as `foldLimiter=on`). Served through the engine and
+  decoded, 120 s of the climax: 1,355 samples over full scale, side peaks 1.36 -> 23, the highest 1.017 (the codec's
+  own overshoot on the centre channel, there before too).
+
 - **A session-preserving rebuild starts on the playlist the session's refused master settled on.** On an M5 iPad
   (iPadOS 27.0.1) every master of a Dolby Vision Profile 7 film was refused with -11868 and the session played from
   the media playlist; a rebuild (a host's `reloadAtCurrentPosition` for an audio option, the audio pick, a route

@@ -38,6 +38,18 @@ final class AudioBridge: @unchecked Sendable {
 
     // MARK: - Encoder shape
 
+    /// Whether the PCM needs the peak limiter at unity before the encoder: E-AC-3 takes float, and libswresample does
+    /// not normalize a float rematrix (`rematrix_maxval` reads as unbounded for float output), so folding 7.1 into
+    /// 5.1 adds each back channel to its side channel at full weight. On 环太平洋's climax (TrueHD 7.1, 3 min) the side
+    /// channels peaked at 1.43 with 1,941 samples over full scale, and E-AC-3 carried them to the decoder (1.45 after
+    /// a round trip), clipped where the device plays them: the crackle the user heard on a MacBook (Zool, Diagnostics
+    /// 81, 2026-10-19). The integer formats are normalized by libswresample itself, and the dialogue boost's stereo
+    /// fold has its own matrix and FLAC.
+    static func foldNeedsLimiter(encoder: AVCodecID, sourceChannels: Int, encoderChannels: Int,
+                                 dialogueBoost: Bool) -> Bool {
+        encoder == AV_CODEC_ID_EAC3 && !dialogueBoost && sourceChannels > encoderChannels
+    }
+
     /// The encoder a mode opens for a given source. `.lossless` is FLAC unconditionally;
     /// `.surroundCompat` is EAC3 only where there is surround to carry.
     ///
@@ -398,7 +410,9 @@ final class AudioBridge: @unchecked Sendable {
             ? 2 : min(resolvedChannels, Self.maxEncodedChannels(for: encoderCodecID))
         self.dialogueBoost = dialogueBoost
             ? DialogueBoostProcessor(sampleRate: Int(sampleRate), stereoSource: resolvedChannels <= 2) : nil
-        self.volumeBoost = VolumeBoostProcessor.isActive(volumeBoost)
+        let foldLimited = Self.foldNeedsLimiter(encoder: encoderCodecID, sourceChannels: Int(resolvedChannels),
+                                                encoderChannels: Int(nChannels), dialogueBoost: dialogueBoost)
+        self.volumeBoost = VolumeBoostProcessor.isActive(volumeBoost) || foldLimited
             ? VolumeBoostProcessor(gain: volumeBoost, sampleRate: Int(sampleRate)) : nil
         let encoderName = avcodec_get_name(encoderCodecID).map { String(cString: $0) } ?? "?"
         let logBitRate: String = encoderCodecID == AV_CODEC_ID_EAC3
@@ -413,7 +427,9 @@ final class AudioBridge: @unchecked Sendable {
             + "sourceChannels=\(resolvedChannels) "
             + "encoderChannels=\(nChannels) bitRate=\(logBitRate) "
             + (dialogueBoost ? "dialogueBoost=on " : "")
-            + (self.volumeBoost.map { "volumeBoost=\(Int((Double($0.gain) * 100).rounded()))% " } ?? "")
+            + (VolumeBoostProcessor.isActive(volumeBoost)
+                ? (self.volumeBoost.map { "volumeBoost=\(Int((Double($0.gain) * 100).rounded()))% " } ?? "") : "")
+            + (foldLimited ? "foldLimiter=on " : "")
             + "(source=\(resolvedSource), container=\(containerChannels), decoder=\(decoderChannels))",
             category: .session
         )
