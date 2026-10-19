@@ -12,6 +12,16 @@ the public-API contract.
 
 ### Fixed
 
+- **A file with PGS subtitle tracks opens without reading the whole stream probe.** A PGS track the container
+  declares without a size never satisfies `find_stream_info` ("unspecified size") until a display set falls inside
+  the probe, so on a Blu-ray remux the probe read its full 50 MiB: 6.8 s of an A12Z iPad's 13.9 s start on
+  环太平洋 (32 such tracks) over 62-90 Mbit/s, 2.2 s on an M5. Such a stream now sits the probe out as an attachment,
+  as an unresolvable audio track does (#466), and is a subtitle again after it; the embedded decoder never needed the
+  size (it seeds its canvas from the video's and takes the PCS's). Measured through the app's reader from PikPak:
+  find_stream_info 2.2 s -> 2 to 6 ms on 环太平洋, the engine's part of the start 3.9/3.5 s -> 2.3/2.2 s; release-check
+  PGS files' first frame 5.3-5.7 s -> 3.6-4.2 s with the same seeks and the same cue counts; and a 16 MB probe
+  (a host's warm) that gave up at its cap now loads the keyframe index from 6.4 MB.
+
 - **A seek target that a restart served but AVPlayer never received is sought again at once.** On an A12Z iPad
   over a 62 Mbit/s link, a restart's 17 MB segment took 5.3 s; AVPlayer gave up on the request at 4.0 s (-12889,
   "No response for media file") and the bytes went into a closed socket (errno 54), after which the seek still

@@ -1072,8 +1072,10 @@ public final class Demuxer: @unchecked Sendable {
         reclassifyAttachedPictures(ctx)
         boundProbeForDeclaredDiscTitle(ctx)
         let parked = parkUnresolvableAudio(ctx)
+        let parkedSubtitles = parkUnsizedPGS(ctx)
         let findRet = avformat_find_stream_info(ctx, nil)
         unparkUnresolvableAudio(ctx, parked)
+        unparkSubtitles(ctx, parkedSubtitles)
         guard findRet >= 0 else {
             emitOpenTimings(outcome: "find_stream_info failed (\(findRet))")
             throw DemuxerError.streamInfoFailed(code: findRet)
@@ -1164,6 +1166,38 @@ public final class Demuxer: @unchecked Sendable {
                 category: .demux)
         }
         return parked
+    }
+
+    /// A PGS track the container declares without a size keeps `has_codec_parameters` false ("unspecified size") until
+    /// a display set happens to fall inside the probe, so find_stream_info reads to its cap (the #75 pattern the subtitle
+    /// side demuxer already skips, #87). On a Blu-ray remux with 30-odd PGS tracks that is the whole 50 MiB: 6.8 s of an
+    /// A12Z iPad's 13.9 s start over 62-90 Mbit/s, 2.2 s on an M5 (2026-10-19). Nothing needs the size from the probe:
+    /// the embedded decoder seeds its canvas from the video's and takes the PCS's when it arrives. So such a stream sits
+    /// the probe out as an attachment, like an unresolvable audio track (#466), and is a subtitle again after it.
+    static func pgsWaitsOnProbe(codecID: AVCodecID, codecType: AVMediaType, width: Int32) -> Bool {
+        codecType == AVMEDIA_TYPE_SUBTITLE && codecID == AV_CODEC_ID_HDMV_PGS_SUBTITLE && width <= 0
+    }
+
+    private func parkUnsizedPGS(_ ctx: UnsafeMutablePointer<AVFormatContext>) -> [Int] {
+        var parked: [Int] = []
+        for i in 0..<Int(ctx.pointee.nb_streams) {
+            guard let codecpar = ctx.pointee.streams[i]?.pointee.codecpar,
+                  Self.pgsWaitsOnProbe(codecID: codecpar.pointee.codec_id, codecType: codecpar.pointee.codec_type,
+                                       width: codecpar.pointee.width) else { continue }
+            codecpar.pointee.codec_type = AVMEDIA_TYPE_ATTACHMENT
+            parked.append(i)
+        }
+        if !parked.isEmpty {
+            EngineLog.emit("[Demuxer] \(parked.count) PGS stream(s) without a size kept out of the stream probe",
+                           category: .demux)
+        }
+        return parked
+    }
+
+    private func unparkSubtitles(_ ctx: UnsafeMutablePointer<AVFormatContext>, _ parked: [Int]) {
+        for i in parked where i < Int(ctx.pointee.nb_streams) {
+            ctx.pointee.streams[i]?.pointee.codecpar?.pointee.codec_type = AVMEDIA_TYPE_SUBTITLE
+        }
     }
 
     private func unparkUnresolvableAudio(_ ctx: UnsafeMutablePointer<AVFormatContext>, _ parked: [Int]) {
