@@ -3143,6 +3143,9 @@ public final class AetherEngine: ObservableObject {
                 // rebuilt with AAC once the load returns, the master offered again; no in-place fallback.
                 if airPlayActive, noteAirPlayMasterRefusal(session: session) {
                     airPlayCompatRebuildPending = true
+                    // The refused master stays the item until the rebuild replaces it; its late `.failed` is
+                    // held so the host app does not reopen the source meanwhile.
+                    host.holdsStartupFailuresForRebuild = true
                     return
                 }
                 // #98: before the bare (subtitle-less) media playlist, try the HDR-preserving reduced
@@ -7037,9 +7040,15 @@ public final class AetherEngine: ObservableObject {
     /// nothing in the public API reports either, so each offer is made once and remembered.
     let airPlayReceiverBook = AirPlayReceiverBook()
 
+    /// Receivers that failed to start on an HDR master this process, by route UID (#227). An Apple TV parked in SDR
+    /// refuses one. Per process on purpose: a user who switches the receiver's output format to HDR gets the offer
+    /// again on the next launch.
+    private var airPlayReceiversRefusingHDRMaster: Set<String> = []
+
     /// Set when a receiver refused a master whose audio it cannot play: the load finishes, then the session is
     /// rebuilt with AAC audio and the master offered again (`rebuildForAirPlayCompatAudioIfPending`).
     private var airPlayCompatRebuildPending = false
+    private var airPlayCompatRebuildTask: Task<Void, Never>?
     private var airPlayDecodeWatchdog: Task<Void, Never>?
 
     /// The bridge mode a session is built with: the host's, unless a wireless receiver known to play AAC only
@@ -7073,21 +7082,27 @@ public final class AetherEngine: ObservableObject {
     @MainActor
     func noteAirPlayMasterRefusal(session: HLSVideoEngine) -> Bool {
         guard airPlayActive, let uid = Self.currentAirPlayReceiverUID() else { return false }
-        let wantsCompatAudio = !session.servedSourceIsHDR && !session.servesReceiverCompatibleAudio
-        let entry = airPlayReceiverBook.update(uid) { entry in
-            if session.servedSourceIsHDR {
-                entry.refusesHDRMaster = true
-            } else if wantsCompatAudio {
-                entry.needsCompatAudio = true
-            } else {
-                entry.refusesEveryMaster = true
-            }
+        // Once per session: a session already built for the receiver (its AAC encoder absent, the bridge cascaded)
+        // is not rebuilt again; the refusal then means every master.
+        let refusal = AirPlayReceiverBook.refusal(sourceIsHDR: session.servedSourceIsHDR,
+                                                  servesCompatibleAudio: session.servesReceiverCompatibleAudio,
+                                                  builtForReceiver: session.audioBridgeMode == .receiverCompat)
+        let wantsCompatAudio = refusal == .needsCompatAudio
+        let entry: AirPlayReceiverBook.Entry
+        switch refusal {
+        case .hdrMaster:
+            airPlayReceiversRefusingHDRMaster.insert(uid)
+            entry = airPlayReceiverBook.entry(for: uid)
+        case .needsCompatAudio:
+            entry = airPlayReceiverBook.update(uid) { $0.needsCompatAudio = true }
+        case .everyMaster:
+            entry = airPlayReceiverBook.update(uid) { $0.refusesEveryMaster = true }
         }
         EngineLog.emit(
             "[AirPlay] receiver refused the \(session.servedSourceIsHDR ? "HDR" : "SDR") master "
             + "(audio \(session.servedAudioCodecs ?? "none")); remembered: refusesHDRMaster="
-            + "\(entry.refusesHDRMaster) refusesEveryMaster=\(entry.refusesEveryMaster) "
-            + "needsCompatAudio=\(entry.needsCompatAudio)"
+            + "\(airPlayReceiversRefusingHDRMaster.contains(uid)) (this process) refusesEveryMaster="
+            + "\(entry.refusesEveryMaster) needsCompatAudio=\(entry.needsCompatAudio)"
             + (wantsCompatAudio ? "; rebuilding with AAC audio and offering the master again" : ""),
             category: .session)
         return wantsCompatAudio
@@ -7121,15 +7136,24 @@ public final class AetherEngine: ObservableObject {
 
     /// Starts the rebuild `noteAirPlayMasterRefusal` asked for. The rebuilt session reads the receiver's
     /// `needsCompatAudio` through `airPlayAudioBridgeMode` and is built with AAC audio.
+    /// Always rebuilds once asked, AirPlay still on or not: the refused item it replaces is held silent until then.
+    /// Bound to the load that asked; a newer load or a stop cancels it.
     @MainActor
     @discardableResult
     func rebuildForAirPlayCompatAudioIfPending() -> Bool {
         guard airPlayCompatRebuildPending else { return false }
         airPlayCompatRebuildPending = false
-        guard airPlayActive else { return false }
+        let gen = loadGeneration
         EngineLog.emit("[AirPlay] rebuilding the session with AAC stereo audio for this receiver at "
                        + "\(String(format: "%.2f", positionForSessionRebuild))s", category: .session)
-        Task { @MainActor [weak self] in try? await self?.reloadAtCurrentPosition() }
+        airPlayCompatRebuildTask?.cancel()
+        airPlayCompatRebuildTask = Task { @MainActor [weak self] in
+            guard let self, !Task.isCancelled, self.loadGeneration == gen else { return }
+            // The reload's own stopInternal cancels this task's handle; let go of it first, or the
+            // rebuild would cancel itself mid-load.
+            self.airPlayCompatRebuildTask = nil
+            try? await self.reloadAtCurrentPosition()
+        }
         return true
     }
 
@@ -7147,7 +7171,7 @@ public final class AetherEngine: ObservableObject {
         airPlayDecodeWatchdog?.cancel()
         airPlayDecodeWatchdog = nil
         guard airPlayActive, !loadedOptions.isLive, let session = nativeVideoSession,
-              !session.servesReceiverCompatibleAudio else { return }
+              !session.servesReceiverCompatibleAudio, session.audioBridgeMode != .receiverCompat else { return }
         let baseline = currentTime
         airPlayDecodeWatchdog = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(Self.airPlayDecodeWatchdogSeconds * 1_000_000_000))
@@ -7155,7 +7179,7 @@ public final class AetherEngine: ObservableObject {
                   self.state == .playing, let session = self.nativeVideoSession,
                   let uid = Self.currentAirPlayReceiverUID() else { return }
             let advanced = self.currentTime - baseline
-            let fetched = session.mediaSegmentRequestCount
+            let fetched = session.deliveredSegmentCount
             guard advanced < 0.5, fetched >= Self.airPlayDecodeWatchdogSegments else { return }
             self.airPlayReceiverBook.update(uid) { $0.needsCompatAudio = true }
             EngineLog.emit(
@@ -7346,13 +7370,14 @@ public final class AetherEngine: ObservableObject {
         airPlayServedMasterToReceiver = false
         #if os(iOS)
         guard airPlayActive else { return (url, session.servingMasterPlaylist) }
-        let receiver = Self.currentAirPlayReceiverUID().map { airPlayReceiverBook.entry(for: $0) }
-            ?? AirPlayReceiverBook.Entry()
-        let refusedBefore = receiver.refusesHDRMaster || receiver.refusesEveryMaster
+        let receiverUID = Self.currentAirPlayReceiverUID()
+        let receiver = receiverUID.map { airPlayReceiverBook.entry(for: $0) } ?? AirPlayReceiverBook.Entry()
+        let refusedHDRMaster = receiverUID.map { airPlayReceiversRefusingHDRMaster.contains($0) } ?? false
+        let refusedBefore = refusedHDRMaster || receiver.refusesEveryMaster
         let playlist = AirPlayPlaylistDecision.playlistForReceiver(
             servingMasterPlaylist: session.servingMasterPlaylist,
             sourceIsHDR: session.servedSourceIsHDR,
-            receiverRefusedHDRMaster: receiver.refusesHDRMaster,
+            receiverRefusedHDRMaster: refusedHDRMaster,
             receiverRefusesEveryMaster: receiver.refusesEveryMaster)
         let carriesRenditions = AirPlayPlaylistDecision.carriesSubtitleRenditions(playlist)
         guard let lanURL = airPlayPlaybackURL(base: url, playlist: playlist) else {
@@ -7916,6 +7941,9 @@ public final class AetherEngine: ObservableObject {
         dolbyVisionConversion = nil
         airPlayDecodeWatchdog?.cancel()
         airPlayDecodeWatchdog = nil
+        airPlayCompatRebuildTask?.cancel()
+        airPlayCompatRebuildTask = nil
+        airPlayCompatRebuildPending = false
         airPlayProgressWatchdog?.cancel()
         airPlayProgressWatchdog = nil
         displayModeDiagnostic?.cancel()

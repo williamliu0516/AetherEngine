@@ -523,13 +523,14 @@ final class HLSLocalServer: @unchecked Sendable {
     /// The AirPlay progress watchdog needs to tell "the receiver refused the manifest" from "the clock is
     /// not moving for some other reason", and a receiver that refuses never asks for a segment at all.
     private var servedMediaBytes = false
-    /// Media segment requests answered or attempted this session, by anyone. The AirPlay decode watchdog reads
-    /// it to tell a receiver that holds segments and does not play them from one still waiting for them.
-    private var mediaSegmentRequests = 0
-    var mediaSegmentRequestCount: Int {
+    /// Distinct media segments delivered whole this session, to anyone. The AirPlay decode watchdog reads it to
+    /// tell a receiver that holds segments and does not play them from one still waiting for them; a request that
+    /// failed or was retried does not count.
+    private var deliveredSegmentIndices = Set<Int>()
+    var deliveredSegmentCount: Int {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return mediaSegmentRequests
+        return deliveredSegmentIndices.count
     }
 
     /// True once the session has served an init or media segment to anyone (#227).
@@ -1337,13 +1338,14 @@ final class HLSLocalServer: @unchecked Sendable {
             }
             if normalizedPath.hasPrefix("/seg"),
                normalizedPath.hasSuffix(".mp4") {
-                stateLock.lock(); servedMediaBytes = true; mediaSegmentRequests &+= 1; stateLock.unlock()
+                stateLock.lock(); servedMediaBytes = true; stateLock.unlock()
                 let indexStr = normalizedPath.dropFirst(4).dropLast(4)
                 if let index = Int(indexStr), index >= 0 {
                     // AE#418 round 7: every exit from this branch says what became of the request, so
                     // a placement composed from it can tell "not delivered yet" from "never arriving".
                     func delivered(_ ok: Bool) -> Bool {
                         provider?.didServeMediaSegment(index: index, delivered: ok)
+                        if ok { stateLock.lock(); deliveredSegmentIndices.insert(index); stateLock.unlock() }
                         return ok
                     }
                     func refused(_ responseWritten: Bool) -> Bool {

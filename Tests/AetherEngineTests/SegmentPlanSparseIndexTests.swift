@@ -283,5 +283,11 @@ struct SegmentPlanTargetTests {
         #expect(standard.count == 15)
         #expect(short.count == 30)
         #expect(short.allSatisfy { abs($0.durationSeconds - 2) < 0.01 })
+        // The tail rule folds a tail shorter than the session's target, not the default 4 s: a 2 s tail stays 2 s.
+        let collapsed = HLSVideoEngine.collapseShortSegments(
+            short, minDurationSeconds: HLSVideoEngine.minSegmentDurationSeconds,
+            targetSeconds: AetherEngine.thirdPartyReceiverSegmentSeconds)
+        #expect(collapsed.count == 30)
+        #expect(abs((collapsed.last?.durationSeconds ?? 0) - 2) < 0.01)
     }
 }

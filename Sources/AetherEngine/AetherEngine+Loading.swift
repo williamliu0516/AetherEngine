@@ -2762,6 +2762,9 @@ extension AetherEngine {
             // Re-arm samplers: stopInternal nilled them, and the reload path bypasses public load() that normally restarts them. Without this, liveTelemetry stays nil and the stats overlay shows "-" after every audio switch.
             startMemoryProbe()
             startLiveTelemetrySampler()
+            // A route-change reload of a custom source comes through here, not through load(): the AirPlay decode
+            // watchdog is armed for it too.
+            if !targetSoftwarePath, state == .playing { armAirPlayDecodeWatchdog(gen: gen) }
             // Safety net for the live rejoin: if the rebuilt AVPlayer item
             // never reaches readyToPlay although the producer is serving,
             // fail the reload like a load error instead of leaving the user

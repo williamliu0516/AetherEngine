@@ -221,6 +221,10 @@ final class NativeAVPlayerHost {
     /// stashes the message so the engine can surface a real terminal error if the gate exhausts
     /// every option (a timed-out silent 0-track park leaves it nil; the gate supplies a fallback).
     var startupReadinessGateActive: Bool = false
+    /// Set by the engine when its readiness gate left a refused master in place for a session rebuild it has
+    /// already scheduled (an AirPlay receiver that needs AAC): a late `.failed` of that item is held like one
+    /// under the gate, so the host app does not reopen the source while the rebuild runs. The next item load ends it.
+    var holdsStartupFailuresForRebuild = false
     private(set) var lastSuppressedStartupFailure: String?
 
     // MARK: - Seek landing state
@@ -491,6 +495,7 @@ final class NativeAVPlayerHost {
               inPlaceSwap: Bool = false, contract: SessionLoadContract) {
         let outgoingDiagnostics = inPlaceSwap ? itemDiagnostics : nil
         unloadCurrentItem(inPlaceSwap: inPlaceSwap)
+        holdsStartupFailuresForRebuild = false
 
         self.sessionContract = contract
         mountedStartPosition = skipInitialSeek ? nil : (startPosition ?? 0)
@@ -1080,7 +1085,7 @@ final class NativeAVPlayerHost {
             // failures (a display rejection AND the -11819 "Cannot Complete Action" cold handshake).
             // Stash the message and stay silent; the gate polls item state and reloads the master /
             // falls back to media / surfaces a terminal error itself. Publishing here would race it.
-            if startupReadinessGateActive {
+            if startupReadinessGateActive || holdsStartupFailuresForRebuild {
                 lastSuppressedStartupFailure = desc
                 EngineLog.emit(
                     "[NativeAVPlayerHost] #\(sessionID) startup .failed (code=\(code.map(String.init) ?? "?")) "

@@ -1782,7 +1782,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // Fold degenerate sub-frame segments (keyframe clusters make buildKeyframeSegmentPlan emit
         // ~40 ms segments the producer cannot cut, wedging the near-EOF resume; the plan and producer
         // share these boundaries, so the merge fixes both at once).
-        plan = Self.collapseShortSegments(plan, minDurationSeconds: Self.minSegmentDurationSeconds)
+        plan = Self.collapseShortSegments(plan, minDurationSeconds: Self.minSegmentDurationSeconds,
+                                          targetSeconds: vodSegmentTargetSeconds)
         self.segmentPlan = plan
         if !keyframeBytePositions.isEmpty {
             sourcePeakBitrate = Self.peakSegmentBitrate(plan: plan, keyframeBytePositions: keyframeBytePositions)
@@ -2507,7 +2508,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// AirPlay watchdog reads it: a receiver that refuses the manifest asks for playlists and never for a
     /// segment, which separates a refusal from a clock that is merely paused.
     public var hasServedMediaSegment: Bool { server?.hasServedMediaSegment ?? false }
-    var mediaSegmentRequestCount: Int { server?.mediaSegmentRequestCount ?? 0 }
+    var deliveredSegmentCount: Int { server?.deliveredSegmentCount ?? 0 }
 
     /// The audio CODECS entry this session's playlists name (`mp4a.40.2`, `ec-3`, `fLaC`, ...), nil when it
     /// serves no audio. What a wireless receiver is asked to decode, whatever the source carried.
