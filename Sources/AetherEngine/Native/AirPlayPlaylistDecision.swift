@@ -33,8 +33,8 @@ import Foundation
 /// The master is therefore always offered. A receiver that will not take it fails silently, with no
 /// `-11868`, no failed item, and the rate flickering to `playing` for one tick so even `hasEverPlayed`
 /// latches, which is why `AetherEngine`'s progress watchdog is the thing that catches it: five seconds
-/// without a segment fetched reloads the LAN media playlist, and that receiver is remembered for the rest
-/// of the process so it is never made to wait again. Offering the master a second time to exploit the
+/// without a segment fetched reloads the LAN media playlist, and that receiver is remembered
+/// (`AirPlayReceiverBook`, across launches) so it is never made to wait again. Offering the master a second time to exploit the
 /// output switch the first attempt triggers was tried on device and changed nothing but the wait.
 enum AirPlayPlaylistDecision {
 
@@ -52,14 +52,17 @@ enum AirPlayPlaylistDecision {
     ///   - sourceIsHDR: the served variant advertises HDR (`HLSVideoEngine.servedSourceIsHDR`). Must be the
     ///     real `VIDEO-RANGE`, not the DV-capability-inflated `sourceIsHDR`, or SDR content on a DV-capable
     ///     device takes the HDR branch and the renditions are dropped for no reason.
-    ///   - receiverRefusedHDRMaster: this receiver already failed to start on an HDR master this process.
-    ///     Skips the offer and the watchdog wait it would cost again.
+    ///   - receiverRefusedHDRMaster: this receiver already failed to start on an HDR master
+    ///     (`AirPlayReceiverBook`). Skips the offer and the watchdog wait it would cost again.
+    ///   - receiverRefusesEveryMaster: this receiver refused an SDR master too, as third-party receivers do;
+    ///     it gets the media playlist whatever the source.
     static func playlistForReceiver(
         servingMasterPlaylist: Bool,
         sourceIsHDR: Bool,
-        receiverRefusedHDRMaster: Bool = false
+        receiverRefusedHDRMaster: Bool = false,
+        receiverRefusesEveryMaster: Bool = false
     ) -> ReceiverPlaylist {
-        guard servingMasterPlaylist else { return .media }
+        guard servingMasterPlaylist, !receiverRefusesEveryMaster else { return .media }
         guard sourceIsHDR else { return .master }
         return receiverRefusedHDRMaster ? .media : .master
     }

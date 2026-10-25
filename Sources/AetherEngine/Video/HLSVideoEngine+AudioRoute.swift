@@ -274,7 +274,7 @@ extension HLSVideoEngine {
                     )
                 }
             }
-        } else if preferBridge && sourceIsAtmos && !audioIsProcessed {
+        } else if preferBridge && sourceIsAtmos && !audioIsProcessed && audioBridgeMode != .receiverCompat {
             // EAC3+JOC always stream-copies; a pre-bridge decision is a codec-table bug.
             EngineLog.emit(
                 "[HLSVideoEngine] WARNING: Atmos source pre-routed to FLAC bridge without stream-copy attempt, Atmos lost. Investigate the codec compatibility table.",
@@ -284,7 +284,9 @@ extension HLSVideoEngine {
 
         // #731: TrueHD Atmos or DTS:X with object rendering requested. Tried before the channel bridges,
         // which it falls back to on any failure (see buildSpatialAudioProducerIfEligible).
-        if !forcedDrop, !audioIsProcessed, let audioStream = sourceAudioStream, sourceAudioStreamIndex >= 0,
+        // `.receiverCompat` skips it too: a receiver that needs AAC takes no APAC either.
+        if !forcedDrop, !audioIsProcessed, audioBridgeMode != .receiverCompat,
+           let audioStream = sourceAudioStream, sourceAudioStreamIndex >= 0,
            let prod = buildSpatialAudioProducerIfEligible(
                audioStream: audioStream,
                audioDemuxer: audioDemuxer,
@@ -363,9 +365,14 @@ extension HLSVideoEngine {
                     // The label and the CODECS attribute come from the encoder the bridge ACTUALLY opened,
                     // not from the mode: `.surroundCompat` on a stereo source produces fLaC, and a master
                     // playlist that advertises ec-3 for a FLAC track is a load failure, not a cosmetic slip.
-                    let isEAC3Out = bridge.outputCodecID == AV_CODEC_ID_EAC3
-                    let hlsCodec = isEAC3Out ? "ec-3" : "fLaC"
-                    let pipelineLabel = "\(sourceCodecLabel) → \(isEAC3Out ? "EAC3" : "FLAC") bridge"
+                    let (hlsCodec, outLabel): (String, String) = {
+                        switch bridge.outputCodecID {
+                        case AV_CODEC_ID_EAC3: return ("ec-3", "EAC3")
+                        case AV_CODEC_ID_AAC:  return ("mp4a.40.2", "AAC")
+                        default:               return ("fLaC", "FLAC")
+                        }
+                    }()
+                    let pipelineLabel = "\(sourceCodecLabel) → \(outLabel) bridge"
                         + (dialogueBoost ? " (dialogue boost)" : "")
                     audioHLSCodecs = hlsCodec
                     self.audioPipelineDescription = pipelineLabel

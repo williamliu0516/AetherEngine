@@ -860,6 +860,7 @@ extension AetherEngine {
             audioSourceStreamIndexOverride: audioSourceStreamIndex,
             undecodableAudioStreamIndices: undecodableLiveAudioStreamIndices,
             audioBridgeMode: audioBridgeMode,
+            vodSegmentTargetSeconds: airPlayVODSegmentTargetSeconds(),
             objectAudioRendering: loadedOptions.objectAudioRendering,
             dialogueBoost: loadedOptions.dialogueBoost,
             volumeBoost: loadedOptions.volumeBoost,
@@ -2720,7 +2721,7 @@ extension AetherEngine {
                     panelIsInHDRMode: reloadRoutingPanelHDR,
                     // AE#535: the load's table, for the same reason as the panel answer above.
                     sessionDisplayCaps: reloadDisplayCaps,
-                    audioBridgeMode: loadedOptions.audioBridgeMode,
+                    audioBridgeMode: airPlayAudioBridgeMode(loadedOptions.audioBridgeMode),
                     // isLive required: without it the reload rebuilds as VOD and HLSVideoEngine fails "cannot build segment plan" (device repro: KiKA).
                     isLive: loadedOptions.isLive,
                     dvrWindowSeconds: loadedOptions.dvrWindowSeconds,

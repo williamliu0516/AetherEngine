@@ -25,9 +25,14 @@ import AetherLibswresample
 ///     HDMI, or an AVR or soundbar on eARC (a Sonos Arc there takes 6 channels, so lossless 5.1). A legacy-ARC
 ///     route downmixes to stereo. Not picked from the route: with Continuous Audio Connection on, tvOS reports
 ///     32 channels for every HDMI sink (AE#794).
+///   - `.receiverCompat`: AAC-LC stereo, 96 kbps/channel, for every source that is not AAC already. The one audio
+///     a third-party AirPlay receiver is sure to decode: a Hisense Roku TV (2026-10-25) refused FLAC outright and
+///     stalled on E-AC-3 after fetching its first segments, while AAC played. Never set by a host for a local
+///     route; the engine picks it for a wireless receiver its `AirPlayReceiverBook` knows to need it.
 public enum AudioBridgeMode: String, Sendable, CaseIterable {
     case surroundCompat
     case lossless
+    case receiverCompat
 }
 
 final class AudioBridge: @unchecked Sendable {
@@ -47,7 +52,9 @@ final class AudioBridge: @unchecked Sendable {
     /// fold has its own matrix and FLAC.
     static func foldNeedsLimiter(encoder: AVCodecID, sourceChannels: Int, encoderChannels: Int,
                                  dialogueBoost: Bool) -> Bool {
-        encoder == AV_CODEC_ID_EAC3 && !dialogueBoost && sourceChannels > encoderChannels
+        // AAC takes float too, and its stereo fold of a 5.1 or 7.1 source adds the same way.
+        (encoder == AV_CODEC_ID_EAC3 || encoder == AV_CODEC_ID_AAC)
+            && !dialogueBoost && sourceChannels > encoderChannels
     }
 
     /// The encoder a mode opens for a given source. `.lossless` is FLAC unconditionally;
@@ -68,6 +75,7 @@ final class AudioBridge: @unchecked Sendable {
         switch mode {
         case .lossless:       return AV_CODEC_ID_FLAC
         case .surroundCompat: return sourceChannels > 2 ? AV_CODEC_ID_EAC3 : AV_CODEC_ID_FLAC
+        case .receiverCompat: return AV_CODEC_ID_AAC
         }
     }
 
@@ -84,14 +92,17 @@ final class AudioBridge: @unchecked Sendable {
     /// `DocumentedConstantsTests` pins them: a cap that moves without the sentence moving with it
     /// is a doc that lies in a paragraph that still reads perfectly.
     static func maxEncodedChannels(for encoder: AVCodecID) -> Int32 {
-        encoder == AV_CODEC_ID_EAC3 ? 6 : 8
+        // `.receiverCompat` is stereo: the receivers that need it report a two-channel route.
+        if encoder == AV_CODEC_ID_AAC { return 2 }
+        return encoder == AV_CODEC_ID_EAC3 ? 6 : 8
     }
 
     /// EAC3 scales at 128 kbps per resolved channel (Dolby's transparent reference profile): 256
     /// kbps stereo, 768 kbps 5.1, and 1024 kbps if the cap above ever reaches 8. FLAC is VBR, so
     /// its rate is 0 (unlimited) rather than a number.
     static func encoderBitRate(for encoder: AVCodecID, channels: Int32) -> Int64 {
-        encoder == AV_CODEC_ID_EAC3 ? Int64(channels) * 128_000 : 0
+        if encoder == AV_CODEC_ID_AAC { return Int64(channels) * 96_000 }
+        return encoder == AV_CODEC_ID_EAC3 ? Int64(channels) * 128_000 : 0
     }
 
     /// The sample rates an encoder in THIS build accepts, as libavcodec itself reports them. Empty means
@@ -373,7 +384,7 @@ final class AudioBridge: @unchecked Sendable {
         let encoderCodecID = forcedEncoder
             ?? Self.bridgeEncoder(for: mode, sourceChannels: dialogueBoost ? 2 : resolvedChannels)
         outputCodecID = encoderCodecID
-        if encoderCodecID == AV_CODEC_ID_EAC3 {
+        if encoderCodecID == AV_CODEC_ID_EAC3 || encoderCodecID == AV_CODEC_ID_AAC {
             pcmSampleFmt = AV_SAMPLE_FMT_FLTP
             pcmBytesPerSample = 4
             pcmBitsPerRawSample = 32
@@ -415,8 +426,8 @@ final class AudioBridge: @unchecked Sendable {
         self.volumeBoost = VolumeBoostProcessor.isActive(volumeBoost) || foldLimited
             ? VolumeBoostProcessor(gain: volumeBoost, sampleRate: Int(sampleRate)) : nil
         let encoderName = avcodec_get_name(encoderCodecID).map { String(cString: $0) } ?? "?"
-        let logBitRate: String = encoderCodecID == AV_CODEC_ID_EAC3
-            ? "\(Int64(nChannels) * 128) kbps"
+        let logBitRate: String = encoderCodecID == AV_CODEC_ID_EAC3 || encoderCodecID == AV_CODEC_ID_AAC
+            ? "\(Self.encoderBitRate(for: encoderCodecID, channels: nChannels) / 1000) kbps"
             : "VBR"
         EngineLog.emit(
             "[AudioBridge] init: mode=\(mode.rawValue) encoder=\(encoderName)"
@@ -441,6 +452,8 @@ final class AudioBridge: @unchecked Sendable {
         let resolvedBitRate = Self.encoderBitRate(for: encoderCodecID, channels: nChannels)
         enc.pointee.bit_rate = resolvedBitRate
         enc.pointee.time_base = AVRational(num: 1, den: sampleRate)
+        // The mp4 muxer builds the esds from the AudioSpecificConfig, which the encoder writes as extradata.
+        if encoderCodecID == AV_CODEC_ID_AAC { enc.pointee.flags |= AV_CODEC_FLAG_GLOBAL_HEADER }
         var encLayout = AVChannelLayout()
         av_channel_layout_default(&encLayout, nChannels)
         let layoutCopyRet = av_channel_layout_copy(&enc.pointee.ch_layout, &encLayout)
@@ -833,6 +846,7 @@ final class AudioBridge: @unchecked Sendable {
         enc.pointee.bits_per_raw_sample = pcmBitsPerRawSample
         enc.pointee.bit_rate = oldEnc.pointee.bit_rate
         enc.pointee.time_base = oldEnc.pointee.time_base
+        enc.pointee.flags = oldEnc.pointee.flags
         let layoutRet = av_channel_layout_copy(&enc.pointee.ch_layout, &oldEnc.pointee.ch_layout)
         guard layoutRet >= 0, avcodec_open2(enc, encCodec, nil) >= 0 else {
             var tmp: UnsafeMutablePointer<AVCodecContext>? = enc

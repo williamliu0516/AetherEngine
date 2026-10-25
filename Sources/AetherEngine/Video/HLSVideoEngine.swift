@@ -1039,6 +1039,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         audioSourceStreamIndexOverride: Int32? = nil,
         undecodableAudioStreamIndices: Set<Int32> = [],
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
+        vodSegmentTargetSeconds: Double? = nil,
         objectAudioRendering: ObjectAudioRendering = .off,
         dialogueBoost: Bool = false,
         volumeBoost: Double = 1,
@@ -1095,6 +1096,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.audioSourceStreamIndexOverride = audioSourceStreamIndexOverride
         self.undecodableAudioStreamIndices = undecodableAudioStreamIndices
         self.audioBridgeMode = audioBridgeMode
+        self.vodSegmentTargetSeconds = vodSegmentTargetSeconds ?? Self.targetSegmentDuration
         self.objectAudioRendering = objectAudioRendering
         self.dialogueBoost = dialogueBoost
         self.volumeBoost = VolumeBoostProcessor.clampedGain(volumeBoost)
@@ -1209,6 +1211,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Bridge encoder for codecs illegal in fMP4 (TrueHD, DTS, DTS-HD MA, MP3, Opus,
     /// EAC3 from MKV without dec3 extradata).
     let audioBridgeMode: AudioBridgeMode
+
+    /// The duration a VOD keyframe plan cuts at: `targetSegmentDuration`, or shorter for a wireless receiver that
+    /// fails on large segments (`AetherEngine.airPlayVODSegmentTargetSeconds`).
+    let vodSegmentTargetSeconds: Double
 
     /// TrueHD Atmos and DTS:X delivery (#731, see `ObjectAudioRendering`); consulted before `audioBridgeMode`.
     let objectAudioRendering: ObjectAudioRendering
@@ -1458,7 +1464,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 plan = Self.buildKeyframeSegmentPlan(
                     keyframes: keyframes,
                     videoTimeBase: videoTimeBase,
-                    sourceDurationSeconds: durationSeconds
+                    sourceDurationSeconds: durationSeconds,
+                    targetSeconds: vodSegmentTargetSeconds
                 )
                 planBoundariesClaimRandomAccess = true
                 keyframeBytePositions = Dictionary(keyframeEntries.map { ($0.pts, $0.pos) },
@@ -2000,6 +2007,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
                           + " re-encode",
                     category: .session
                 )
+            } else if audioBridgeMode == .receiverCompat, compat != .aac {
+                // A wireless receiver this engine has seen refuse or stall on anything but AAC.
+                bridgePreferred = true
+                EngineLog.emit(
+                    "[HLSVideoEngine] audio: codec=\(compat), the AirPlay receiver plays AAC only; "
+                    + "re-encoding to AAC stereo instead of stream-copy",
+                    category: .session
+                )
             } else if compat != .unsupported {
                 // ADTS-AAC from MPEG-TS has no ASC in extradata, so mp4a/esds can't be built
                 // (EINVAL/"Could not find tag for codec aac"). Synthesize ASC + clear TS codec_tag;
@@ -2161,6 +2176,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             audioIsAtmosStreamCopy && audioDelivery == .streamCopy && savedAudioConfig != nil
 
         // 7. Wire provider, server, and URL.
+        servedAudioCodecs = audioHLSCodecs
         let manifestCodecs = audioHLSCodecs.map { "\(primaryCodecs),\($0)" } ?? primaryCodecs
         // AE#418: a segment AVPlayer places is what moves the axis it reads.
         var segmentPlacedHandler: (@Sendable (Int) -> Void)?
@@ -2491,6 +2507,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// AirPlay watchdog reads it: a receiver that refuses the manifest asks for playlists and never for a
     /// segment, which separates a refusal from a clock that is merely paused.
     public var hasServedMediaSegment: Bool { server?.hasServedMediaSegment ?? false }
+    var mediaSegmentRequestCount: Int { server?.mediaSegmentRequestCount ?? 0 }
+
+    /// The audio CODECS entry this session's playlists name (`mp4a.40.2`, `ec-3`, `fLaC`, ...), nil when it
+    /// serves no audio. What a wireless receiver is asked to decode, whatever the source carried.
+    private(set) var servedAudioCodecs: String?
+
+    /// True when a receiver that plays AAC only can play this session's audio as it is: AAC, or no audio.
+    var servesReceiverCompatibleAudio: Bool {
+        servedAudioCodecs.map { $0.hasPrefix("mp4a.40.") } ?? true
+    }
 
     /// Flip the serving flag after the engine has reloaded the media playlist on a display rejection.
     func markServingMediaAfterFallback() {

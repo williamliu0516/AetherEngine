@@ -523,6 +523,15 @@ final class HLSLocalServer: @unchecked Sendable {
     /// The AirPlay progress watchdog needs to tell "the receiver refused the manifest" from "the clock is
     /// not moving for some other reason", and a receiver that refuses never asks for a segment at all.
     private var servedMediaBytes = false
+    /// Media segment requests answered or attempted this session, by anyone. The AirPlay decode watchdog reads
+    /// it to tell a receiver that holds segments and does not play them from one still waiting for them.
+    private var mediaSegmentRequests = 0
+    var mediaSegmentRequestCount: Int {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return mediaSegmentRequests
+    }
+
     /// True once the session has served an init or media segment to anyone (#227).
     var hasServedMediaSegment: Bool {
         stateLock.lock()
@@ -1328,7 +1337,7 @@ final class HLSLocalServer: @unchecked Sendable {
             }
             if normalizedPath.hasPrefix("/seg"),
                normalizedPath.hasSuffix(".mp4") {
-                stateLock.lock(); servedMediaBytes = true; stateLock.unlock()
+                stateLock.lock(); servedMediaBytes = true; mediaSegmentRequests &+= 1; stateLock.unlock()
                 let indexStr = normalizedPath.dropFirst(4).dropLast(4)
                 if let index = Int(indexStr), index >= 0 {
                     // AE#418 round 7: every exit from this branch says what became of the request, so

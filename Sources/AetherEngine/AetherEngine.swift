@@ -3139,6 +3139,12 @@ public final class AetherEngine: ObservableObject {
                 attempt += 1
 
             case .fallBackToMedia:
+                // A wireless receiver that refused an SDR master of audio it may not play gets the session
+                // rebuilt with AAC once the load returns, the master offered again; no in-place fallback.
+                if airPlayActive, noteAirPlayMasterRefusal(session: session) {
+                    airPlayCompatRebuildPending = true
+                    return
+                }
                 // #98: before the bare (subtitle-less) media playlist, try the HDR-preserving reduced
                 // master. It keeps HDR10 + subtitle renditions and, being plain hvc1 without DV signaling,
                 // may start where the cold DV handshake did not. This case is terminal (returns/throws),
@@ -5586,7 +5592,7 @@ public final class AetherEngine: ObservableObject {
                     panelIsInHDRMode: routingPanelHDR,
                     // AE#535: the table composed at the top of this load, not a second read of it.
                     sessionDisplayCaps: sessionDisplayCaps,
-                    audioBridgeMode: options.audioBridgeMode,
+                    audioBridgeMode: airPlayAudioBridgeMode(options.audioBridgeMode),
                     isLive: options.isLive,
                     dvrWindowSeconds: options.dvrWindowSeconds,
                     // Set only by reloadAtCurrentPosition's live reopen:
@@ -5656,7 +5662,10 @@ public final class AetherEngine: ObservableObject {
                     state = .playing
                     // #227: a receiver that refuses the playlist it was handed neither fails the item nor
                     // reports a rejection, so the gate above cannot see it. Watch the clock instead.
-                    armAirPlayProgressWatchdog(gen: gen, position: startPosition ?? 0)
+                    if !rebuildForAirPlayCompatAudioIfPending() {
+                        armAirPlayProgressWatchdog(gen: gen, position: startPosition ?? 0)
+                        armAirPlayDecodeWatchdog(gen: gen)
+                    }
                 }
                 startMemoryProbe()
                 startLiveTelemetrySampler()
@@ -7023,11 +7032,66 @@ public final class AetherEngine: ObservableObject {
         videoFormat = corrected
     }
 
-    /// Receivers that failed to start on an HDR master this process, by route UID (#227). An Apple TV
-    /// parked in SDR refuses one, and nothing in the public API reports the receiver's dynamic range, so
-    /// the offer has to be made once and remembered. Per process on purpose: a user who switches the
-    /// receiver's output format to HDR gets the offer again on the next launch.
-    private var airPlayReceiversRefusingHDRMaster: Set<String> = []
+    /// What each wireless receiver has refused, by route UID, kept across launches (`AirPlayReceiverBook`). An
+    /// Apple TV parked in SDR refuses an HDR master, a third-party TV refuses every master and plays AAC only, and
+    /// nothing in the public API reports either, so each offer is made once and remembered.
+    let airPlayReceiverBook = AirPlayReceiverBook()
+
+    /// Set when a receiver refused a master whose audio it cannot play: the load finishes, then the session is
+    /// rebuilt with AAC audio and the master offered again (`rebuildForAirPlayCompatAudioIfPending`).
+    private var airPlayCompatRebuildPending = false
+    private var airPlayDecodeWatchdog: Task<Void, Never>?
+
+    /// The bridge mode a session is built with: the host's, unless a wireless receiver known to play AAC only
+    /// holds the route.
+    func airPlayAudioBridgeMode(_ configured: AudioBridgeMode) -> AudioBridgeMode {
+        guard airPlayActive, let uid = Self.currentAirPlayReceiverUID(),
+              airPlayReceiverBook.entry(for: uid).needsCompatAudio else { return configured }
+        return .receiverCompat
+    }
+
+    /// Segment duration for a third-party receiver (one that needs AAC or refuses every master): half the usual.
+    /// The Hisense Roku TV that needed AAC also failed 4 min into a 4K HDR10 film with -12862 "The quota has been
+    /// exceeded", twice at the same high-bitrate scene, after it had stopped fetching with segments to spare; read
+    /// as a receiver whose buffer cannot take a 4 s segment at that bitrate, so it gets segments half as large.
+    nonisolated static let thirdPartyReceiverSegmentSeconds: Double = 2
+
+    func airPlayVODSegmentTargetSeconds() -> Double {
+        guard airPlayActive, let uid = Self.currentAirPlayReceiverUID() else {
+            return HLSVideoEngine.targetSegmentDuration
+        }
+        let entry = airPlayReceiverBook.entry(for: uid)
+        return entry.needsCompatAudio || entry.refusesEveryMaster
+            ? Self.thirdPartyReceiverSegmentSeconds : HLSVideoEngine.targetSegmentDuration
+    }
+
+    /// A wireless receiver refused the master this session handed it (#35 gate or #227 watchdog). Records what
+    /// the refusal says about the receiver and returns true when the session should be rebuilt with AAC audio
+    /// rather than fall back in place: a receiver that refuses even an SDR master is a third-party one, and the
+    /// one such receiver measured (a Hisense Roku TV) refused or stalled on every audio but AAC, which is also
+    /// what its refusals of the master named in CODECS.
+    @MainActor
+    func noteAirPlayMasterRefusal(session: HLSVideoEngine) -> Bool {
+        guard airPlayActive, let uid = Self.currentAirPlayReceiverUID() else { return false }
+        let wantsCompatAudio = !session.servedSourceIsHDR && !session.servesReceiverCompatibleAudio
+        let entry = airPlayReceiverBook.update(uid) { entry in
+            if session.servedSourceIsHDR {
+                entry.refusesHDRMaster = true
+            } else if wantsCompatAudio {
+                entry.needsCompatAudio = true
+            } else {
+                entry.refusesEveryMaster = true
+            }
+        }
+        EngineLog.emit(
+            "[AirPlay] receiver refused the \(session.servedSourceIsHDR ? "HDR" : "SDR") master "
+            + "(audio \(session.servedAudioCodecs ?? "none")); remembered: refusesHDRMaster="
+            + "\(entry.refusesHDRMaster) refusesEveryMaster=\(entry.refusesEveryMaster) "
+            + "needsCompatAudio=\(entry.needsCompatAudio)"
+            + (wantsCompatAudio ? "; rebuilding with AAC audio and offering the master again" : ""),
+            category: .session)
+        return wantsCompatAudio
+    }
 
     /// Route UID of the wireless AirPlay receiver currently holding the audio route, or nil.
     nonisolated static func currentAirPlayReceiverUID() -> String? {
@@ -7055,6 +7119,56 @@ public final class AetherEngine: ObservableObject {
         }
     }
 
+    /// Starts the rebuild `noteAirPlayMasterRefusal` asked for. The rebuilt session reads the receiver's
+    /// `needsCompatAudio` through `airPlayAudioBridgeMode` and is built with AAC audio.
+    @MainActor
+    @discardableResult
+    func rebuildForAirPlayCompatAudioIfPending() -> Bool {
+        guard airPlayCompatRebuildPending else { return false }
+        airPlayCompatRebuildPending = false
+        guard airPlayActive else { return false }
+        EngineLog.emit("[AirPlay] rebuilding the session with AAC stereo audio for this receiver at "
+                       + "\(String(format: "%.2f", positionForSessionRebuild))s", category: .session)
+        Task { @MainActor [weak self] in try? await self?.reloadAtCurrentPosition() }
+        return true
+    }
+
+    /// A receiver holding this many segments has what it needs to start.
+    static let airPlayDecodeWatchdogSegments = 3
+    static let airPlayDecodeWatchdogSeconds: Double = 10
+
+    /// A receiver that took the playlist and its segments and still does not play them cannot decode what it
+    /// holds. Measured 2026-10-25 on a Hisense Roku TV: E-AC-3 5.1, seven segments (28 s) fetched, the clock never
+    /// moved, while the same TV played AAC. When the session's audio is not AAC, that is the likely cause, so the
+    /// receiver is remembered as needing AAC and the session rebuilt with it. AAC that does not play either is left
+    /// to the #65 recovery: there is no further form to offer.
+    @MainActor
+    func armAirPlayDecodeWatchdog(gen: UInt64) {
+        airPlayDecodeWatchdog?.cancel()
+        airPlayDecodeWatchdog = nil
+        guard airPlayActive, !loadedOptions.isLive, let session = nativeVideoSession,
+              !session.servesReceiverCompatibleAudio else { return }
+        let baseline = currentTime
+        airPlayDecodeWatchdog = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(Self.airPlayDecodeWatchdogSeconds * 1_000_000_000))
+            guard let self, !Task.isCancelled, self.loadGeneration == gen, self.airPlayActive,
+                  self.state == .playing, let session = self.nativeVideoSession,
+                  let uid = Self.currentAirPlayReceiverUID() else { return }
+            let advanced = self.currentTime - baseline
+            let fetched = session.mediaSegmentRequestCount
+            guard advanced < 0.5, fetched >= Self.airPlayDecodeWatchdogSegments else { return }
+            self.airPlayReceiverBook.update(uid) { $0.needsCompatAudio = true }
+            EngineLog.emit(
+                "[AirPlay] receiver holds \(fetched) segments and has not played in "
+                + "\(String(format: "%.0f", Self.airPlayDecodeWatchdogSeconds))s (clock advanced "
+                + "\(String(format: "%.2f", advanced))s) on \(session.servedAudioCodecs ?? "?") audio; "
+                + "remembered as needing AAC",
+                category: .session)
+            self.airPlayCompatRebuildPending = true
+            self.rebuildForAirPlayCompatAudioIfPending()
+        }
+    }
+
     /// The receiver never started on the playlist it was handed (#227): reload the LAN media playlist, which
     /// every receiver takes, and remember an HDR refusal so the same receiver is not made to wait again.
     ///
@@ -7076,17 +7190,16 @@ public final class AetherEngine: ObservableObject {
         let advanced = currentTime - baseline
         guard advanced < 0.5, !session.hasServedMediaSegment else { return }
 
-        let receiverUID = Self.currentAirPlayReceiverUID()
-        if let receiverUID, session.servedSourceIsHDR {
-            airPlayReceiversRefusingHDRMaster.insert(receiverUID)
+        if noteAirPlayMasterRefusal(session: session) {
+            airPlayCompatRebuildPending = true
+            rebuildForAirPlayCompatAudioIfPending()
+            return
         }
         EngineLog.emit(
             "[AirPlay] receiver did not start in "
             + "\(String(format: "%.0f", Self.airPlayProgressWatchdogSeconds))s (clock advanced "
             + "\(String(format: "%.2f", advanced))s, no segment fetched); the playlist it was handed is "
-            + "refused, falling back to the LAN media playlist (subtitle renditions dropped"
-            + (receiverUID != nil && session.servedSourceIsHDR
-               ? ", and this receiver is remembered as refusing HDR masters" : "") + ")",
+            + "refused, falling back to the LAN media playlist (subtitle renditions dropped)",
             category: .session)
         session.markServingMediaAfterFallback()
         nativeSubtitleRenditionsServed = false
@@ -7233,12 +7346,14 @@ public final class AetherEngine: ObservableObject {
         airPlayServedMasterToReceiver = false
         #if os(iOS)
         guard airPlayActive else { return (url, session.servingMasterPlaylist) }
-        let receiverUID = Self.currentAirPlayReceiverUID()
-        let refusedBefore = receiverUID.map { airPlayReceiversRefusingHDRMaster.contains($0) } ?? false
+        let receiver = Self.currentAirPlayReceiverUID().map { airPlayReceiverBook.entry(for: $0) }
+            ?? AirPlayReceiverBook.Entry()
+        let refusedBefore = receiver.refusesHDRMaster || receiver.refusesEveryMaster
         let playlist = AirPlayPlaylistDecision.playlistForReceiver(
             servingMasterPlaylist: session.servingMasterPlaylist,
             sourceIsHDR: session.servedSourceIsHDR,
-            receiverRefusedHDRMaster: refusedBefore)
+            receiverRefusedHDRMaster: receiver.refusesHDRMaster,
+            receiverRefusesEveryMaster: receiver.refusesEveryMaster)
         let carriesRenditions = AirPlayPlaylistDecision.carriesSubtitleRenditions(playlist)
         guard let lanURL = airPlayPlaybackURL(base: url, playlist: playlist) else {
             EngineLog.emit("[AirPlay] no LAN IP; keeping \(url.absoluteString)", category: .engine)
@@ -7247,6 +7362,7 @@ public final class AetherEngine: ObservableObject {
         airPlayServedMasterToReceiver = carriesRenditions
         EngineLog.emit("[AirPlay] loadNative serving via \(lanURL.absoluteString) (playlist=\(playlist) "
                        + "sourceIsHDR=\(session.servedSourceIsHDR) refusedBefore=\(refusedBefore) "
+                       + "audio=\(session.servedAudioCodecs ?? "none") "
                        + "subtitle renditions \(carriesRenditions ? "carried" : "dropped"))", category: .engine)
         return (lanURL, carriesRenditions)
         #else
@@ -7798,6 +7914,8 @@ public final class AetherEngine: ObservableObject {
         nativeVideoSession = nil
         nativeSubtitleRenditionsServed = false
         dolbyVisionConversion = nil
+        airPlayDecodeWatchdog?.cancel()
+        airPlayDecodeWatchdog = nil
         airPlayProgressWatchdog?.cancel()
         airPlayProgressWatchdog = nil
         displayModeDiagnostic?.cancel()

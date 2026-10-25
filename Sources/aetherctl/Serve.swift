@@ -8,7 +8,8 @@ func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = fal
               nativeSubsIndex: Int? = nil, startPosition: Double? = nil,
               audioDelayMs: Int = 0, iFrames: Bool = false,
               objectAudioRendering: ObjectAudioRendering = .off, audioStreamIndex: Int32? = nil,
-              stereo: StereoPresentation? = nil, volumeBoost: Double = 1) -> Never {
+              stereo: StereoPresentation? = nil, volumeBoost: Double = 1,
+              audioBridgeMode: AudioBridgeMode = .surroundCompat) -> Never {
     EngineLog.handler = { line in
         let timestamp = ISO8601DateFormatter.string(
             from: Date(),
@@ -29,6 +30,7 @@ func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = fal
     if let audioStreamIndex { flagSuffix += " [--audio-index \(audioStreamIndex)]" }
     if let stereo { flagSuffix += " [--stereo \(stereo)]" }
     if volumeBoost != 1 { flagSuffix += " [--volume-boost \(volumeBoost)]" }
+    if audioBridgeMode != .surroundCompat { flagSuffix += " [--audio-bridge \(audioBridgeMode.rawValue)]" }
     print(EngineLog.redacted("aetherctl serve: \(url.absoluteString)\(flagSuffix)"))
     print("")
 
@@ -41,6 +43,7 @@ func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = fal
         // for the whole verdict. A source with nothing to correct never gets past the gate inside.
         dolbyVisionRPUProfile: DolbyVisionRecordAudit.rpuCorrection(url: url),
         audioSourceStreamIndexOverride: audioStreamIndex,
+        audioBridgeMode: audioBridgeMode,
         objectAudioRendering: objectAudioRendering,
         volumeBoost: volumeBoost,
         // nil (no flag) is the session as this system gets it; a flag resolves it as visionOS would.
