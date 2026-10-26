@@ -121,4 +121,15 @@ struct StartupReadinessGateTests {
         // Media loaded but still 0 tracks: the cold DV/HDCP decode failure the gate was written for.
         #expect(StartupReadinessGate.timeoutOutcome(hasLoadedMedia: true) == .timedOut)
     }
+
+    @Test("A wireless receiver gets one master attempt: its first refusal falls back")
+    func airPlayReceiverGetsOneMasterAttempt() {
+        #expect(StartupReadinessGate.nextAction(
+            outcome: .dead, attempt: 1, masterAttempts: 1,
+            masterAlreadyFellBack: false, hasMediaFallbackURL: true) == .fallBackToMedia)
+        // The default keeps the cold-HDMI-link retry.
+        #expect(StartupReadinessGate.nextAction(
+            outcome: .dead, attempt: 1,
+            masterAlreadyFellBack: false, hasMediaFallbackURL: true) == .reloadMaster)
+    }
 }

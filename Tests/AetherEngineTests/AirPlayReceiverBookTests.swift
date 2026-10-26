@@ -38,7 +38,7 @@ struct AirPlayReceiverBookTests {
         #expect(book.entry(for: "r\(AirPlayReceiverBook.capacity + 2)").needsCompatAudio)
     }
 
-    @Test("A refused master: HDR stays per process, non-AAC SDR asks for AAC once, then every master")
+    @Test("A refused master: HDR stays per process, non-AAC SDR asks for AAC once (and every master), AAC SDR every master")
     func refusalVerdicts() {
         #expect(AirPlayReceiverBook.refusal(sourceIsHDR: true, servesCompatibleAudio: false,
                                             builtForReceiver: false) == .hdrMaster)
