@@ -7110,7 +7110,7 @@ public final class AetherEngine: ObservableObject {
             + "(audio \(session.servedAudioCodecs ?? "none")); remembered: refusesHDRMaster="
             + "\(airPlayReceiversRefusingHDRMaster.contains(uid)) (this process) refusesEveryMaster="
             + "\(entry.refusesEveryMaster) needsCompatAudio=\(entry.needsCompatAudio)"
-            + (wantsCompatAudio ? "; rebuilding with AAC audio and offering the master again" : ""),
+            + (wantsCompatAudio ? "; rebuilding with AAC audio on the media playlist" : ""),
             category: .session)
         return wantsCompatAudio
     }
