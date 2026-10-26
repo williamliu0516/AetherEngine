@@ -3076,6 +3076,10 @@ public final class AetherEngine: ObservableObject {
             : Self.startupGateInitialSeconds
         var attempt = 1
         var dataWaitRounds = 0
+        // A wireless receiver gets the master once. The second attempt warms a cold HDMI Dolby Vision link; a
+        // receiver that refused does not change its mind (#227), and a Hisense Roku TV dropped the AirPlay
+        // connection altogether on its fourth refusal in a row (2026-10-25), so every refusal is one too many.
+        let masterAttempts = airPlayActive ? 1 : StartupReadinessGate.masterAttempts
         while true {
             // Attempt 1 plays the item the load path already created; later attempts replay it fresh.
             host.play()
@@ -3100,6 +3104,7 @@ public final class AetherEngine: ObservableObject {
             switch StartupReadinessGate.nextAction(
                 outcome: outcome,
                 attempt: attempt,
+                masterAttempts: masterAttempts,
                 masterAlreadyFellBack: masterFallbackUsed,
                 hasMediaFallbackURL: session.mediaPlaylistURL != nil,
                 dataWaitRounds: dataWaitRounds,
@@ -3126,13 +3131,13 @@ public final class AetherEngine: ObservableObject {
                 guard let masterURL = session.masterPlaylistURL else {
                     // Master URL unavailable (should not happen while serving the master): force the
                     // fallback path on the next loop rather than reloading a URL we don't have.
-                    attempt = StartupReadinessGate.masterAttempts
+                    attempt = masterAttempts
                     continue
                 }
                 EngineLog.emit(
                     "[AetherEngine] #35 readiness gate: master did not start (\(outcome)) after a "
                     + "panel switch; reloading the master (attempt \(attempt + 1)/"
-                    + "\(StartupReadinessGate.masterAttempts), link may still be warming) at "
+                    + "\(masterAttempts), link may still be warming) at "
                     + "\(String(format: "%.2f", position))s",
                     category: .session)
                 host.swapItem(url: airPlayHostSwapped(masterURL), startPosition: position)
@@ -3181,7 +3186,7 @@ public final class AetherEngine: ObservableObject {
                 nativeSubtitleRenditionsServed = false
                 EngineLog.emit(
                     "[AetherEngine] #35 readiness gate: master never produced tracks after "
-                    + "\(StartupReadinessGate.masterAttempts) attempts; falling back to the media "
+                    + "\(masterAttempts) attempt\(masterAttempts == 1 ? "" : "s"); falling back to the media "
                     + "playlist at \(String(format: "%.2f", position))s (HDR10 base, DV upgrade "
                     + "dropped this session)",
                     category: .session)
@@ -7096,7 +7101,7 @@ public final class AetherEngine: ObservableObject {
             airPlayReceiversRefusingHDRMaster.insert(uid)
             entry = airPlayReceiverBook.entry(for: uid)
         case .needsCompatAudio:
-            entry = airPlayReceiverBook.update(uid) { $0.needsCompatAudio = true }
+            entry = airPlayReceiverBook.update(uid) { $0.needsCompatAudio = true; $0.refusesEveryMaster = true }
         case .everyMaster:
             entry = airPlayReceiverBook.update(uid) { $0.refusesEveryMaster = true }
         }
