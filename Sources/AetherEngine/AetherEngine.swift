@@ -3141,7 +3141,9 @@ public final class AetherEngine: ObservableObject {
             case .fallBackToMedia:
                 // A wireless receiver that refused an SDR master of audio it may not play gets the session
                 // rebuilt with AAC once the load returns, the master offered again; no in-place fallback.
-                if airPlayActive, noteAirPlayMasterRefusal(session: session) {
+                // Only a session that can be rebuilt in place takes that road; one that cannot (a forward-only
+                // origin) falls back in place below, the receiver's need for AAC remembered for its next load.
+                if airPlayActive, noteAirPlayMasterRefusal(session: session), canRebuildForAirPlayReceiver {
                     airPlayCompatRebuildPending = true
                     // The refused master stays the item until the rebuild replaces it; its late `.failed` is
                     // held so the host app does not reopen the source meanwhile.
@@ -7134,6 +7136,12 @@ public final class AetherEngine: ObservableObject {
         }
     }
 
+    /// A session the AAC rebuild may replace: one `reloadAtCurrentPosition` reopens where it is. A forward-only
+    /// custom source refuses the reload, and a sequential origin reopens at byte 0, so both fall back in place.
+    var canRebuildForAirPlayReceiver: Bool {
+        sessionReloadRefusal == nil && !loadedOptions.sequentialOrigin
+    }
+
     /// Starts the rebuild `noteAirPlayMasterRefusal` asked for. The rebuilt session reads the receiver's
     /// `needsCompatAudio` through `airPlayAudioBridgeMode` and is built with AAC audio.
     /// Always rebuilds once asked, AirPlay still on or not: the refused item it replaces is held silent until then.
@@ -7152,7 +7160,17 @@ public final class AetherEngine: ObservableObject {
             // The reload's own stopInternal cancels this task's handle; let go of it first, or the
             // rebuild would cancel itself mid-load.
             self.airPlayCompatRebuildTask = nil
-            try? await self.reloadAtCurrentPosition()
+            do {
+                try await self.reloadAtCurrentPosition()
+            } catch {
+                EngineLog.emit("[AirPlay] the AAC rebuild failed: \(error)", category: .session)
+            }
+            // No new item came (the reload refused or failed early): the held failure must not stay held.
+            if self.loadGeneration == gen, self.nativeHost?.holdsStartupFailuresForRebuild == true {
+                self.nativeHost?.holdsStartupFailuresForRebuild = false
+                EngineLog.emit("[AirPlay] the AAC rebuild did not replace the refused item; its failure "
+                               + "is no longer held", category: .session)
+            }
         }
         return true
     }
@@ -7214,7 +7232,7 @@ public final class AetherEngine: ObservableObject {
         let advanced = currentTime - baseline
         guard advanced < 0.5, !session.hasServedMediaSegment else { return }
 
-        if noteAirPlayMasterRefusal(session: session) {
+        if noteAirPlayMasterRefusal(session: session), canRebuildForAirPlayReceiver {
             airPlayCompatRebuildPending = true
             rebuildForAirPlayCompatAudioIfPending()
             return
