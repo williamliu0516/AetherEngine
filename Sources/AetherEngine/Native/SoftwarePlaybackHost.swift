@@ -1382,16 +1382,41 @@ final class SoftwarePlaybackHost {
 
     /// #95 audio tap: mirrors every decoded audio CMSampleBuffer to the tap (nil = tap off).
     /// Set/cleared on the main actor by AetherEngine+AudioTap; read per packet on the demux and
-    /// feeder threads (same unsynchronized-flag pattern as `_isPlaying`; worst case one buffer
-    /// reaches a just-removed sink).
-    nonisolated(unsafe) var audioTapSink: (@Sendable (CMSampleBuffer) -> Void)?
+    /// feeder threads, under `tapSinksLock`: a closure is a reference, and a read racing the main
+    /// actor's write could retain one the write had just released (ThreadSanitizer in reel's
+    /// sweep, 2026-10-30: `installSoftwareTapSink` against the demux loop's getter). A loop that
+    /// took the sink before a removal still hands it that one buffer.
+    nonisolated var audioTapSink: (@Sendable (CMSampleBuffer) -> Void)? {
+        get { tapSinksLock.lock(); defer { tapSinksLock.unlock() }; return _audioTapSink }
+        set {
+            tapSinksLock.lock()
+            let replaced = _audioTapSink
+            _audioTapSink = newValue
+            tapSinksLock.unlock()
+            // Released outside the lock: what the closure held may run code of its own as it goes.
+            withExtendedLifetime(replaced) {}
+        }
+    }
 
     /// #112 rework subtitle tap: the demux loop hands every embedded subtitle packet to this
     /// sink (nil = tap off), which copies the payload into the session's SubtitlePacketStore.
-    /// Same unsynchronized-flag pattern as `audioTapSink`; the sink copies synchronously, so
-    /// the packet pointer never escapes the demux thread. The trailing Bool marks packets of
-    /// split-PES PGS streams (MPEG-TS) that need display-set reassembly in the store.
-    nonisolated(unsafe) var subtitleTapSink: (@Sendable (Int32, UnsafeMutablePointer<AVPacket>, AVRational, Bool) -> Void)?
+    /// Guarded as `audioTapSink` is; the sink copies synchronously, so the packet pointer never
+    /// escapes the demux thread. The trailing Bool marks packets of split-PES PGS streams
+    /// (MPEG-TS) that need display-set reassembly in the store.
+    nonisolated var subtitleTapSink: (@Sendable (Int32, UnsafeMutablePointer<AVPacket>, AVRational, Bool) -> Void)? {
+        get { tapSinksLock.lock(); defer { tapSinksLock.unlock() }; return _subtitleTapSink }
+        set {
+            tapSinksLock.lock()
+            let replaced = _subtitleTapSink
+            _subtitleTapSink = newValue
+            tapSinksLock.unlock()
+            withExtendedLifetime(replaced) {}
+        }
+    }
+
+    private let tapSinksLock = NSLock()
+    nonisolated(unsafe) private var _audioTapSink: (@Sendable (CMSampleBuffer) -> Void)?
+    nonisolated(unsafe) private var _subtitleTapSink: (@Sendable (Int32, UnsafeMutablePointer<AVPacket>, AVRational, Bool) -> Void)?
 
     /// #112 rework: embedded subtitle stream indices + time bases, captured at load before the
     /// demux loop starts (the SW host applies no stream discard, so these packets already flow).

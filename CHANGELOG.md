@@ -12,6 +12,13 @@ the public-API contract.
 
 ### Fixed
 
+- **The software host's tap sinks are read and written under one lock.** `audioTapSink` and `subtitleTapSink`
+  were `nonisolated(unsafe)` closures, written on the main actor (a tap installed, its stream stopped) and read
+  for every packet on the demux thread, so a read could retain a closure the write had just released and later
+  call freed memory. ThreadSanitizer caught it in a host app's sweep (`installSoftwareTapSink` against
+  `startDemuxLoop`'s getter). Both now go through `tapSinksLock`, the replaced closure released outside it
+  (`SoftwareTapSinkRaceTests`, which reports the race under `swift test --sanitize=thread` without the lock).
+
 - **A 7.1 source folded into the E-AC-3 bridge's 5.1 no longer clips.** libswresample does not normalize a float
   rematrix, so each back channel was added to its side channel at full weight: on 环太平洋's climax (TrueHD 7.1)
   the side channels reached 1.36 to 1.43 of full scale, E-AC-3 carried the overs to the decoder, and the device
