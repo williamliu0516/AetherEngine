@@ -1390,6 +1390,10 @@ extension AetherEngine {
     /// The rule stays PGS-shaped on purpose. A text event carries its own duration and a packet
     /// following it says nothing about it, so text cues keep the placeholder gate: only an
     /// unconfirmed end is anyone else's to set.
+    /// The drain's time base for the packets it decodes (`AVRational(num: 1, den: 1000)`): every cue
+    /// time the decoder makes is a multiple of it, the store's PTS are not.
+    nonisolated static let subtitleDrainTimeQuantumSeconds: Double = 0.001
+
     @discardableResult
     nonisolated static func alignCueEnds(_ cues: inout [SubtitleCue],
                                          toNextPacket nextPacketPTS: (Double) -> Double?) -> Bool {
@@ -1398,8 +1402,15 @@ extension AetherEngine {
             let cue = cues[i]
             var isBitmap = false
             if case .image = cue.body { isBitmap = true }
+            // A cue's start is its packet's PTS as the drain hands it to the decoder, rounded to the
+            // millisecond (the drain's 1/1000 time base), while the store keeps the PTS exact. Rounded
+            // down, the cue's OWN packet sits up to half a millisecond after its start and was taken
+            // for its successor: the set closed the instant it opened. On 90 kHz timestamps (a Blu-ray,
+            // any M2TS) that is about every other set; a line resent as acquisition points every third
+            // of a second blinked, and a line sent once never showed (Zool, Suzume's Chinese PGS). No
+            // successor comes within a millisecond: sets are at least a frame apart.
             guard isBitmap || cue.endTime - cue.startTime > subtitleOpenEndedWindowSeconds,
-                  let end = nextPacketPTS(cue.startTime),
+                  let end = nextPacketPTS(cue.startTime + subtitleDrainTimeQuantumSeconds),
                   end > cue.startTime, end < cue.endTime else { continue }
             cues[i] = cue.with(endTime: end)
             changed = true
