@@ -65,6 +65,55 @@ struct AudioOutputClockLockTests {
         #expect(paused.wait(timeout: .now() + 5) == .success)
         #expect(output.rate == 0)
     }
+
+    @Test("a write asked before a stop and still waiting for its turn is dropped: the clock stays at rest")
+    func aWriteAskedBeforeAStopIsDropped() {
+        let output = AudioOutput()
+        let (entered, release) = holdingWrites(output)
+        let seeked = DispatchSemaphore(value: 0), rated = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            output.seekClock(to: CMTime(seconds: 30, preferredTimescale: 600), rate: 0)
+            seeked.signal()
+        }
+        #expect(entered.wait(timeout: .now() + 5) == .success)
+        DispatchQueue.global().async {
+            output.setRate(1)
+            rated.signal()
+        }
+        // Waiting behind the seek's write, asked before the stop.
+        #expect(rated.wait(timeout: .now() + 0.3) == .timedOut)
+        output.stop()
+        release.signal()
+        #expect(seeked.wait(timeout: .now() + 5) == .success)
+        #expect(rated.wait(timeout: .now() + 5) == .success)
+        #expect(output.rate == 0)
+    }
+
+    @Test("a seek waiting on the preroll gate when a stop comes sets up no preroll: nothing starts the clock later")
+    func aStopCancelsAPrerollStillBeingAskedFor() throws {
+        let output = AudioOutput()
+        let asked = DispatchSemaphore(value: 0), answer = DispatchSemaphore(value: 0)
+        let first = FirstTake()
+        output.videoPrerollSatisfied = { _ in
+            if first.take() {
+                asked.signal()
+                _ = answer.wait(timeout: .now() + 10)
+            }
+            return false   // not ready: the seek would set up a preroll that starts the clock at its timeout
+        }
+        let seeked = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            output.seekClock(to: CMTime(seconds: 30, preferredTimescale: 600), rate: 1)
+            seeked.signal()
+        }
+        #expect(asked.wait(timeout: .now() + 5) == .success)
+        output.stop()
+        answer.signal()
+        #expect(seeked.wait(timeout: .now() + 5) == .success)
+        // Past the preroll's timeout, when a preroll set up after the stop would have started the clock.
+        Thread.sleep(forTimeInterval: AudioOutput.prerollTimeout + 0.5)
+        #expect(output.rate == 0)
+    }
 }
 
 /// True for the first `take()` only.

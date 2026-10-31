@@ -26,9 +26,12 @@ final class AudioOutput: @unchecked Sendable {
     private let clockLock = NSLock()
     /// A `stop()` came and the clock is not at rest yet. Guarded by `lock`.
     private var restOwed = false
+    /// Retired by every `stop()`, under `lock`: a clock write asked before a stop that has not run yet is
+    /// dropped (`withClock`), as is a preroll it would set up (`anchorClock`).
+    private var stopGeneration = 0
 
     #if DEBUG
-    /// Test-only: runs at the start of every clock write, holding `clockLock` and not `lock`.
+    /// Test-only: runs as a clock write starts, holding `clockLock` and not `lock`.
     var whileSettingClockForTesting: (@Sendable () -> Void)?
     #endif
 
@@ -184,7 +187,7 @@ final class AudioOutput: @unchecked Sendable {
 
     /// Set playback speed (0.5-2.0). Hosts own rate state (lastRate/pausedByHost); this object is stateless about it.
     func setRate(_ rate: Float) {
-        withClock {
+        withClock { issued in
             // A host resumes right after it arms the clock; while a preroll waits, that rate is the one
             // the preroll starts at, not a start of its own.
             if rate > 0, updatePrerollRate(rate) { return }
@@ -192,7 +195,7 @@ final class AudioOutput: @unchecked Sendable {
             // landed while paused anchors at rate 0 and never asks the gate, so the play that follows
             // would otherwise start it with nothing queued.
             if rate > 0, synchronizer.rate == 0, videoPrerollSatisfied?(currentTime.seconds) != nil {
-                anchorClock(to: currentTime, rate: rate)
+                anchorClock(to: currentTime, rate: rate, issued: issued)
                 return
             }
             cancelPreroll()
@@ -204,7 +207,7 @@ final class AudioOutput: @unchecked Sendable {
 
     /// Pause audio (and the master clock). Hosts resume via setRate (pausedByHost pattern); deliberately no resume() here.
     func pause() {
-        withClock {
+        withClock { _ in
             cancelPreroll()
             let at = synchronizer.currentTime()
             EngineLog.emit("[AudioOutput] pause at t=\(String(format: "%.3f", timeline.sourceSeconds(forRenderer: at.seconds)))", category: .swPlayback)
@@ -216,7 +219,7 @@ final class AudioOutput: @unchecked Sendable {
     /// sample runs whenever its task is scheduled, and on a starved main actor that is after the clock
     /// has walked on (#694: 1.149 s on a 1.0 s source on a CI runner).
     func pause(notAfter latest: Double) {
-        withClock {
+        withClock { _ in
             cancelPreroll()
             let now = timeline.sourceTime(forRenderer: synchronizer.currentTime())
             let seconds = SoftwareEndOfMediaClock.parkSeconds(clockSeconds: CMTimeGetSeconds(now), notAfter: latest)
@@ -395,6 +398,7 @@ final class AudioOutput: @unchecked Sendable {
         prerollGeneration &+= 1
         prerollRate = nil
         restOwed = true
+        stopGeneration &+= 1
         renderer.flush()
         lock.unlock()
         // The clock's rest outside `lock`, now if no clock write is under way, else by that write as it
@@ -402,15 +406,19 @@ final class AudioOutput: @unchecked Sendable {
         payRest()
     }
 
-    /// Runs a clock write under `clockLock` and outside `lock`. Before letting go it pays a rest a `stop()`
-    /// owed meanwhile, so the stop wins as when both held `lock`; after, the one a stop owed between that
-    /// and the unlock, unless the next holder will.
-    private func withClock(_ write: () -> Void) {
+    /// Runs a clock write under `clockLock` and outside `lock`, with the stops so far when it was asked
+    /// (`issued`): none if a `stop()` came while it waited for the lock. Before letting go it pays a rest a
+    /// stop owed meanwhile, so the stop wins as when both held `lock`; after, the one a stop owed between
+    /// that and the unlock, unless the next holder will.
+    private func withClock(_ write: (_ issued: Int) -> Void) {
+        let issued = stops
         clockLock.lock()
-        #if DEBUG
-        whileSettingClockForTesting?()
-        #endif
-        write()
+        if stops == issued {
+            #if DEBUG
+            whileSettingClockForTesting?()
+            #endif
+            write(issued)
+        }
         restIfOwed()
         clockLock.unlock()
         payRest()
@@ -422,6 +430,12 @@ final class AudioOutput: @unchecked Sendable {
             restIfOwed()
             clockLock.unlock()
         }
+    }
+
+    private var stops: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return stopGeneration
     }
 
     private var owesRest: Bool {
@@ -443,14 +457,19 @@ final class AudioOutput: @unchecked Sendable {
     /// demux loops call it once on the first decoded packet, seek paths call it directly. Avoids the
     /// falling-through-time races that pause -> flush -> setRate would expose.
     func seekClock(to time: CMTime, rate: Float) {
-        withClock { anchorClock(to: time, rate: rate) }
+        withClock { issued in anchorClock(to: time, rate: rate, issued: issued) }
     }
 
-    /// `seekClock`'s write, holding `clockLock` (`setRate` starts a still clock through it too).
-    private func anchorClock(to time: CMTime, rate: Float) {
+    /// `seekClock`'s write, holding `clockLock` (`setRate` starts a still clock through it too); nothing if a
+    /// `stop()` came since it was asked (`issued`), the gate's answer awaited included.
+    private func anchorClock(to time: CMTime, rate: Float, issued: Int) {
         // Asked before taking `lock`: the gate reads the video renderer's state under its own lock.
         let preroll = rate > 0 ? videoPrerollSatisfied?(time.seconds) : nil
         lock.lock()
+        guard stopGeneration == issued else {
+            lock.unlock()
+            return
+        }
         EngineLog.emit("[AudioOutput] seekClock to=\(String(format: "%.3f", time.seconds)) rate=\(rate)", category: .swPlayback)
         prerollGeneration &+= 1
         let gen = prerollGeneration
@@ -526,7 +545,7 @@ final class AudioOutput: @unchecked Sendable {
             }
             return
         }
-        withClock {
+        withClock { _ in
             lock.lock()
             guard prerollGeneration == gen, let rate = prerollRate else {
                 lock.unlock()
