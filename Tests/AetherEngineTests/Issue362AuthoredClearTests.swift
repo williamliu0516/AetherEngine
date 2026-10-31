@@ -263,4 +263,24 @@ struct Issue362AuthoredClearTests {
         #expect(store.firstPTS(streamIndex: 3, after: 2771.143) == nil)   // the frontier itself
         #expect(store.firstPTS(streamIndex: 4, after: 0) == nil)          // a stream with nothing
     }
+
+    // MARK: - A set's own packet
+
+    /// Suzume's UHD Blu-ray, its Chinese PGS (PID 0x12A2), as `ffprobe -show_packets` reads it: a line set at
+    /// 5525.700367, resent as acquisition points every third of a second, cleared at 5529.287289. The drain hands
+    /// the decoder each set at its PTS rounded to the millisecond, so the cues start at 5525.700, 5526.034 and 5526.368
+    /// while the store keeps the 90 kHz PTS: two of the three sets' own packets sit after their cue's start.
+    @Test("a set's own packet, a fraction of a millisecond after its rounded start, does not end it")
+    func ownPacketDoesNotEndTheSet() {
+        let store = SubtitlePacketStore()
+        for pts in [5525.700367, 5526.034033, 5526.367700, 5529.287289] {
+            store.append(streamIndex: 5, ptsSeconds: pts, durationSeconds: 0, payload: Data(count: 23_466))
+        }
+        var cues = [imageCue(id: 32, start: 5525.700, end: 5525.700 + placeholder),
+                    imageCue(id: 33, start: 5526.034, end: 5526.034 + placeholder),
+                    imageCue(id: 34, start: 5526.368, end: 5526.368 + placeholder)]
+        #expect(AetherEngine.alignCueEnds(&cues, toNextPacket: { store.firstPTS(streamIndex: 5, after: $0) }))
+        // Each set runs to the next one, the last to the clear: the line stays up from 5525.7 to 5529.29.
+        #expect(cues.map(\.endTime) == [5526.034033, 5526.367700, 5529.287289])
+    }
 }
