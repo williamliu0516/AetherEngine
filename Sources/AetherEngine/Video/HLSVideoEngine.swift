@@ -4432,6 +4432,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// preserving a "progressing" producer: progress toward a region the pending target is not
     /// in is not worth preserving (640 s target, march at ~316 s: 3x30 s serve timeouts ride to
     /// item death long before the march arrives). `true` with no provider (nothing to judge).
+    /// A seek asked for playlist time `seconds` (`VideoSegmentProvider.noteSeekTarget`).
+    func noteSeekTarget(playlistTime seconds: Double) {
+        provider?.noteSeekTarget(segmentIndexForPlaylistTime(seconds))
+    }
+
     func producerCoversPlaylistTime(_ seconds: Double) -> Bool {
         guard let prov = provider else { return true }
         return prov.activeMarchCovers(segmentIndexForPlaylistTime(seconds))

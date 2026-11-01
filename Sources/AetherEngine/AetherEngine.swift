@@ -6250,6 +6250,9 @@ public final class AetherEngine: ObservableObject {
             // re-issued seek for a bounded number of windows rather than reverting to the old position.
             var reanchored = false
             var postReanchorWaits = 0
+            // The segment this seek asks for, which the producer restarts at when its march is slower (an empty
+            // cache's far seek, `VideoSegmentProvider.noteSeekTarget`); a prefetch never does.
+            nativeVideoSession?.noteSeekTarget(playlistTime: clockTarget)
             var landed = await nativeHost?.seek(to: clockTarget,
                                                 deadlineSeconds: Self.nativeSeekReconcileBudgetSeconds) ?? true
             deadlineLoop: while !landed {

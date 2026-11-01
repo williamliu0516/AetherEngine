@@ -18,6 +18,18 @@ the public-API contract.
 
 ### Fixed
 
+- **A far seek that comes before the producer has stored a segment restarts at once when the march is slower.** With
+  nothing stored the request took the empty-cache branch, which marked it for a restart, but the producer covering
+  the index vetoed the fire, and the rule that lifts that veto for a slow march ran only in the forward-wait branch.
+  The request waited for the march until AVPlayer gave it up: on an iPad over a 26 Mbit/s SMB link, a 16 Mbit/s AV1
+  clip's seg6 asked 1.5 s after the start was served 8.1 s later (the seek moving after 11.9 s), and the same for a
+  Dolby Vision Profile 8 clip (7.5 s) and an HEVC one (12.3 s). The empty-cache branch now decides the same way, and
+  before any segment is stored the pace is the segment at the source's average bitrate over the pump's read rate,
+  known half a second into the read (the mean of the segments up to the one asked for); while it is still unknown the
+  wait decides again each second, and a march found slow in the last slice still restarts. Only the segment a seek
+  asked for restarts this way (`HLSVideoEngine.noteSeekTarget`, set by the programmatic VOD seek): an AVPlayer
+  prefetch ahead of a start's first segment, and a quick march, keep the veto (`EmptyCacheFarSeekTests`).
+
 - **The software host's tap sinks are read and written under one lock.** `audioTapSink` and `subtitleTapSink`
   were `nonisolated(unsafe)` closures, written on the main actor (a tap installed, its stream stopped) and read
   for every packet on the demux thread, so a read could retain a closure the write had just released and later

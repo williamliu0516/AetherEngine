@@ -1837,6 +1837,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         // AE#169 round 2: true when the fetch takes the VOD forward-window backpressure wait, so a
         // full-timeout miss records (index, front) for the frozen-march escalation above.
         var tookForwardWait = false
+        var emptyCacheFarAhead = false
         if staleBelowProducer || producerPassedAndPruned {
             needsRestart = true
         } else if let r = range {
@@ -1896,7 +1897,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                 // and the one segment (2026-10-17, A12Z iPad). At the producer's own pace, restart when the
                 // segments before this one would take longer than that reopen.
                 marchTooSlow = !isLive && Self.forwardMarchSlowerThanRestart(
-                    segmentsAhead: index - front, secondsPerSegment: cache.estimatedSecondsPerSegment)
+                    segmentsAhead: index - front, secondsPerSegment: marchPace(from: front, to: index))
                 if marchTooSlow {
                     EngineLog.emit(
                         "[HLSVideoEngine] seg\(index): \(index - front) segments ahead of the march at "
@@ -1910,6 +1911,17 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             // (producer far from index, won't backfill). index > 2 heuristic missed the repro where
             // producer was at idx 1314 and AVPlayer requested seg-0 after a back-scrub (30 s timeout).
             needsRestart = abs(index - lastRestartIndex) > 2
+            // A far seek while the producer still writes its first segment: the producer covers the index, which
+            // vetoes the restart below, and the request waited for the march until AVPlayer gave it up and asked
+            // again (a 16 Mbit/s AV1 clip over a 26 Mbit/s SMB link: seg6 asked 1.5 s after the start, served 8.1 s
+            // later, the seek moving after 11.9 s; iPad, 2026-11-01). The same rule as the forward wait lifts the
+            // veto: restart when the march is slower than a restart, decided again each second while the pace is
+            // still unknown (`emptyCacheFarAhead`). Only for the segment a seek asked for (`noteSeekTarget`): an
+            // AVPlayer prefetch ahead of a start's first segment keeps the veto (Codex).
+            emptyCacheFarAhead = needsRestart && !isLive && index > lastRestartIndex && isSeekTarget(index)
+            if emptyCacheFarAhead {
+                marchTooSlow = emptyCacheMarchTooSlow(index)
+            }
         }
 
         if needsRestart, let restart = restartHandler {
@@ -1969,8 +1981,23 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                     }
                     attempt += 1
                 }
-                if let source = cache.fetchSource(index: index, timeout: repositionWaitSlice,
-                                                  progressive: fetchesProgressively) {
+                // Held back only by the veto, the slice waits a second at a time and decides again: the pace is
+                // known once the pump has read for half a second.
+                let sliceEnd = DispatchTime.now() + repositionWaitSlice
+                let slowBefore = marchTooSlow
+                var source: SegmentSource?
+                repeat {
+                    let deciding = emptyCacheFarAhead && !marchTooSlow
+                    let now = DispatchTime.now()
+                    let left = sliceEnd > now ? Double(sliceEnd.uptimeNanoseconds - now.uptimeNanoseconds) / 1e9 : 0
+                    source = cache.fetchSource(index: index, timeout: deciding ? min(1, max(0.05, left)) : left,
+                                               progressive: fetchesProgressively)
+                    if source != nil || cache.isClosed || !deciding { break }
+                    marchTooSlow = emptyCacheMarchTooSlow(index)
+                } while !marchTooSlow && DispatchTime.now() < sliceEnd
+                // Decided slow in this slice, the last one included: one more pass fires the restart (Codex).
+                if marchTooSlow, !slowBefore { attempt = min(attempt, Self.repositionMaxWaits - 1) }
+                if let source {
                     return logServed(index: index, source: source, totalStart: totalStart, restarted: true)
                 }
                 // Audit SEG-3: a closed cache answers fetch at once, so riding a restart that
@@ -1994,7 +2021,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                     return logServed(index: index, source: source, totalStart: totalStart, restarted: false)
                 }
                 if Self.forwardMarchSlowerThanRestart(segmentsAhead: index - activeMarchFront,
-                                                      secondsPerSegment: cache.estimatedSecondsPerSegment) {
+                                                      secondsPerSegment: marchPace(from: activeMarchFront,
+                                                                                   to: index)) {
                     return serveSource(at: index)
                 }
             }
@@ -2104,6 +2132,56 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// is reset per provider-fired restart) or its restart anchor before the first write (AE#141).
     private var activeMarchFront: Int {
         max(cache.highestStoredIndex, lastRestartIndex)
+    }
+
+    /// The producer's seconds per segment (`SegmentCache.estimatedSecondsPerSegment`), else, before it has stored
+    /// one, the segments from `front` up to `index` at the source's average bitrate over the pump's read rate (their
+    /// mean length: a short last segment says nothing of the march to it).
+    private func marchPace(from front: Int, to index: Int) -> Double? {
+        if let pace = cache.estimatedSecondsPerSegment { return pace }
+        let lower = max(0, front), upper = min(index, segments.count)
+        guard lower < upper else { return nil }
+        let mean = segments[lower..<upper].reduce(0) { $0 + $1.durationSeconds } / Double(upper - lower)
+        return Self.plannedSecondsPerSegment(segmentSeconds: mean, sourceBitrate: sourceBitrate,
+                                             pumpBytesPerSecond: cache.currentPumpRate)
+    }
+
+    /// The segment the host's last seek asked for, and when (`noteSeekTarget`). Guarded by `stateLock`.
+    private var _seekTarget: (index: Int, at: Double)?
+
+    /// A seek asked for segment `index`: a request for it (or the one before, where AVPlayer lands on a boundary) in
+    /// the next minute is that seek's, not a prefetch.
+    func noteSeekTarget(_ index: Int) {
+        stateLock.lock()
+        _seekTarget = (index, ProcessInfo.processInfo.systemUptime)
+        stateLock.unlock()
+    }
+
+    private func isSeekTarget(_ index: Int) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard let target = _seekTarget, ProcessInfo.processInfo.systemUptime - target.at <= 60 else { return false }
+        return index == target.index || index == target.index - 1
+    }
+
+    /// A segment's bytes at the source's average bitrate over the pump's read rate; nil when either is unknown.
+    nonisolated static func plannedSecondsPerSegment(segmentSeconds: Double, sourceBitrate: Int64,
+                                                     pumpBytesPerSecond: Double?) -> Double? {
+        guard sourceBitrate > 0, segmentSeconds > 0, let rate = pumpBytesPerSecond, rate > 0 else { return nil }
+        return Double(sourceBitrate) / 8 * segmentSeconds / rate
+    }
+
+    /// The empty-cache far seek's march too slow (`forwardMarchSlowerThanRestart`), logged when it is.
+    private func emptyCacheMarchTooSlow(_ index: Int) -> Bool {
+        // From the front as it stands: the wait can span stores (Codex).
+        let front = activeMarchFront
+        let pace = marchPace(from: front, to: index)
+        guard Self.forwardMarchSlowerThanRestart(segmentsAhead: index - front, secondsPerSegment: pace)
+        else { return false }
+        EngineLog.emit(
+            "[HLSVideoEngine] seg\(index): \(index - front) segments ahead of a producer that had none stored, at "
+            + String(format: "%.2f", pace ?? 0) + " s each; restarting rather than pumping through", category: .session)
+        return true
     }
 
     /// AE#141: whether the active producer's march can plausibly deliver `index` without a

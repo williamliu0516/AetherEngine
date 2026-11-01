@@ -819,6 +819,14 @@ final class SegmentCache: @unchecked Sendable {
     /// The pump's read rate while it is not parked, in bytes a second, and when it was taken (`notePumpRate`).
     private var pumpRate: (bytesPerSecond: Double, at: Double)?
 
+    /// The pump's read rate in bytes a second, nil when it is older than five seconds (`notePumpRate`).
+    var currentPumpRate: Double? {
+        condition.lock()
+        defer { condition.unlock() }
+        guard let rate = pumpRate, ProcessInfo.processInfo.systemUptime - rate.at <= 5 else { return nil }
+        return rate.bytesPerSecond
+    }
+
     /// The producer read `bytesPerSecond` over its last stretch without a park.
     func notePumpRate(bytesPerSecond: Double) {
         guard bytesPerSecond.isFinite, bytesPerSecond > 0 else { return }
