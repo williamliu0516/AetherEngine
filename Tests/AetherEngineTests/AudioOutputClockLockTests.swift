@@ -7,7 +7,10 @@ import Testing
 /// simulator's never returned). `seekClock` made it holding `lock`, which `stop()` takes, and a recovery's stop
 /// on the main thread waited behind it for good: the player froze (2026-10-31). The writes now run outside
 /// `lock`, one at a time in the order asked, and a stop never waits for one: the write under way pays its rest.
-@Suite("AudioOutput clock writes and stop")
+/// The callers run on threads of their own, not the global pool, which a loaded full run left them waiting on for over
+/// 5 s (zool.22, 4985 tests). A step that has to happen gets 60 s: a semaphore wait does not hear `.timeLimit`, so an
+/// unbounded one would hang the run rather than fail; only the claims (0.3 s, 10 s) are tight.
+@Suite("AudioOutput clock writes and stop", .offCooperativePool, .timeLimit(.minutes(2)))
 struct AudioOutputClockLockTests {
 
     /// A write held in the synchronizer until `release` is signalled; `entered` once it is there.
@@ -17,7 +20,7 @@ struct AudioOutputClockLockTests {
         output.whileSettingClockForTesting = {
             guard first.take() else { return }
             entered.signal()
-            _ = release.wait(timeout: .now() + 10)
+            _ = release.wait(timeout: .now() + 60)
         }
         return (entered, release)
     }
@@ -27,20 +30,20 @@ struct AudioOutputClockLockTests {
         let output = AudioOutput()
         let (entered, release) = holdingWrites(output)
         let seeked = DispatchSemaphore(value: 0)
-        DispatchQueue.global().async {
+        Thread.detachNewThread {
             output.seekClock(to: CMTime(seconds: 30, preferredTimescale: 600), rate: 1)
             seeked.signal()
         }
-        #expect(entered.wait(timeout: .now() + 5) == .success)
+        #expect(entered.wait(timeout: .now() + 60) == .success)
         let stopped = DispatchSemaphore(value: 0)
-        DispatchQueue.global().async {
+        Thread.detachNewThread {
             output.stop()
             stopped.signal()
         }
-        // Before: the stop waited on `lock` until the seek's write came back, here 10 s.
-        #expect(stopped.wait(timeout: .now() + 2) == .success)
+        // Before: the stop waited on `lock` until the seek's write came back, here 60 s.
+        #expect(stopped.wait(timeout: .now() + 10) == .success)
         release.signal()
-        #expect(seeked.wait(timeout: .now() + 5) == .success)
+        #expect(seeked.wait(timeout: .now() + 60) == .success)
         #expect(output.rate == 0)
     }
 
@@ -49,20 +52,20 @@ struct AudioOutputClockLockTests {
         let output = AudioOutput()
         let (entered, release) = holdingWrites(output)
         let seeked = DispatchSemaphore(value: 0), paused = DispatchSemaphore(value: 0)
-        DispatchQueue.global().async {
+        Thread.detachNewThread {
             output.seekClock(to: CMTime(seconds: 30, preferredTimescale: 600), rate: 1)
             seeked.signal()
         }
-        #expect(entered.wait(timeout: .now() + 5) == .success)
-        DispatchQueue.global().async {
+        #expect(entered.wait(timeout: .now() + 60) == .success)
+        Thread.detachNewThread {
             output.pause()
             paused.signal()
         }
         // The pause waits behind the seek's write, as it waited on `lock` before.
         #expect(paused.wait(timeout: .now() + 0.3) == .timedOut)
         release.signal()
-        #expect(seeked.wait(timeout: .now() + 5) == .success)
-        #expect(paused.wait(timeout: .now() + 5) == .success)
+        #expect(seeked.wait(timeout: .now() + 60) == .success)
+        #expect(paused.wait(timeout: .now() + 60) == .success)
         #expect(output.rate == 0)
     }
 
@@ -71,12 +74,12 @@ struct AudioOutputClockLockTests {
         let output = AudioOutput()
         let (entered, release) = holdingWrites(output)
         let seeked = DispatchSemaphore(value: 0), rated = DispatchSemaphore(value: 0)
-        DispatchQueue.global().async {
+        Thread.detachNewThread {
             output.seekClock(to: CMTime(seconds: 30, preferredTimescale: 600), rate: 0)
             seeked.signal()
         }
-        #expect(entered.wait(timeout: .now() + 5) == .success)
-        DispatchQueue.global().async {
+        #expect(entered.wait(timeout: .now() + 60) == .success)
+        Thread.detachNewThread {
             output.setRate(1)
             rated.signal()
         }
@@ -84,8 +87,8 @@ struct AudioOutputClockLockTests {
         #expect(rated.wait(timeout: .now() + 0.3) == .timedOut)
         output.stop()
         release.signal()
-        #expect(seeked.wait(timeout: .now() + 5) == .success)
-        #expect(rated.wait(timeout: .now() + 5) == .success)
+        #expect(seeked.wait(timeout: .now() + 60) == .success)
+        #expect(rated.wait(timeout: .now() + 60) == .success)
         #expect(output.rate == 0)
     }
 
@@ -97,19 +100,19 @@ struct AudioOutputClockLockTests {
         output.videoPrerollSatisfied = { _ in
             if first.take() {
                 asked.signal()
-                _ = answer.wait(timeout: .now() + 10)
+                _ = answer.wait(timeout: .now() + 60)
             }
             return false   // not ready: the seek would set up a preroll that starts the clock at its timeout
         }
         let seeked = DispatchSemaphore(value: 0)
-        DispatchQueue.global().async {
+        Thread.detachNewThread {
             output.seekClock(to: CMTime(seconds: 30, preferredTimescale: 600), rate: 1)
             seeked.signal()
         }
-        #expect(asked.wait(timeout: .now() + 5) == .success)
+        #expect(asked.wait(timeout: .now() + 60) == .success)
         output.stop()
         answer.signal()
-        #expect(seeked.wait(timeout: .now() + 5) == .success)
+        #expect(seeked.wait(timeout: .now() + 60) == .success)
         // Past the preroll's timeout, when a preroll set up after the stop would have started the clock.
         Thread.sleep(forTimeInterval: AudioOutput.prerollTimeout + 0.5)
         #expect(output.rate == 0)
