@@ -589,7 +589,7 @@ extension AetherEngine {
                       // This lean path has no live-reopen / readiness watchdog; let AVPlayer's "gave up"
                       // signal surface a dead upstream (segment 404 / token expiry) so the host can retune.
                       surfaceEndFailures: true,
-                      httpHeaders: options.httpHeaders,
+                      httpHeaders: Self.remoteHLSPlayerHeaders(options),
                       // #168 follow-up: live-only (VOD remote HLS is the AE#154 reroute target; ingesting
                       // it back would ping-pong), and hosts can opt out via LoadOptions.
                       armIngestFallback: RemoteHLSIngestFallback.shouldArm(
@@ -618,6 +618,22 @@ extension AetherEngine {
         // The sampler reads AVPlayer's access log on this route: both bitrates, network rate and transfer,
         // dropped frames and forward buffer. The loopback counters (producer, muxer, server) read zero.
         startLiveTelemetrySampler()
+    }
+
+    /// Whether the stand-in puts the relay in front of `originURL`: always for a host that asked for it
+    /// (`LoadOptions.relaysRemoteHLS`); for an https origin of a host with a trust evaluator, where the system
+    /// refuses it (AE#495); else never, and the origin is not asked.
+    nonisolated static func remoteHLSNeedsRelay(_ originURL: URL, options: LoadOptions) async -> Bool {
+        if options.relaysRemoteHLS { return true }
+        guard EngineTLS.serverTrustEvaluator != nil, originURL.scheme?.lowercased() == "https" else { return false }
+        return await HLSOriginRelay.systemTrustRefuses(originURL, headers: options.httpHeaders)
+    }
+
+    /// The headers AVPlayer itself is handed on this bypass: none for a host that asked for the relay
+    /// (`LoadOptions.relaysRemoteHLS`), which fetches with them in AVPlayer's place, or that the origin refuses
+    /// without them where the relay could not be mounted; else all of them (#119).
+    nonisolated static func remoteHLSPlayerHeaders(_ options: LoadOptions) -> [String: String] {
+        options.relaysRemoteHLS ? [:] : options.httpHeaders
     }
 
     /// AE#616: on this bypass `sourceTime` would otherwise be item time, which an origin that restarts
@@ -673,19 +689,13 @@ extension AetherEngine {
     private func prepareRemoteHLSStandIn(originURL: URL,
                                          options: LoadOptions,
                                          expectedGeneration: UInt64) async -> URL? {
-        let mayNeedRelay = EngineTLS.serverTrustEvaluator != nil
-            && originURL.scheme?.lowercased() == "https"
         let tracks = options.isLive
             ? []
             : externalSubtitleRegistry
                 .filter { $0.value.isTextFormat }
                 .sorted { $0.key < $1.key }
                 .map { RemoteHLSSubtitleProvider.Track(externalID: $0.key, source: $0.value) }
-        // Nothing to stand in for, so the origin is never asked.
-        guard !tracks.isEmpty || mayNeedRelay else { return nil }
-        let needsRelay = mayNeedRelay
-            ? await HLSOriginRelay.systemTrustRefuses(originURL, headers: options.httpHeaders)
-            : false
+        let needsRelay = await Self.remoteHLSNeedsRelay(originURL, options: options)
         guard !options.isLive || needsRelay else { return nil }
         guard !tracks.isEmpty || needsRelay else { return nil }
 

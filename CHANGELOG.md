@@ -10,6 +10,16 @@ the public-API contract.
 
 ## [Unreleased]
 
+### Added
+
+- **`LoadOptions.relaysRemoteHLS`: a host whose headers carry a secret keeps them off every other host on the remote
+  HLS bypass.** AVPlayer sends the headers it is handed to every host a redirect or a playlist names, so a reverse
+  proxy's `Authorization` or a Cloudflare Access pair reached a CDN the server sent the stream to. With the option the
+  origin relay (AE#495) stands in front of the master with no trust evaluator and no sidecar, AVPlayer is handed no
+  headers, and the relay's fetches send them to the origin the URL names only; elsewhere they carry only the headers
+  that describe the request. Where the relay cannot be mounted, AVPlayer opens the origin without the headers. Off by
+  default: a host without such headers keeps AVPlayer on the origin, as before.
+
 ### Documentation
 
 - **`LoadOptions.volumeBoost` and `stereoPresentation`, `AetherEngine.sweepStaleSessionDirectories()` and
