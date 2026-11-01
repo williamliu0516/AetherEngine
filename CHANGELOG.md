@@ -30,6 +30,14 @@ the public-API contract.
   asked for restarts this way (`HLSVideoEngine.noteSeekTarget`, set by the programmatic VOD seek): an AVPlayer
   prefetch ahead of a start's first segment, and a quick march, keep the veto (`EmptyCacheFarSeekTests`).
 
+- **A redirect to another origin carries only the caller's headers that describe the request.** A token under a name
+  the credential list did not have (`X-Plex-Token`) and a proxy's own secret (`CF-Access-Client-Secret`) were replayed
+  to a cross-origin redirect target and to hosts a playlist named, and the session's own redirects (the relay's pump,
+  the HLS playlist fetches) scrubbed only the credential list from what URLSession copied onto the new request.
+  Across origins a caller's header now goes along only when it is `Accept`, `Accept-Encoding`, `Accept-Language`,
+  `If-Range`, `Range`, `Referer` or `User-Agent` (the last two for the header-dependent proxies of #8 / #119); the
+  same-host http to https upgrade keeps credentials (`RedirectHeaderPolicyTests`).
+
 - **The software host's tap sinks are read and written under one lock.** `audioTapSink` and `subtitleTapSink`
   were `nonisolated(unsafe)` closures, written on the main actor (a tap installed, its stream stopped) and read
   for every packet on the demux thread, so a read could retain a closure the write had just released and later
