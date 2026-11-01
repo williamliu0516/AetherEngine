@@ -296,7 +296,7 @@ struct Issue377HeldConnectionTests {
         #expect(origin.requestLog.map(\.path) == ["/source.mkv", "/pinned.mkv"])
     }
 
-    @Test("a cross-origin redirect drops the credential headers and keeps the rest")
+    @Test("a cross-origin redirect drops the credential headers and keeps what describes the request")
     func crossOriginRedirectDropsCredentials() async throws {
         let total: Int64 = 64 * 1024
         final class PortBox: @unchecked Sendable { var port: UInt16 = 0 }
@@ -314,7 +314,7 @@ struct Issue377HeldConnectionTests {
         let connection = HeldSourceConnection(
             url: url, offset: 0,
             extraHeaders: ["X-Emby-Token": "secret", "Authorization": "MediaBrowser Token=\"secret\"",
-                           "X-Custom": "kept"],
+                           "X-Custom": "source only", "Referer": "https://app.example/"],
             userAgent: nil, label: "test", delegate: delegate)
         connection.start()
         #expect(delegate.waitForEnd())
@@ -324,7 +324,8 @@ struct Issue377HeldConnectionTests {
         #expect(headers[0]["x-emby-token"] == "secret")
         #expect(headers[1]["x-emby-token"] == nil)
         #expect(headers[1]["authorization"] == nil)
-        #expect(headers[1]["x-custom"] == "kept")
+        #expect(headers[1]["x-custom"] == nil)
+        #expect(headers[1]["referer"] == "https://app.example/")
     }
 
     @Test("a mid-body offset asks for exactly that offset")

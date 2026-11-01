@@ -5,8 +5,10 @@ import Foundation
 /// TLS downgrade. A cross-host redirect target (presigned object storage, CDN) must not
 /// see the media-server token; replaying it both discloses the credential and can break
 /// the request outright when the target authenticates via the URL itself and rejects
-/// conflicting auth mechanisms with 400. Non-credential headers are replayed
-/// unconditionally so header-dependent proxies keep working (#8).
+/// conflicting auth mechanisms with 400. Elsewhere a caller's header goes along only when it
+/// describes the request (`describing`, with the Referer and User-Agent header-dependent
+/// proxies need, #8): a token by any other name (X-Plex-Token) and a proxy's own secret
+/// (CF-Access-Client-Secret) went to the target, as only the names below were known.
 enum RedirectHeaderPolicy {
     private static let credentialHeaders: Set<String> = [
         "authorization",
@@ -17,6 +19,11 @@ enum RedirectHeaderPolicy {
         "x-mediabrowser-token",
     ]
 
+    /// The caller's headers that may go to another origin: what range, what format, who asks.
+    private static let describing: Set<String> = [
+        "accept", "accept-encoding", "accept-language", "if-range", "range", "referer", "user-agent",
+    ]
+
     static func headersToReplay(
         extraHeaders: [String: String],
         originalURL: URL?,
@@ -25,12 +32,12 @@ enum RedirectHeaderPolicy {
         if credentialsAllowed(from: originalURL, to: redirectURL) {
             return extraHeaders
         }
-        return extraHeaders.filter { !credentialHeaders.contains($0.key.lowercased()) }
+        return extraHeaders.filter { describing.contains($0.key.lowercased()) }
     }
 
     /// Audit NET-7: the headers a host handed over for `anchor` as they may be sent to `target`, a URI
     /// some playlist named. A playlist can name any host and scheme, so it gets the rule a redirect
-    /// gets: credentials only to the same origin with no TLS downgrade, everything else as given.
+    /// gets: credentials only to the same origin with no TLS downgrade, elsewhere only what describes the request.
     static func scoped(_ headers: [String: String], grantedFor anchor: URL?, sentTo target: URL?)
         -> [String: String]
     {
@@ -54,7 +61,8 @@ enum RedirectHeaderPolicy {
             updated.setValue(originalRange, forHTTPHeaderField: "Range")
         }
         if !credentialsAllowed(from: originalURL, to: request.url) {
-            for name in credentialHeaders {
+            for name in credentialHeaders.union(extraHeaders.keys.map { $0.lowercased() })
+                where !describing.contains(name) {
                 updated.setValue(nil, forHTTPHeaderField: name)
             }
         }
@@ -92,7 +100,7 @@ enum RedirectHeaderPolicy {
 /// Audit NET-109: which URLs may receive the headers a host handed over. Being allowed to fetch a
 /// URL (a playlist named it, a redirect landed there) and being granted the host's credentials are
 /// separate decisions: only the URLs the host itself passed in are anchors, and every other target
-/// gets the same headers minus the credentials, the rule a redirect follows. One type so the relay,
+/// gets only the headers that describe the request, the rule a redirect follows. One type so the relay,
 /// the subtitle proxy, the audio tap and the live rendition fetch cannot each decide differently.
 struct CredentialScope: Sendable {
     let headers: [String: String]
