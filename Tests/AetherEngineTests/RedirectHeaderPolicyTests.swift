@@ -131,6 +131,31 @@ struct RedirectHeaderPolicyTests {
         #expect(out["Authorization"] == "Bearer abc")
     }
 
+    @Test("A session's own redirect leaves the request's token behind cross-host", .timeLimit(.minutes(1)))
+    func sessionDelegateScrubsTheOriginalRequestsHeaders() async throws {
+        let cdn = try #require(ThrottledOriginServer(totalSize: 64 * 1024))
+        defer { cdn.stop() }
+        let cdnPort = cdn.port
+        let sourceMaybe = ThrottledOriginServer(
+            totalSize: 64 * 1024, respond: { _, _, _ in .redirect(to: "http://127.0.0.1:\(cdnPort)/seg.ts") })
+        let source = try #require(sourceMaybe)
+        defer { source.stop() }
+        let session = URLSession(configuration: .ephemeral, delegate: EngineTLS.RedirectScrubbingDelegate(),
+                                 delegateQueue: nil)
+        defer { session.invalidateAndCancel() }
+        var request = URLRequest(url: url("http://127.0.0.1:\(source.port)/index.m3u8"))
+        for (name, value) in ["X-Plex-Token": "FAKE-PLEX", "CF-Access-Client-Secret": "FAKE-PROXY",
+                              "Range": "bytes=0-1023", "User-Agent": "UA/1"] {
+            request.setValue(value, forHTTPHeaderField: name)
+        }
+        _ = try await session.data(for: request)
+        let atTarget = try #require(cdn.requestHeaders.last)
+        #expect(atTarget["x-plex-token"] == nil && atTarget["cf-access-client-secret"] == nil,
+                "a token or a proxy's secret reached the CDN: \(atTarget.keys.sorted())")
+        #expect(atTarget["range"] == "bytes=0-1023" && atTarget["user-agent"] == "UA/1")
+        #expect(source.requestHeaders.last?["x-plex-token"] == "FAKE-PLEX")
+    }
+
     @Test("Missing original URL strips credentials, keeps what describes the request")
     func nilOriginalDropsCredentials() {
         let out = RedirectHeaderPolicy.headersToReplay(

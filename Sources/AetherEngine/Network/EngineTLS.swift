@@ -68,7 +68,9 @@ public enum EngineTLS {
     /// target), so without this a 302 took the host's token wherever it
     /// pointed. A task delegate that implements its own redirect method
     /// (AVIOReader, SourcePrewarmFetcher) still answers for its task; one that
-    /// does not (the relay's pump) falls back to this.
+    /// does not (the relay's pump) falls back to this. The original request's
+    /// headers are the caller's: with none named, only the credential list was
+    /// scrubbed, and X-Plex-Token or a proxy's secret went on to the target.
     class RedirectScrubbingDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
         func urlSession(
             _ session: URLSession,
@@ -82,7 +84,7 @@ public enum EngineTLS {
                 request,
                 originalURL: original?.url,
                 originalRange: original?.value(forHTTPHeaderField: "Range"),
-                extraHeaders: [:]))
+                extraHeaders: original?.allHTTPHeaderFields ?? [:]))
         }
     }
 
