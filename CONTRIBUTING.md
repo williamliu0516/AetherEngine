@@ -21,6 +21,8 @@ For iterative work, open `Package.swift` in Xcode 27+ and pick the `AetherEngine
 
 The `aetherctl` command-line target is macOS-only (it uses `Foundation.Process`) and is excluded from the iOS / tvOS library build.
 
+On a Mac with the application firewall on, `HLS local server against slow and silent peers` › `LAN peers cannot take the slots kept for loopback` runs into its two-minute limit. The test connects to the Mac's own `en0` address; the firewall completes those connections but never hands them to the test process (`swiftpm-testing-helper`, ad-hoc signed like everything `swift build` makes), so the server never counts them. Loopback connections are not held back. That is the machine, not the engine: read that one failure as environmental, or run the suite where the firewall is off.
+
 ## Writing tests
 
 The suite is large (3000 tests over 460 files) and cheap (the whole run is about a minute), so the

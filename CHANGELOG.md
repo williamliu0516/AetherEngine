@@ -10,6 +10,12 @@ the public-API contract.
 
 ## [Unreleased]
 
+### Documentation
+
+- **`LoadOptions.volumeBoost` and `stereoPresentation`, `AetherEngine.sweepStaleSessionDirectories()` and
+  aetherctl's `--stereo`, `--volume-boost` and `--audio-bridge` are documented** (docs/api.md, docs/cli.md), so the three
+  documentation-coverage tests pass again; CONTRIBUTING names the LAN-peer HLS test a Mac's firewall times out.
+
 ### Fixed
 
 - **The software host's tap sinks are read and written under one lock.** `audioTapSink` and `subtitleTapSink`
