@@ -9,8 +9,8 @@ import Foundation
 /// size probes go blind, and the reader degrades to forward-only streaming. It also
 /// disclosed the media-server token to foreign hosts. The policy: credential headers
 /// are replayed only when the redirect target is a trustworthy same-host destination
-/// (no security downgrade); everything else is still replayed unconditionally so
-/// header-dependent proxies keep working (#8).
+/// (no security downgrade); elsewhere only what describes the request goes, the Referer and
+/// User-Agent header-dependent proxies need among it (#8).
 struct RedirectHeaderPolicyTests {
 
     private func url(_ s: String) -> URL { URL(string: s)! }
@@ -47,19 +47,36 @@ struct RedirectHeaderPolicyTests {
 
     // MARK: Cross-origin credential stripping
 
-    @Test("Host change strips Authorization but keeps non-credential headers")
+    @Test("Host change keeps only the headers that describe the request")
     func crossHostDropsCredentials() {
         let out = RedirectHeaderPolicy.headersToReplay(
             extraHeaders: [
                 "Authorization": "Bearer abc",
                 "User-Agent": "Sodalite/1.0",
+                "Referer": "https://app.example/",
                 "X-Custom": "1",
             ],
             originalURL: url("https://media.example/Items/42/stream.mp4"),
             redirectURL: url("https://storage.cdn.example/bucket/42.mp4?sig=xyz"))
-        #expect(out["Authorization"] == nil)
-        #expect(out["User-Agent"] == "Sodalite/1.0")
-        #expect(out["X-Custom"] == "1")
+        #expect(out == ["User-Agent": "Sodalite/1.0", "Referer": "https://app.example/"])
+    }
+
+    @Test("A Plex token and a proxy's own secret stay behind cross-host, carried over or replayed")
+    func crossHostDropsTokensByAnyName() {
+        let extra = ["X-Plex-Token": "FAKE-PLEX", "CF-Access-Client-Secret": "FAKE-PROXY", "Range": "bytes=0-"]
+        let out = RedirectHeaderPolicy.headersToReplay(
+            extraHeaders: extra,
+            originalURL: url("https://plex.example:32400/video/start.m3u8"),
+            redirectURL: url("https://relay.other.example/video/start.m3u8"))
+        #expect(out == ["Range": "bytes=0-"])
+        var carried = URLRequest(url: url("https://relay.other.example/video/start.m3u8"))
+        for (name, value) in extra { carried.setValue(value, forHTTPHeaderField: name) }
+        let request = RedirectHeaderPolicy.redirectRequest(
+            carried, originalURL: url("https://plex.example:32400/video/start.m3u8"), originalRange: nil,
+            extraHeaders: extra)
+        #expect(request.value(forHTTPHeaderField: "X-Plex-Token") == nil)
+        #expect(request.value(forHTTPHeaderField: "CF-Access-Client-Secret") == nil)
+        #expect(request.value(forHTTPHeaderField: "Range") == "bytes=0-")
     }
 
     @Test("All credential header kinds are stripped cross-host")
@@ -114,14 +131,13 @@ struct RedirectHeaderPolicyTests {
         #expect(out["Authorization"] == "Bearer abc")
     }
 
-    @Test("Missing original URL strips credentials, keeps the rest")
+    @Test("Missing original URL strips credentials, keeps what describes the request")
     func nilOriginalDropsCredentials() {
         let out = RedirectHeaderPolicy.headersToReplay(
-            extraHeaders: ["Authorization": "Bearer abc", "X-Custom": "1"],
+            extraHeaders: ["Authorization": "Bearer abc", "X-Custom": "1", "User-Agent": "UA/1"],
             originalURL: nil,
             redirectURL: url("https://media.example/x"))
-        #expect(out["Authorization"] == nil)
-        #expect(out["X-Custom"] == "1")
+        #expect(out == ["User-Agent": "UA/1"])
     }
 
     // MARK: Request-level sanitization

@@ -494,7 +494,8 @@ final class Issue732PersistentHTTP1Tests: XCTestCase {
 
         for path in ["/1.ts", "/2.ts", "/3.ts"] {
             let answer = try await transport.get(
-                edge.url(path), headers: ["Authorization": "secret", "X-Plain": "kept"], limit: 1024)
+                edge.url(path), headers: ["Authorization": "secret", "X-Plain": "source only",
+                                          "Referer": "https://app.example/"], limit: 1024)
             XCTAssertEqual(String(decoding: answer.body, as: UTF8.self), path)
             XCTAssertEqual(answer.response.url, cdn.url(path))
         }
@@ -502,7 +503,8 @@ final class Issue732PersistentHTTP1Tests: XCTestCase {
         XCTAssertEqual(cdn.connectionCount, 1)
         XCTAssertTrue(edge.requests.allSatisfy { $0.headers["authorization"] == "secret" })
         XCTAssertTrue(cdn.requests.allSatisfy { $0.headers["authorization"] == nil })
-        XCTAssertTrue(cdn.requests.allSatisfy { $0.headers["x-plain"] == "kept" })
+        XCTAssertTrue(cdn.requests.allSatisfy { $0.headers["x-plain"] == nil })
+        XCTAssertTrue(cdn.requests.allSatisfy { $0.headers["referer"] == "https://app.example/" })
     }
 
     func testWholeResourceRequestCarriesNoRange() throws {

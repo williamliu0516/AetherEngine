@@ -102,6 +102,9 @@ extension PrewarmStoreSuites {
             // A non-credential header a header-dependent proxy needs (#8): it must still travel, or
             // the fix would have broken the thing the policy deliberately keeps.
             headers["Referer"] = "https://app.example"
+            // A token by a name the credential list does not have, and a proxy's own secret.
+            headers["X-Plex-Token"] = "FAKE-PLEX"
+            headers["CF-Access-Client-Secret"] = "FAKE-PROXY"
             let reader = AVIOReader(url: URL(string: "http://127.0.0.1:\(source.port)/movie.bin")!,
                                     extraHeaders: headers,
                                     boundedInitialFetch: firstRange)
@@ -117,6 +120,8 @@ extension PrewarmStoreSuites {
                     "the media server's credential reached the CDN: \(atTarget)")
             #expect(!atTarget.contains(where: { $0["x-emby-token"] != nil }),
                     "the media server's token reached the CDN: \(atTarget)")
+            #expect(!atTarget.contains(where: { $0["x-plex-token"] != nil || $0["cf-access-client-secret"] != nil }),
+                    "a token or a proxy's secret reached the CDN: \(atTarget.map { $0.keys.sorted() })")
             #expect(atTarget.allSatisfy { $0["referer"] == "https://app.example" },
                     "a non-credential header stopped travelling: \(atTarget)")
             #expect(source.requestHeaders.allSatisfy { $0["authorization"] == "Bearer SOURCE-ONLY" },
