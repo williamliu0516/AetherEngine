@@ -108,6 +108,11 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
         await currentFillTask()?.value
     }
 
+    /// `AetherEngine.setNativeSubtitleText` for the injected renditions, each with its sidecar's language.
+    func setText(_ transform: (@Sendable (_ text: String, _ language: String?) -> String)?) {
+        NativeSubtitleCueStore.setText(transform, on: stores, languages: tracks.map(\.source.language))
+    }
+
     /// AE#616: every sidecar's decode has finished, so `allCueStarts()` is the whole program.
     var isFillFinished: Bool { stores.allSatisfy(\.isFinished) }
 

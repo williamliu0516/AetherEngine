@@ -2458,6 +2458,32 @@ extension AetherEngine {
         }
     }
 
+    /// Rewrite the text the native renditions serve, the way the host rewrites its own overlay: each cue's text is
+    /// served as `transform(text, language)`, `language` being its track's tag (nil when the track has none). So a
+    /// Simplified/Traditional Chinese conversion the viewer chose reaches the PiP window, an AirPlay receiver and an
+    /// external display, where the rendition is the display. Covers every text rendition: embedded, declared
+    /// sidecars, closed captions and OCR, and the sidecars injected into a remote HLS origin. nil (the default)
+    /// serves the text verbatim. Kept across loads like `setNativeSubtitleTiming`; a change made while a rendition
+    /// is shown is replayed through the selection, so call it only when the rewrite changes. Runs on the loopback
+    /// server's thread for each cue a fetch serves: keep it quick and free of the main actor. The host's overlay and
+    /// `subtitleCues` are not affected.
+    public func setNativeSubtitleText(_ transform: (@Sendable (_ text: String, _ language: String?) -> String)?) {
+        nativeSubtitleTextTransform = transform
+        applyNativeSubtitleText()
+        EngineLog.emit("[AetherEngine] native subtitle text transform=\(transform != nil)", category: .engine)
+        if nativeSubtitleRenderingRequested, let ordinal = nativeSubtitleReapplyOrdinal {
+            setNativeSubtitleSelected(track: ordinal)
+        }
+    }
+
+    /// Hands the host's text rewrite to every native store of the session and of a remote HLS stand-in.
+    func applyNativeSubtitleText() {
+        NativeSubtitleCueStore.setText(nativeSubtitleTextTransform,
+                                       on: nativeVideoSession?.nativeSubtitleCueStoresForSession ?? [],
+                                       languages: nativeVideoSession?.nativeSubtitleLanguagesForSession ?? [])
+        remoteHLSSubtitleProxy?.provider?.setText(nativeSubtitleTextTransform)
+    }
+
     // MARK: - Session-preserving reload carryover (#170)
 
     /// True when `nativeSubtitleReapplyOrdinal` equals the active track's mapping through the

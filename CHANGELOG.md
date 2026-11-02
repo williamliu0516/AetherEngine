@@ -12,6 +12,13 @@ the public-API contract.
 
 ### Added
 
+- **`setNativeSubtitleText(_:)`: the host's rewrite of subtitle text reaches the native renditions.** Each cue a
+  rendition serves goes through `transform(text, language)`, with its own track's language, so a viewer's Simplified or
+  Traditional Chinese choice reaches the PiP window, an AirPlay receiver and an external display as it reaches the
+  host's overlay. Every text rendition takes it: embedded tracks, declared sidecars, closed captions, OCR and the
+  sidecars injected into a remote HLS origin. Kept across loads like `setNativeSubtitleTiming`; a change made while a
+  rendition is shown is replayed through the selection. nil, the default, serves the text as it was decoded.
+
 - **`LoadOptions.relaysRemoteHLS`: a host whose headers carry a secret keeps them off every other host on the remote
   HLS bypass.** AVPlayer sends the headers it is handed to every host a redirect or a playlist names, so a reverse
   proxy's `Authorization` or a Cloudflare Access pair reached a CDN the server sent the stream to. With the option the

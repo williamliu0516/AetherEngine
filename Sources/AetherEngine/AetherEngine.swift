@@ -3758,6 +3758,9 @@ public final class AetherEngine: ObservableObject {
     var nativeSubtitleTimingScale: Double = 1
     var nativeSubtitleTimingOffset: Double = 0
 
+    /// `setNativeSubtitleText`: the host's rewrite of every native rendition's text, kept across loads.
+    var nativeSubtitleTextTransform: (@Sendable (_ text: String, _ language: String?) -> String)?
+
     /// AE#464 round 2: the position the load currently in flight was handed, parked across the window
     /// in which `load` has already zeroed the clock but the rebuilt session has not reached it yet.
     /// Written at the two sites that raise `state = .loading` for a load, retired by an accepted seek;

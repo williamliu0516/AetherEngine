@@ -170,6 +170,34 @@ struct RemoteHLSSubtitleProxyTests {
         #expect(body.contains("00:00:01.000 --> 00:00:03.000"))
     }
 
+    @Test("An injected rendition serves its text through the host's rewrite, with the sidecar's language",
+          .timeLimit(.minutes(2)))
+    func sidecarFollowsHostText() async throws {
+        let srt = """
+        1
+        00:00:01,000 --> 00:00:03,000
+        Erste Zeile
+
+        """
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ae316-\(UUID().uuidString).srt")
+        try srt.write(to: file, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: file) }
+
+        let provider = RemoteHLSSubtitleProvider(
+            tracks: [Self.track(100_000, url: file)],
+            masterBody: Self.master, programDuration: 60, defaultHeaders: [:],
+            vttFillWaitSeconds: 10)
+        defer { provider.cancelFill() }
+        provider.startFill()
+        await provider.awaitFill()
+
+        provider.setText { text, language in "\(language ?? "-"):\(text.uppercased())" }
+        #expect(provider.nativeSubtitleVTT(ordinal: 0, segmentIndex: 0)?.contains("en:ERSTE ZEILE") == true)
+        provider.setText(nil)
+        #expect(provider.nativeSubtitleVTT(ordinal: 0, segmentIndex: 0)?.contains("\nErste Zeile") == true)
+    }
+
     // MARK: - Rendition metadata
 
     @Test("Renditions are numbered in subs_{ordinal} order and carry the host's own labels")

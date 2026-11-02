@@ -23,6 +23,8 @@ final class NativeSubtitleCueStore: @unchecked Sendable {
     /// source is served at `timingScale * t + timingOffset`, before the playlist shift.
     private var timingScale: Double = 1
     private var timingOffset: Double = 0
+    /// The host's rewrite of the served text (`AetherEngine.setNativeSubtitleText`), nil for verbatim.
+    private var textTransform: (@Sendable (String) -> String)?
     private var finished = false
     /// Sodalite#32: the pump tap and a side reader can feed the same store concurrently (and a producer
     /// restart re-reads a region), so appends dedup on (start, end, text) instead of trusting the source.
@@ -42,6 +44,21 @@ final class NativeSubtitleCueStore: @unchecked Sendable {
 
     func setTiming(scale: Double, offset: Double) {
         lock.lock(); timingScale = scale; timingOffset = offset; lock.unlock()
+    }
+
+    func setTextTransform(_ transform: (@Sendable (String) -> String)?) {
+        lock.lock(); textTransform = transform; lock.unlock()
+    }
+
+    /// Hands the host's text rewrite to each store with its own track's language (ordinal-aligned; a store
+    /// past the end of `languages` gets nil).
+    static func setText(_ transform: (@Sendable (_ text: String, _ language: String?) -> String)?,
+                        on stores: [NativeSubtitleCueStore], languages: [String?]) {
+        for (i, store) in stores.enumerated() {
+            let language = i < languages.count ? languages[i] : nil
+            guard let transform else { store.setTextTransform(nil); continue }
+            store.setTextTransform { @Sendable text in transform(text, language) }
+        }
     }
 
     /// Set once the reader has read the track to EOF, so a whole-program .vtt consumer knows every cue is present (Sodalite#32).
@@ -89,19 +106,19 @@ final class NativeSubtitleCueStore: @unchecked Sendable {
         return cues.sorted { $0.startTime < $1.startTime }
     }
 
-    /// Cues overlapping `[start, end)` in AVPlayer-axis seconds, text only,
-    /// sorted by start.
+    /// Cues overlapping `[start, end)` in AVPlayer-axis seconds, text only (rewritten by the host's
+    /// text transform), sorted by start.
     func cuesInWindow(start: Double, end: Double) -> [(start: Double, end: Double, text: String)] {
         lock.lock()
         let snapshot = cues
-        let shift = shiftSeconds, scale = timingScale, offset = timingOffset
+        let shift = shiftSeconds, scale = timingScale, offset = timingOffset, transform = textTransform
         lock.unlock()
         var out: [(start: Double, end: Double, text: String)] = []
         for c in snapshot {
             guard let t = c.text else { continue }
             let s = scale * c.startTime + offset - shift
             let e = scale * c.endTime + offset - shift
-            if e > start && s < end { out.append((max(0, s), max(0, e), t)) }
+            if e > start && s < end { out.append((max(0, s), max(0, e), transform?(t) ?? t)) }
         }
         return out.sorted { $0.start < $1.start }
     }
