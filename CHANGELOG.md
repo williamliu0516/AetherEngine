@@ -28,6 +28,11 @@ the public-API contract.
 
 ### Fixed
 
+- **A playlist the origin relay fetched through a redirect resolves its relative URIs against where it was served from.** They
+  resolved against the URL the relay asked, so a master an origin redirected to an edge (`/master.m3u8` to
+  `edge/vod/master.m3u8`) sent its `v/index.m3u8` back to the origin, and the stream did not play. The credentials
+  stay with the origin the host named.
+
 - **A far seek that comes before the producer has stored a segment restarts at once when the march is slower.** With
   nothing stored the request took the empty-cache branch, which marked it for a restart, but the producer covering
   the index vetoed the fire, and the rule that lifts that veto for a slow march ran only in the forward-wait branch.

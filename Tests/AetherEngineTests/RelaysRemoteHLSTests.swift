@@ -92,6 +92,41 @@ struct RelaysRemoteHLSTests {
         }
     }
 
+    /// A playlist the origin redirected names its variant relative to where it was served from, the edge, not to the
+    /// URL the relay asked (Codex's review of relay-proxy-headers, 4): resolved against the origin, the variant was
+    /// asked of the origin and the stream did not play.
+    @Test("Relative URIs in a redirected playlist resolve against where it was served from")
+    func aRedirectedPlaylistsRelativeURIsGoToTheEdge() async throws {
+        let originMaybe = CannedHTTPOrigin(), edgeMaybe = CannedHTTPOrigin()
+        let origin = try #require(originMaybe), edge = try #require(edgeMaybe)
+        defer { origin.stop(); edge.stop() }
+        origin.route("/master.m3u8", .redirect(to: "\(edge.baseURL)/vod/master.m3u8"))
+        edge.route("/vod/master.m3u8", .body("""
+            #EXTM3U
+            #EXT-X-STREAM-INF:BANDWIDTH=1000000
+            v/index.m3u8
+            """, contentType: "application/vnd.apple.mpegurl"))
+        edge.route("/vod/v/index.m3u8", .body("""
+            #EXTM3U
+            #EXT-X-TARGETDURATION:6
+            #EXTINF:6.0,
+            seg0.ts
+            #EXT-X-ENDLIST
+            """, contentType: "application/vnd.apple.mpegurl"))
+        let master = try #require(URL(string: "\(origin.baseURL)/master.m3u8"))
+        let prepared = try #require(await RemoteHLSSubtitleProxy.prepare(
+            originURL: master, tracks: [], httpHeaders: headers, needsRelay: true))
+        defer { prepared.tearDown() }
+
+        let variant = try #require(Self.relayed(try await Self.text(of: prepared.masterURL)).first)
+        let media = try await Self.text(of: variant)
+        #expect(media.contains("#EXTINF"), "the variant was not the edge's: \(media)")
+        #expect(origin.requests.map(\.path) == ["/master.m3u8"], "asked of the origin: \(origin.requests.map(\.path))")
+        for request in edge.requests {
+            for name in secrets { #expect(request.headers[name] == nil, "\(name) reached \(request.path)") }
+        }
+    }
+
     /// The relay's own addresses in a playlist it served: every URI in it.
     private static func relayed(_ playlist: String) -> [URL] {
         playlist.components(separatedBy: "\n").flatMap { line -> [String] in
