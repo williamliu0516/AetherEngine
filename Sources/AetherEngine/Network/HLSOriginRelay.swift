@@ -359,8 +359,10 @@ final class HLSOriginRelay: @unchecked Sendable {
                         contentType: fetched.contentType ?? "application/octet-stream",
                         contentRange: fetched.contentRange))
             }
+            // Against where it was served from: a playlist an origin redirected to an edge names its variants on the
+            // edge (Codex's review of relay-proxy-headers, 4). Credentials stay with the origin the host named.
             let rewritten = rewritePlaylist(
-                String(decoding: fetched.body, as: UTF8.self), relativeTo: origin,
+                String(decoding: fetched.body, as: UTF8.self), relativeTo: fetched.url,
                 authority: Self.rewriteAuthority(host: host), port: port, token: token)
             // A rewritten body has a different length than the range that produced it, so the
             // partial framing cannot survive. Playlists are small and nothing ranges them.
@@ -386,6 +388,8 @@ final class HLSOriginRelay: @unchecked Sendable {
         let body: Data
         let contentType: String?
         let contentRange: String?
+        /// Where the body came from, after the redirects the session followed: what its relative URIs resolve against.
+        let url: URL
     }
 
     private enum Upstream {
@@ -484,7 +488,7 @@ final class HLSOriginRelay: @unchecked Sendable {
                 if isSuccess { return .failed }
                 return .held(
                     Fetched(status: http.statusCode, body: Data(), contentType: contentType,
-                            contentRange: contentRange))
+                            contentRange: contentRange, url: http.url ?? origin))
             }
             if let error = pump.awaitFailure() {
                 // A playlist read halfway is not a playlist, and the framing of a held answer is its
@@ -494,7 +498,7 @@ final class HLSOriginRelay: @unchecked Sendable {
             }
             return .held(
                 Fetched(status: http.statusCode, body: body, contentType: contentType,
-                        contentRange: contentRange))
+                        contentRange: contentRange, url: http.url ?? origin))
         }
 
         guard sink.head(http.statusCode, contentType ?? "application/octet-stream", contentRange,
