@@ -45,4 +45,16 @@ extension AetherEngine {
     ) -> Bool {
         !consumerIsPaused || allowPausedConsumer
     }
+
+    /// Pure decision (KH6G, Zool, 2026-10-30): where a stage-2 reload of a VOD item is placed once it is ready, besides
+    /// its mount seek. On AirPlay the receiver fetches the fresh item's playlist itself and came up at segment 0,
+    /// ignoring the mount seek to the place it died at (15.93 s): the engine read that request as a scrub
+    /// ("declareTarget backward jump 5 -> 0", "seek#10 nativeScrub began target=0.08") and the film went back to its
+    /// start. So on an external screen the reload's position is also stashed for the #127 pre-ready replay, which seeks
+    /// there once the item is ready. A live reload has its own rejoin placement (#454), and a local VOD reload's mount
+    /// seek lands (AE#629): neither changes. Nil: no replay.
+    nonisolated static func reloadStartReplay(isLive: Bool, externalPlayback: Bool, position: Double) -> Double? {
+        guard !isLive, externalPlayback, position.isFinite, position > 0 else { return nil }
+        return position
+    }
 }

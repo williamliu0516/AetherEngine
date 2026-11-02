@@ -161,5 +161,19 @@ struct ItemDeathRecoveryTransportTests {
         #expect(body.contains("if host.transportIntentIsPlaying { host.play() }"))
         #expect(!body.contains("\n        host.play()\n"))
     }
-}
 
+    // MARK: - KH6G: the reload's start on an external screen
+
+    @Test("a VOD reload on AirPlay is placed at the position it died at once ready")
+    func airPlayVODReloadReplaysItsStart() {
+        #expect(AetherEngine.reloadStartReplay(isLive: false, externalPlayback: true, position: 15.93) == 15.93)
+    }
+
+    @Test("a local VOD reload, a live one, or one at the start keeps its mount seek alone")
+    func otherReloadsDoNotReplay() {
+        #expect(AetherEngine.reloadStartReplay(isLive: false, externalPlayback: false, position: 15.93) == nil)
+        #expect(AetherEngine.reloadStartReplay(isLive: true, externalPlayback: true, position: 15.93) == nil)
+        #expect(AetherEngine.reloadStartReplay(isLive: false, externalPlayback: true, position: 0) == nil)
+        #expect(AetherEngine.reloadStartReplay(isLive: false, externalPlayback: true, position: .nan) == nil)
+    }
+}
