@@ -3418,8 +3418,13 @@ public final class AetherEngine: ObservableObject {
         if host.transportIntentIsPlaying { host.play() }
         // KH6G: on AirPlay a VOD reload's mount seek is not enough; the receiver came up at segment 0. Replayed at
         // readiness (#127), latest-wins as any pre-ready seek is.
-        if let replay = Self.reloadStartReplay(isLive: isLive, externalPlayback: player.isExternalPlaybackActive,
-                                               position: anchor) {
+        // `isExternalPlaybackActive` is unavailable on visionOS (see `isExternalPlaybackActiveNow`): no receiver there.
+        #if os(visionOS)
+        let external = false
+        #else
+        let external = player.isExternalPlaybackActive
+        #endif
+        if let replay = Self.reloadStartReplay(isLive: isLive, externalPlayback: external, position: anchor) {
             EngineLog.emit("[AetherEngine] #65 reload on an external screen: the item is placed at "
                            + "\(String(format: "%.2f", replay))s again once it is ready (KH6G)", category: .engine)
             pendingPreReadySeek = PendingPreReadySeek(seconds: replay, origin: .host)
