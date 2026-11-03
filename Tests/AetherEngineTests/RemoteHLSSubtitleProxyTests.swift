@@ -195,7 +195,11 @@ struct RemoteHLSSubtitleProxyTests {
 
         provider.setText { text, language in "\(language ?? "-"):\(text.uppercased())" }
         #expect(provider.nativeSubtitleVTT(ordinal: 0, segmentIndex: 0)?.contains("en:ERSTE ZEILE") == true)
+        // AE#616's clock matches what AVPlayer presents, so it indexes the rewritten text, again on each change.
+        #expect(provider.allCueStarts().map(\.text) == ["en:ERSTE ZEILE"])
+        #expect(provider.textGeneration == 1)
         provider.setText(nil)
+        #expect(provider.textGeneration == 2)
         #expect(provider.nativeSubtitleVTT(ordinal: 0, segmentIndex: 0)?.contains("\nErste Zeile") == true)
     }
 

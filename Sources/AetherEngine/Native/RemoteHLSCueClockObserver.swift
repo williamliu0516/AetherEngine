@@ -14,6 +14,8 @@ final class RemoteHLSCueClockObserver: NSObject, AVPlayerItemLegibleOutputPushDe
     private weak var item: AVPlayerItem?
     private let provider: RemoteHLSSubtitleProvider
     private var clock = RemoteHLSCueClock()
+    /// The provider's `textGeneration` the clock's index was built at.
+    private var indexedText = 0
     private var jumpObserver: NSObjectProtocol?
     private let onOffset: @MainActor (Double) -> Void
     private let onTimeJump: @MainActor () -> Void
@@ -60,9 +62,14 @@ final class RemoteHLSCueClockObserver: NSObject, AVPlayerItemLegibleOutputPushDe
     }
 
     private func deliver(texts: [String], itemTime: Double) {
-        // The fill runs from mount; a line can be presented before it finished. Index once it has.
-        if !clock.hasCues, provider.isFillFinished {
+        // The fill runs from mount; a line can be presented before it finished. Index once it has, and again when
+        // the host's text rewrite changes what the renditions serve (`setNativeSubtitleText`): AVPlayer shows the new
+        // text from then on, and a line the replayed selection brings back part-way is a landing, not a start.
+        let text = provider.textGeneration
+        if provider.isFillFinished, !clock.hasCues || text != indexedText {
+            if clock.hasCues { clock.noteTimeJump() }
             clock.setCues(provider.allCueStarts())
+            indexedText = text
         }
         guard clock.hasCues else { return }
         let previous = clock.offset
