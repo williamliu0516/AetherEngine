@@ -35,6 +35,12 @@ the public-API contract.
 
 ### Fixed
 
+- **An audio switch's held picture is read off the main thread.** `AVPlayerItem.addOutput` is a synchronous call
+  onto the item's queue; for the held picture it ran on main (45 ms on an iPhone SE, with AVPlayer's own callbacks
+  then waiting on the same queue, about 90 ms of main blocked in all), so the switch dropped frames with nothing
+  running there. The output is attached, read and removed on a background task now: the SDK marks those calls
+  nonisolated.
+
 - **A closed session's segment folder is removed at background QoS, off the closing task.** An audio switch or a
   close unlinks every segment the session kept; done in place, that I/O held the file system for the host's own
   writes (an iPhone SE's audio switch: 48 segments unlinked while the main thread waited 1.74 s on a one-line

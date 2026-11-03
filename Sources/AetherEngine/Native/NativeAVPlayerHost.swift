@@ -1875,26 +1875,35 @@ final class NativeAVPlayerHost {
     /// swap opens: `replaceCurrentItem` blanks this layer until the next item's first frame, however
     /// long the old item was kept. An output belongs to one item and is only attached for the read.
     /// nil when no frame arrives inside `timeout`, which the caller treats as "nothing to hold".
+    ///
+    /// Zool's fork: the output is attached, read and removed off the main thread. `addOutput` is a synchronous call
+    /// onto the item's queue (45 ms on an iPhone SE's audio switch, with AVPlayer's own callbacks then waiting on the
+    /// same queue), and on main it held the frames the switch drew. The SDK marks `addOutput`, `removeOutput` and
+    /// `currentTime` nonisolated, and the output is Sendable. The item is not watched for a replacement meanwhile:
+    /// the caller checks its generation once the frame is back.
     func captureDisplayedFrame(timeout: Duration = .milliseconds(500)) async -> CVPixelBuffer? {
         guard let item = playerItem else { return nil }
-        let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
-            kCVPixelBufferIOSurfacePropertiesKey as String: [String: String]()
-        ])
-        item.add(output)
-        defer { item.remove(output) }
-        let clock = ContinuousClock()
-        let deadline = clock.now + timeout
-        repeat {
-            // A playing item vends at the host clock, a paused one only at the time it holds.
-            let itemTime = avPlayer.rate == 0 ? item.currentTime()
-                : output.itemTime(forHostTime: CACurrentMediaTime())
-            if itemTime.isNumeric,
-               let buffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: nil) {
-                return buffer
-            }
-            try? await Task.sleep(for: .milliseconds(8))
-        } while clock.now < deadline && playerItem === item
-        return nil
+        // A playing item vends at the host clock, a paused one only at the time it holds.
+        let paused = avPlayer.rate == 0
+        let read = Task.detached(priority: .userInitiated) { () async -> SendableBuffer? in
+            let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
+                kCVPixelBufferIOSurfacePropertiesKey as String: [String: String]()
+            ])
+            item.add(output)
+            defer { item.remove(output) }
+            let clock = ContinuousClock()
+            let deadline = clock.now + timeout
+            repeat {
+                let itemTime = paused ? item.currentTime() : output.itemTime(forHostTime: CACurrentMediaTime())
+                if itemTime.isNumeric,
+                   let buffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: nil) {
+                    return SendableBuffer(value: buffer)
+                }
+                try? await Task.sleep(for: .milliseconds(8))
+            } while clock.now < deadline
+            return nil
+        }
+        return await read.value?.value
     }
 
     /// Synthesize organic end-of-media when the engine determines a tail park is video-exhaustion
