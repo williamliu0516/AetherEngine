@@ -3643,6 +3643,14 @@ public final class AetherEngine: ObservableObject {
         // intent (#122), which the in-place swap keeps. Playing a paused title here woke the tvOS
         // screensaver its item had died behind.
         if host.transportIntentIsPlaying { host.play() }
+        // KH6G: on AirPlay a VOD reload's mount seek is not enough; the receiver came up at segment 0. Replayed at
+        // readiness (#127), latest-wins as any pre-ready seek is.
+        if let replay = Self.reloadStartReplay(isLive: isLive, externalPlayback: player.isExternalPlaybackActive,
+                                               position: anchor) {
+            EngineLog.emit("[AetherEngine] #65 reload on an external screen: the item is placed at "
+                           + "\(String(format: "%.2f", replay))s again once it is ready (KH6G)", category: .engine)
+            pendingPreReadySeek = PendingPreReadySeek(seconds: replay, origin: .host)
+        }
         if let rejoinPosition {
             // Stashed rather than seeked: the pre-readiness seek IS the wedge LiveReloadPolicy exists
             // to avoid, and a live seek does not defer itself (`shouldDeferHostSeek` excludes live), so
