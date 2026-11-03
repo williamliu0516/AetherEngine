@@ -73,6 +73,18 @@ final class AudioBridge: @unchecked Sendable {
     /// Pure and named rather than inline, because docs/formats.md quotes both numbers and
     /// `DocumentedConstantsTests` pins them: a cap that moves without the sentence moving with it
     /// is a doc that lies in a paragraph that still reads perfectly.
+    /// Zool's fork (89ee461e, carried onto 7.54.0): whether the PCM needs the shaping graph's limiter alone before the
+    /// encoder. E-AC-3 takes float, and libswresample does not normalize a float rematrix (`rematrix_maxval` reads as
+    /// unbounded for float output), so folding 7.1 into 5.1 adds each back channel to its side channel at full
+    /// weight. On 环太平洋's climax (TrueHD 7.1, 3 min) the side channels peaked at 1.43 with 1,941 samples over full
+    /// scale, and E-AC-3 carried them to the decoder (1.45 after a round trip), clipped where the device played them: a
+    /// crackle on a MacBook (Zool, Diagnostics 81, 2026-10-19). The integer formats are normalized by libswresample
+    /// itself, and an active shaping's graph ends in the limiter already.
+    static func foldNeedsLimiter(encoder: AVCodecID, sourceChannels: Int, encoderChannels: Int,
+                                 shaping: AudioShaping) -> Bool {
+        encoder == AV_CODEC_ID_EAC3 && !shaping.isActive && sourceChannels > encoderChannels
+    }
+
     static func maxEncodedChannels(for encoder: AVCodecID) -> Int32 {
         encoder == AV_CODEC_ID_EAC3 ? 6 : 8
     }
@@ -400,6 +412,8 @@ final class AudioBridge: @unchecked Sendable {
         // Cap to encoder max (EAC3 5.1, FLAC 7.1). Above-cap downmix happens automatically inside swr_convert
         // when source layout exceeds the encoder's; the resampler picks Apple-compatible ordering.
         let nChannels: Int32 = min(shapedChannels, Self.maxEncodedChannels(for: encoderCodecID))
+        let foldLimited = Self.foldNeedsLimiter(encoder: encoderCodecID, sourceChannels: Int(resolvedChannels),
+                                                encoderChannels: Int(nChannels), shaping: self.shaping)
         let encoderName = avcodec_get_name(encoderCodecID).map { String(cString: $0) } ?? "?"
         let logBitRate: String = encoderCodecID == AV_CODEC_ID_EAC3
             ? "\(Int64(nChannels) * 128) kbps"
@@ -413,7 +427,8 @@ final class AudioBridge: @unchecked Sendable {
             + "sourceChannels=\(resolvedChannels) "
             + "encoderChannels=\(nChannels) bitRate=\(logBitRate) "
             + "(source=\(resolvedSource), container=\(containerChannels), decoder=\(decoderChannels))"
-            + (self.shaping.isActive ? " AE#923 shaping \(self.shaping.summary)" : ""),
+            + (self.shaping.isActive ? " AE#923 shaping \(self.shaping.summary)" : "")
+            + (foldLimited ? " foldLimiter=on" : ""),
             category: .session
         )
 
@@ -472,7 +487,8 @@ final class AudioBridge: @unchecked Sendable {
         swrInRate = inRate
         av_channel_layout_copy(&swrInLayout, &inLayout)
 
-        if self.shaping.isActive {
+        // An inactive shaping's graph is its limiter alone: what a fold into E-AC-3 needs (`foldNeedsLimiter`).
+        if self.shaping.isActive || foldLimited {
             shapingGraph = AudioShapingGraph(shaping: self.shaping, sampleRate: sampleRate,
                                              layout: &enc.pointee.ch_layout,
                                              sourceHasCentre: AudioShapingMatrix.hasCentre(&inLayout),
