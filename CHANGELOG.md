@@ -35,6 +35,12 @@ the public-API contract.
 
 ### Fixed
 
+- **A closed session's segment folder is removed at background QoS, off the closing task.** An audio switch or a
+  close unlinks every segment the session kept; done in place, that I/O held the file system for the host's own
+  writes (an iPhone SE's audio switch: 48 segments unlinked while the main thread waited 1.74 s on a one-line
+  diagnostics write, frames dropped). It runs on `SegmentCache.discardQueue` now, throttled behind everyone else's
+  I/O; a folder a killed process leaves is still the launch sweep's.
+
 - **A playlist the origin relay fetched through a redirect resolves its relative URIs against where it was served from.** They
   resolved against the URL the relay asked, so a master an origin redirected to an edge (`/master.m3u8` to
   `edge/vod/master.m3u8`) sent its `v/index.m3u8` back to the origin, and the stream did not play. The credentials

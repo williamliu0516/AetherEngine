@@ -426,6 +426,14 @@ final class SegmentCache: @unchecked Sendable {
         if residentSetChanged { onResidentSetChanged?() }
     }
 
+    /// Zool's fork: where a closed session's folder is removed. An audio switch or a close unlinks every segment the
+    /// session kept, and done in place, at the closing task's priority, that I/O held the file system for the host's
+    /// own writes: on an iPhone SE an audio switch unlinked 48 segments (2.1 s of unlink under System Trace) while the
+    /// main thread waited 1.74 s on a one-line diagnostics write. At background QoS the system throttles this I/O
+    /// behind everyone else's. The live marker is released before, so a folder a killed process leaves is the launch
+    /// sweep's.
+    static let discardQueue = DispatchQueue(label: "com.aetherengine.segmentcache.discard", qos: .background)
+
     func close() {
         condition.lock()
         closed = true
@@ -450,7 +458,7 @@ final class SegmentCache: @unchecked Sendable {
 
         expiryTimer?.cancel()
         releaseLiveMarker()
-        try? FileManager.default.removeItem(at: dir)
+        Self.discardQueue.async { try? FileManager.default.removeItem(at: dir) }
         // A closed cache holds nothing, and that is a resident-set change like any other. The engine
         // clears its published band on teardown anyway; this keeps the cache honest on its own.
         if hadEntries { onResidentSetChanged?() }
