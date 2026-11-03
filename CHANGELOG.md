@@ -35,6 +35,17 @@ the public-API contract.
 
 ### Fixed
 
+- **A stop no longer waits on the audio queue.** `AudioOutput.stop()` flushed the renderer in place, under its lock,
+  then rested the clock; the flush resets the audio queue with a synchronous call on the queue's server, and the
+  rate change waits on the queue's lock. With the output on a device that never starts (the iOS simulator on the
+  host's virtual device), that server sat in the start for good, so a recovery's reload stopped on the main thread
+  and never came back, the feed thread waiting on the lock behind it: the whole app froze. Both run on
+  `AudioOutput.stopQueue` now, outside the lock; the output is discarded after its stop, and the retired epoch
+  already refuses every later buffer. On a Mac whose default output is such a device, a started output's stop had
+  not returned after 45 s before and returns at once now, and the reload after it (detach, a new output, its attach,
+  volume and stop) took 2 ms. Not handled: a seek's flush and the AE#549 flush still wait on the queue under the
+  lock, and an enqueue the device holds (the first one waited 90 s there) holds the lock as long.
+
 - **An audio switch's held picture is read off the main thread.** `AVPlayerItem.addOutput` is a synchronous call
   onto the item's queue; for the held picture it ran on main (45 ms on an iPhone SE, with AVPlayer's own callbacks
   then waiting on the same queue, about 90 ms of main blocked in all), so the switch dropped frames with nothing

@@ -30,9 +30,19 @@ final class AudioOutput: @unchecked Sendable {
     /// dropped (`withClock`), as is a preroll it would set up (`anchorClock`).
     private var stopGeneration = 0
 
+    /// Where `stop()` flushes the renderer and rests the clock. A flush resets the audio queue with a synchronous
+    /// call on its server's queue, and a rate change waits on the queue's lock, so both wait for whatever the server
+    /// is doing: with the output on a device that never starts (the iOS simulator on the host's virtual device,
+    /// 2026-11-03), a start that never returned. The recovery's stop on the main thread waited there for good,
+    /// holding `lock`, with the feed thread behind it. A stopped output is discarded, so nothing waits for either;
+    /// one queue for every output, so a server that never answers holds one thread.
+    static let stopQueue = DispatchQueue(label: "engine.audio.stop")
+
     #if DEBUG
     /// Test-only: runs as a clock write starts, holding `clockLock` and not `lock`.
     var whileSettingClockForTesting: (@Sendable () -> Void)?
+    /// Test-only: runs on `stopQueue` just before a stop's flush and rest.
+    var whileStoppingForTesting: (@Sendable () -> Void)?
     #endif
 
     /// AE#464: the host's audio presentation offset, applied to every buffer on its way into the
@@ -399,11 +409,18 @@ final class AudioOutput: @unchecked Sendable {
         prerollRate = nil
         restOwed = true
         stopGeneration &+= 1
-        renderer.flush()
         lock.unlock()
-        // The clock's rest outside `lock`, now if no clock write is under way, else by that write as it
-        // lets go (`withClock`): one waiting in the synchronizer could hold it as long as a prime takes.
-        payRest()
+        // The renderer's flush and the clock's rest on `stopQueue`, outside `lock`: a buffer past `enqueue`'s epoch
+        // check is in the renderer already, and the retired epoch refuses every later one.
+        Self.stopQueue.async { [self] in
+            #if DEBUG
+            whileStoppingForTesting?()
+            #endif
+            renderer.flush()
+            // The rest now if no clock write is under way, else by that write as it lets go (`withClock`): one
+            // waiting in the synchronizer could hold it as long as a prime takes.
+            payRest()
+        }
     }
 
     /// Runs a clock write under `clockLock` and outside `lock`, with the stops so far when it was asked
