@@ -110,4 +110,35 @@ struct DeferredNativeSubtitleWorkTests {
         #expect(engine.nativeSubtitleTimingScale == 1)
         #expect(engine.nativeSubtitleTimingOffset == 1.5)
     }
+
+    // MARK: - The host's text
+
+    @Test("a store serves its cues through the host's text rewrite, with its own track's language")
+    func storeText() {
+        let stores = [NativeSubtitleCueStore(), NativeSubtitleCueStore()]
+        stores[0].replaceCues([text(1, 1, 2, "后来发生了什么")])
+        stores[1].replaceCues([text(2, 1, 2, "後來發生了什麼")])
+        NativeSubtitleCueStore.setText({ text, language in
+            language == "zh-Hans" ? text.applyingTransform(StringTransform("Hans-Hant"), reverse: false) ?? text
+                                  : "\(language ?? "-"):\(text)"
+        }, on: stores, languages: ["zh-Hans"])
+        #expect(stores[0].allCues()[0].text == "後來發生了什麼")
+        #expect(stores[0].cuesInWindow(start: 0, end: 5)[0].text == "後來發生了什麼")
+        #expect(stores[1].allCues()[0].text == "-:後來發生了什麼", "a store past the languages gets nil")
+        #expect(stores[0].snapshotCues()[0].text == "后来发生了什么", "the overlay's own cues keep the decoded text")
+        #expect(WebVTTBuilder.body(cues: stores[0].allCues()).contains("後來發生了什麼"))
+        NativeSubtitleCueStore.setText(nil, on: stores, languages: ["zh-Hans"])
+        #expect(stores[0].allCues()[0].text == "后来发生了什么")
+    }
+
+    @MainActor
+    @Test("the engine keeps the host's text rewrite until the host clears it")
+    func engineText() throws {
+        let engine = try AetherEngine()
+        #expect(engine.nativeSubtitleTextTransform == nil)
+        engine.setNativeSubtitleText { text, language in "\(language ?? "-"):\(text)" }
+        #expect(engine.nativeSubtitleTextTransform?("a", "zh") == "zh:a")
+        engine.setNativeSubtitleText(nil)
+        #expect(engine.nativeSubtitleTextTransform == nil)
+    }
 }

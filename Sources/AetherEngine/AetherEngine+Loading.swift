@@ -733,6 +733,7 @@ extension AetherEngine {
             return nil
         }
         remoteHLSSubtitleProxy = prepared
+        prepared.provider?.setText(nativeSubtitleTextTransform)
         // Audit NAT-2: the NAMEs the served master carries, which the selection and the legible-list
         // filter match against, not the names the tracks asked for (the rewriter disambiguates and
         // escapes them).
@@ -1384,6 +1385,7 @@ extension AetherEngine {
                 let shift = session.playlistShiftSeconds
                 stores.forEach { $0.setShiftSeconds(shift) }
                 applyNativeSubtitleTiming()
+                applyNativeSubtitleText()
                 nativeSubtitleReaderParams = (url: url, stores: stores)
                 // #88: load-declared external tracks fill their stores with one whole-file decode
                 // each (no side demuxer); embedded tracks keep the pump-tap / reader paths below.
