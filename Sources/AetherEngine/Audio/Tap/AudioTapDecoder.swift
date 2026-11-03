@@ -268,6 +268,10 @@ final class AudioTapDecoder: @unchecked Sendable {
 /// A fresh demux + codec context per segment keeps it robust across producer restarts and
 /// track switches; the cost is negligible against 4-6 s of audio per segment.
 final class AudioTapSegmentDecoder: @unchecked Sendable {
+    /// The playback profile under the tap's own name: its opens logged as the pump's read like the session's own
+    /// demuxer reopening several times a second while a seek was pending (Zool, Diagnostics 73).
+    static let openProfile = DemuxerOpenProfile.playback.withReaderLabel("tap")
+
     private let channels: AudioTapChannels
 
     init(channels: AudioTapChannels = .downmix) {
@@ -288,7 +292,7 @@ final class AudioTapSegmentDecoder: @unchecked Sendable {
     private func decode(reader: DataIOReader) -> [AudioTapChunk] {
         let demuxer = Demuxer()
         do {
-            try demuxer.open(reader: reader)
+            try demuxer.open(reader: reader, profile: Self.openProfile)
         } catch {
             return []
         }
