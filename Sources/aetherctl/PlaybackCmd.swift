@@ -642,6 +642,12 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
     )
     // `defernative`: a `.sup` sidecar's OCR fill waits for `nativerender`; `nativeback@N` ends the rendering.
     options.deferNativeSubtitleWork = hostCalls.contains("defernative")
+    // `lookahead@S`: the host's subtitle lookahead (`setSubtitleLookahead`), 0 for a host that shows each cue
+    // at its own time; netbench reads what the forward prefetcher's second read costs with and without it.
+    if let call = hostCalls.first(where: { $0.hasPrefix("lookahead@") }),
+       let seconds = Double(call.dropFirst("lookahead@".count)) {
+        engine.setSubtitleLookahead(seconds)
+    }
     // AE#629: the rescue a host used to see only as a route change.
     let escalationSub = engine.softwarePathEscalations.sink { event in
         let failure = event.absorbedFailure
@@ -809,10 +815,11 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         case "nativesubs", "defernative":
             break  // Sodalite#156, read at load time into LoadOptions.prepareNativeSubtitles / deferNativeSubtitleWork
         case let call where call.hasPrefix("seekfar") || call.hasPrefix("subsoff")
-            || call.hasPrefix("subson") || call.hasPrefix("nativerender") || call.hasPrefix("nativeback"):
+            || call.hasPrefix("subson") || call.hasPrefix("nativerender") || call.hasPrefix("nativeback")
+            || call.hasPrefix("lookahead@"):
             break  // #433 / Sodalite#156, all in the telemetry loop; `@N` picks the tick
         default:
-            print("  HOSTCALL unknown '\(call)' (use play,extractor,setrate,ratehold,pausestart,reloadlive,reloadnext,seekback,seekfar,overlapseek,pauseseek,pausehold,still,stallclock,pausereload,playreload,extplayreload,nativesubs,defernative,nativerender,nativeback,subsoff,subson)")
+            print("  HOSTCALL unknown '\(call)' (use play,extractor,setrate,ratehold,pausestart,reloadlive,reloadnext,seekback,seekfar,overlapseek,pauseseek,pausehold,still,stallclock,pausereload,playreload,extplayreload,nativesubs,defernative,nativerender,nativeback,lookahead@S,subsoff,subson)")
         }
     }
     defer { if let frameExtractor { Task { await frameExtractor.shutdown() } } }
