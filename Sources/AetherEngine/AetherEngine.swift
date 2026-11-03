@@ -2911,6 +2911,8 @@ public final class AetherEngine: ObservableObject {
     /// session so a media reload that also fails cannot loop. Reset in loadSession and in
     /// stopInternal, so a session-preserving rebuild gets its own (#849).
     var masterFallbackUsed = false
+    /// The recovery master (renditions kept) was loaded after a refusal; its own refusal goes to the media playlist.
+    var recoveryMasterUsed = false
 
     /// AE#849: this session's fallback answered a display refusal of an HDR master, which an audio
     /// switch does not change. Per session like `masterFallbackUsed`, and reset with it.
@@ -3063,6 +3065,17 @@ public final class AetherEngine: ObservableObject {
     /// onto the fresh item below (an active PiP rendition otherwise silently disappeared).
     /// React to AVPlayer rejecting the served master (#98, #130): if eligible, reload the media
     /// playlist in place (single-variant); otherwise surface the failure normally.
+    /// What this session's refused master leads to: the recovery master once where it keeps renditions the media
+    /// playlist would drop, else the media playlist, else nothing (`MasterFallbackDecision.nextStep`).
+    @MainActor
+    func masterFallbackStep(_ code: Int, _ session: HLSVideoEngine) -> MasterFallbackDecision.Step {
+        MasterFallbackDecision.nextStep(
+            errorCode: code, servingMasterPlaylist: session.servingMasterPlaylist,
+            alreadyFellBack: masterFallbackUsed, renditionsServed: nativeSubtitleRenditionsServed,
+            recoveryMasterDiffers: session.recoveryMasterPlaylistURL != nil && session.recoveryMasterDiffersFromPrimary,
+            recoveryMasterTried: recoveryMasterUsed)
+    }
+
     @MainActor
     func fallBackToMediaPlaylist(_ rejection: DisplayRejection, expectedGeneration: UInt64) {
         // Audit LIF-103: a rejection of an ended session's item is not the running session's to act on.
@@ -3071,16 +3084,14 @@ public final class AetherEngine: ObservableObject {
             publishError(PlaybackErrorInfo(kind: .masterPlaylistRejected, message: rejection.message, underlyingDomain: rejection.domain, underlyingCode: rejection.code))
             return
         }
-        guard MasterFallbackDecision.shouldFallBackToMediaPlaylist(
-            errorCode: rejection.code,
-            servingMasterPlaylist: session.servingMasterPlaylist,
-            alreadyFellBack: masterFallbackUsed),
-              let mediaURL = session.mediaPlaylistURL else {
+        let recoveryURL = session.recoveryMasterPlaylistURL
+        let step = masterFallbackStep(rejection.code, session)
+        guard step != .surface, let mediaURL = session.mediaPlaylistURL else {
             publishError(PlaybackErrorInfo(kind: .masterPlaylistRejected, message: rejection.message, underlyingDomain: rejection.domain, underlyingCode: rejection.code))
             return
         }
-        masterFallbackUsed = true
-        masterRefusedByDisplay = MasterFallbackDecision.isDisplayRejectionCode(rejection.code)
+        if step == .mediaPlaylist { masterFallbackUsed = true }
+        masterRefusedByDisplay = masterFallbackUsed && MasterFallbackDecision.isDisplayRejectionCode(rejection.code)
             && session.servedSourceIsHDR
         // AE#459: the display answered. Display-rejection codes only, never the -1002 parse failure.
         // AE#535: and only for an HDR master on an HDR-eligible display, or the answer is about the window.
@@ -3123,6 +3134,25 @@ public final class AetherEngine: ObservableObject {
                     category: .engine)
             }
         }
+        let position = host.mountedStartPosition ?? 0
+        if step == .recoveryMaster, let recoveryURL {
+            recoveryMasterUsed = true
+            EngineLog.emit(
+                "[AetherEngine] AVPlayer rejected the master (code=\(rejection.code)); reloading the recovery "
+                + "master (subtitle renditions kept, object-audio CHANNELS and DV signaling dropped) at "
+                + (isLive ? "the live edge" : "\(String(format: "%.2f", position))s"),
+                category: .session)
+            host.swapItem(url: airPlayHostSwapped(recoveryURL),
+                          startPosition: isLive ? nil : position,
+                          skipInitialSeek: LiveReloadPolicy.skipInitialSeek(isLive: isLive, isRejoin: true))
+            if host.transportIntentIsPlaying { host.play() }
+            if let ordinal = nativeSubtitleReapplyOrdinal {
+                EngineLog.emit("[AetherEngine] re-applying native subtitle ordinal=\(ordinal) on the recovery master",
+                               category: .engine)
+                setNativeSubtitleSelected(track: ordinal)
+            }
+            return
+        }
         session.markServingMediaAfterFallback()
         nativeSubtitleRenditionsServed = false
         // #227: while AirPlaying, the item under the rejection is the LAN-IP URL; `mediaPlaylistURL` is the
@@ -3135,7 +3165,6 @@ public final class AetherEngine: ObservableObject {
         // VOD reloads where the rejected item was placed. That is not always where the session
         // started: the #93/#65 stage-2 recovery swaps a fresh item in at the position it held, and a
         // rejection of THAT item has to come back there, not rewind to the first mount.
-        let position = host.mountedStartPosition ?? 0
         EngineLog.emit(
             "[AetherEngine] AVPlayer rejected the master (code=\(rejection.code)); falling back to "
             + "media playlist (no CC/subtitle renditions) at "
@@ -4621,6 +4650,7 @@ public final class AetherEngine: ObservableObject {
         undecodableLiveAudioStreamIndices = Self.undecodableAudioStreamIndicesAcrossLoad(
             undecodableLiveAudioStreamIndices, sessionPreservingReload: sessionPreservingReloadInFlight)
         masterFallbackUsed = false
+        recoveryMasterUsed = false
         nativeSubtitleReanchorTask?.cancel()
         nativeSubtitleReanchorTask = nil
         setPendingRecoverySeekTarget(nil)
@@ -8242,6 +8272,7 @@ public final class AetherEngine: ObservableObject {
         // leak into the reload's, which then could not recover from its own master rejection and
         // surfaced `.masterPlaylistRejected` instead of falling back (#849).
         masterFallbackUsed = false
+        recoveryMasterUsed = false
         masterRefusedByDisplay = false
         // #95: stop the tap reader before the session (and its SegmentCache) goes away.
         // #356: counterpart to the install line, because a session-preserving reload lands here

@@ -89,3 +89,22 @@ comment, URI) so an open failure names itself.
   media-timeline times + `X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000`. If PiP subtitles appear
   shifted by the segment start, flip `relativeToStart: true` at the single provider call site
   (`VideoSegmentProvider.nativeSubtitleVTT(ordinal:segmentIndex:)`); see `WebVTTBuilder.segment`.
+
+## `master-variants-check.sh` (AVFoundation over every served master)
+
+Serves each `.mkv` in a folder with `aetherctl serve --native-subs 0` (`--force-dv` for a file named
+`*DoVi*`) and opens `master.m3u8`, `master_safe.m3u8` and `master_hdr.m3u8` with `AVURLAsset` +
+`AVPlayerItem`: each must reach `.readyToPlay` without a refusal, and a file named `*-subs.mkv` must expose a
+legible option. One line per master gives the result, the audio `CHANNELS` and whether
+`SUPPLEMENTAL-CODECS` was declared.
+
+The matrix used for the PiP subtitle fix (2026-10-18, macOS 27, all 36 opened): SDR, HDR10, DV P8.1 and DV
+P5 clips of 16 s, each muxed with E-AC-3 JOC (`16/JOC`) and a text track, JOC without a text track, and a
+5.1 bed with a text track. The DV and HDR10 clips are cut from the lab's `Lab.*.2160p.HEVC.mkv` files
+(`mkvmerge --split parts:00:00:00-00:00:16 -A -S`); the JOC audio is 16 s copied from any Atmos E-AC-3
+source (`ffmpeg -t 16 -map 0:<atmos track> -c copy joc.eac3`; ffmpeg cannot encode JOC).
+
+```bash
+swift build
+Tests/Integration/master-variants-check.sh <fixture dir>
+```
