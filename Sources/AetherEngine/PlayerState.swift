@@ -1009,6 +1009,20 @@ public struct LoadOptions: Sendable, Equatable {
     /// it is carried. Change it mid-session with `AetherEngine.setAudioShaping(_:)`.
     public var audioShaping: AudioShaping = AudioShaping()
 
+    /// Zool's fork: dialogue boost (speech forward for speakers and headphones at low volume), written into
+    /// `audioShaping` with `volumeBoost` (`AudioBoost.shaping(dialogue:volume:)`): two channels, the dialogue lifted,
+    /// -36 dBFS 3:1 with 14 dB of makeup, then the shaping's limiter. A change takes
+    /// `reloadAtCurrentPosition(applying:)` or `AetherEngine.setAudioShaping(_:)`.
+    public var dialogueBoost: Bool = false {
+        didSet { audioShaping = AudioBoost.shaping(dialogue: dialogueBoost, volume: volumeBoost) }
+    }
+
+    /// Zool's fork: a gain over the system's maximum, 1 (off) to 3 (300 %, +9.5 dB), written into `audioShaping` with
+    /// `dialogueBoost`: a 1:1 compressor whose makeup is the gain, held under full scale by the shaping's limiter.
+    public var volumeBoost: Double = 1 {
+        didSet { audioShaping = AudioBoost.shaping(dialogue: dialogueBoost, volume: volumeBoost) }
+    }
+
     /// Teletext caption page for `dvb_teletext` subtitle decode. nil (default) = libzvbi auto-detect
     /// (`txt_page=subtitle`); an explicit page (e.g. 801 for AU) targets channels whose caption page
     /// libzvbi does not flag as a subtitle page. Only affects teletext streams (#107).
