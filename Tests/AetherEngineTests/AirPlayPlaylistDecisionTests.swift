@@ -25,6 +25,14 @@ struct AirPlayPlaylistDecisionTests {
             servingMasterPlaylist: true, sourceIsHDR: false, receiverRefusedHDRMaster: true) == .master)
     }
 
+    @Test("A receiver that refused an SDR master gets the media playlist for every source")
+    func everyMasterRefusingReceiverGetsMedia() {
+        #expect(AirPlayPlaylistDecision.playlistForReceiver(
+            servingMasterPlaylist: true, sourceIsHDR: false, receiverRefusesEveryMaster: true) == .media)
+        #expect(AirPlayPlaylistDecision.playlistForReceiver(
+            servingMasterPlaylist: true, sourceIsHDR: true, receiverRefusesEveryMaster: true) == .media)
+    }
+
     @Test("A session already on the media playlist has no master to hand over")
     func mediaSessionStaysMedia() {
         #expect(AirPlayPlaylistDecision.playlistForReceiver(

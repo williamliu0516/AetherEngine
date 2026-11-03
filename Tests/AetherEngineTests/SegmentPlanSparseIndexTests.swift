@@ -269,3 +269,19 @@ struct SegmentPlanSparseIndexTests {
         #expect(unanchored.first?.startPts == 0)
     }
 }
+
+struct SegmentPlanTargetTests {
+    @Test("A 2 s target cuts a 1 s GOP source into 2 s segments, the default into 4 s")
+    func shorterTargetForThirdPartyReceivers() {
+        let ms = AVRational(num: 1, den: 1000)
+        let keyframes = (0..<60).map { Int64($0 * 1000) }
+        let standard = HLSVideoEngine.buildKeyframeSegmentPlan(
+            keyframes: keyframes, videoTimeBase: ms, sourceDurationSeconds: 60)
+        let short = HLSVideoEngine.buildKeyframeSegmentPlan(
+            keyframes: keyframes, videoTimeBase: ms, sourceDurationSeconds: 60,
+            targetSeconds: AetherEngine.thirdPartyReceiverSegmentSeconds)
+        #expect(standard.count == 15)
+        #expect(short.count == 30)
+        #expect(short.allSatisfy { abs($0.durationSeconds - 2) < 0.01 })
+    }
+}

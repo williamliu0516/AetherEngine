@@ -67,7 +67,7 @@ func printUsage() {
 
     Usage:
       aetherctl probe [--detect-hdr10plus] [--detect-hdr-vivid] [--detect-atmos] <url>
-      aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] [--iframes] [--atmos-bed 7.1.4 [--bed-format apac|lpcm]] [--audio-index N] [--stereo auto|mono|sbs|ou] <url>
+      aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] [--iframes] [--atmos-bed 7.1.4 [--bed-format apac|lpcm]] [--audio-index N] [--stereo auto|mono|sbs|ou] [--audio-bridge surroundCompat|lossless|receiverCompat] <url>
       aetherctl validate [--no-dv] [--force-dv] [--dv-base-layer] <url>
       aetherctl swdecode [--frames N] <url>
       aetherctl play [--fel] [--upscale] [--surface | --window] [--cycle-el SECONDS] [--dv-pin SPEC] [--seconds N] [--live] [--no-sw-escalation] [--fast-zap] [--live-start-immediately] [--live-cushion SECONDS] [--dvr-window N] [--subs <codec-or-lang>]
@@ -1200,6 +1200,13 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     let audioSeconds = secondsFlag ?? 10
     // --native-subs: diagnostics affordance for mov_text subtitle track (#55); serve only.
     let nativeSubsIndex = takeIntFlag("--native-subs", from: &rest)
+    // --audio-bridge: the bridge mode a session is built with (receiverCompat = AAC stereo); serve only.
+    let serveAudioBridgeArg = takeStringFlag("--audio-bridge", from: &rest)
+    let serveAudioBridge = serveAudioBridgeArg.flatMap(AudioBridgeMode.init(rawValue:)) ?? .surroundCompat
+    if let serveAudioBridgeArg, AudioBridgeMode(rawValue: serveAudioBridgeArg) == nil {
+        print("ERROR: --audio-bridge takes \(AudioBridgeMode.allCases.map(\.rawValue).joined(separator: "|"))")
+        exit(64)
+    }
     // AE#682: list an I-frame rendition in the master; serve only.
     let serveIFrames = takeFlag("--iframes", from: &rest)
     // --throttle-kbps: slow-CDN simulation; starves the producer below real-time to provoke rebuffers.
@@ -1236,7 +1243,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
                  audioDelayMs: serveAudioDelayMs, iFrames: serveIFrames,
                  objectAudioRendering: serveObjectAudioRendering,
                  // `--audio-index` (parsed once above, shared with customio): serve that source stream.
-                 audioStreamIndex: customAudioIndex, stereo: serveStereo)
+                 audioStreamIndex: customAudioIndex, stereo: serveStereo, audioBridgeMode: serveAudioBridge)
     case "validate":
         exit(runValidate(url: url, dvModeAvailable: dvModeAvailable, forceDVWithoutDisplay: forceDV,
                          dolbyVisionHandling: dvHandling))
