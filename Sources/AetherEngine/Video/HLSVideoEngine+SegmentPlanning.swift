@@ -97,8 +97,10 @@ extension HLSVideoEngine {
     /// can let the earlier keyframe of the pair open it, and hands its own to the next boundary,
     /// whose keyframe can then miss it.
     static func finalizedPlan(_ plan: [Segment], minDurationSeconds: Double, keyframeAdvance: Int64,
-                              keyframes: [Int64]) -> (plan: [Segment], reach: [Int64]) {
-        let collapsed = collapseShortSegments(plan, minDurationSeconds: minDurationSeconds)
+                              keyframes: [Int64], targetSeconds: Double = HLSVideoEngine.targetSegmentDuration)
+        -> (plan: [Segment], reach: [Int64]) {
+        let collapsed = collapseShortSegments(plan, minDurationSeconds: minDurationSeconds,
+                                              targetSeconds: targetSeconds)
         return (collapsed, keyframeReachTicks(advance: keyframeAdvance, keyframes: keyframes,
                                               boundaries: collapsed.map(\.startPts)))
     }
@@ -465,7 +467,8 @@ extension HLSVideoEngine {
     /// final segment while removing the unrecoverable boundary.
     ///
     /// Pure for offline testing.
-    static func collapseShortSegments(_ plan: [Segment], minDurationSeconds: Double) -> [Segment] {
+    static func collapseShortSegments(_ plan: [Segment], minDurationSeconds: Double,
+                                      targetSeconds: Double = HLSVideoEngine.targetSegmentDuration) -> [Segment] {
         guard plan.count > 1, minDurationSeconds > 0 else { return plan }
         var out: [Segment] = []
         out.reserveCapacity(plan.count)
@@ -493,7 +496,7 @@ extension HLSVideoEngine {
             out.removeFirst()
         }
         if out.count > 1, let tail = out.last,
-           tail.durationSeconds < Self.targetSegmentDuration {
+           tail.durationSeconds < targetSeconds {
             let previous = out[out.count - 2]
             out[out.count - 2] = Segment(
                 startPts: previous.startPts,

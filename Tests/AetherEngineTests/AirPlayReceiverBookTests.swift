@@ -25,7 +25,6 @@ struct AirPlayReceiverBookTests {
         let reopened = AirPlayReceiverBook(defaults: defaults)
         #expect(reopened.entry(for: "tv").needsCompatAudio)
         #expect(reopened.entry(for: "tv").refusesEveryMaster)
-        #expect(!reopened.entry(for: "tv").refusesHDRMaster)
         #expect(reopened.entry(for: "appletv") == AirPlayReceiverBook.Entry())
     }
 
@@ -33,9 +32,22 @@ struct AirPlayReceiverBookTests {
     func capacity() {
         let book = AirPlayReceiverBook(defaults: freshDefaults())
         for i in 0..<(AirPlayReceiverBook.capacity + 3) {
-            book.update("r\(i)") { $0.refusesHDRMaster = true }
+            book.update("r\(i)") { $0.needsCompatAudio = true }
         }
-        #expect(!book.entry(for: "r0").refusesHDRMaster)
-        #expect(book.entry(for: "r\(AirPlayReceiverBook.capacity + 2)").refusesHDRMaster)
+        #expect(!book.entry(for: "r0").needsCompatAudio)
+        #expect(book.entry(for: "r\(AirPlayReceiverBook.capacity + 2)").needsCompatAudio)
+    }
+
+    @Test("A refused master: HDR stays per process, non-AAC SDR asks for AAC once, then every master")
+    func refusalVerdicts() {
+        #expect(AirPlayReceiverBook.refusal(sourceIsHDR: true, servesCompatibleAudio: false,
+                                            builtForReceiver: false) == .hdrMaster)
+        #expect(AirPlayReceiverBook.refusal(sourceIsHDR: false, servesCompatibleAudio: false,
+                                            builtForReceiver: false) == .needsCompatAudio)
+        #expect(AirPlayReceiverBook.refusal(sourceIsHDR: false, servesCompatibleAudio: true,
+                                            builtForReceiver: false) == .everyMaster)
+        // Built for the receiver and still not AAC (the encoder cascaded to E-AC-3): no second rebuild.
+        #expect(AirPlayReceiverBook.refusal(sourceIsHDR: false, servesCompatibleAudio: false,
+                                            builtForReceiver: true) == .everyMaster)
     }
 }
