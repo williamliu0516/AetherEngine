@@ -8,6 +8,57 @@ Versioning follows [Semantic Versioning](https://semver.org). See
 [README › Stability and versioning](README.md#stability-and-versioning) for
 the public-API contract.
 
+## Zool's fork: 7.54.0-zool.1
+
+This tag is upstream [7.54.0] with the changes below, made for Zool (github.com/williamliu0516). They are listed here as
+the notice of changes the LGPL asks of a modified copy; each is a commit of its own in this tag's history (`git log
+7.54.0..7.54.0-zool.1`), with the fork commit on 7.37.0 it came from. Package.swift, Package.resolved and LICENSE are
+upstream's: every package trait is off by default and FFmpegBuild is upstream's.
+
+### Added
+
+- **`ProbeDetail.keyframeIndex`.** A probe can load the container's seek index the way a session's start does, so a
+  host warms it before the play.
+- **`AetherEngine.sweepStaleSessionDirectories()`.** Removes, at a host's launch, the segment folders a killed or
+  crashed process left; the sweep keeps a folder whose liveness marker is held at any age, removes one whose marker is
+  free at any age, and an unmarked one after an hour (upstream's bounded walk kept).
+- **`LoadOptions.relaysRemoteHLS`.** A host whose headers carry a secret puts the origin relay in front of a remote HLS
+  master, and AVPlayer is handed none of the headers.
+- **`LoadOptions.dialogueBoost` and `LoadOptions.volumeBoost`** (`AudioBoost`), written into `audioShaping`: dialogue
+  boost is two channels, the dialogue lifted 6 dB, -36 dBFS 3:1 with 14 dB of makeup; volume boost (1 to 3) a 1:1
+  compressor whose makeup is the gain; the shaping's limiter after either.
+- **Native subtitle renditions for picture in picture and AirPlay:** `LoadOptions.deferNativeSubtitleWork` (a `.sup`
+  sidecar's OCR fill waits for a shown rendition), `setNativeSubtitleTiming(scale:offset:)` (the host's subtitle
+  offset and rate in the renditions), `setNativeSubtitleText(_:)` (the host's text rewrite, such as a script
+  conversion, in the renditions) and `setSubtitleLookahead(_:)` (one read of the source; the forward prefetcher only
+  for a declared lookahead).
+- **AirPlay receivers:** what a receiver refuses is remembered for it (`AirPlayReceiverBook`), a receiver gets the
+  master once, a refused SDR master means every master, and a TV that plays AAC only gets AAC-LC stereo
+  (`AudioBridgeMode.receiverCompat`, rebuilt in place once per load).
+
+### Fixed
+
+- **A seek whose target a producer restart served is re-sought at once when AVPlayer never received it**, and its
+  deadline ends only when AVPlayer is still waiting a second later. Seeking back from near the end over a link close to
+  the media's bitrate took 16 to 17 s on 7.54.0 (the deadline waited out), 8 to 9 s with these (upstream's march-rate
+  restarts reach the same hook).
+- **A stop never waits behind a clock write held in the synchronizer.** Every clock write held `AudioOutput`'s lock
+  across `setRate`, which can sit in the audio queue's prime (for good on the iOS 27 simulator), and a stop on the
+  main thread waited behind it: the player froze. The writes decide under the lock and call the synchronizer under a
+  lock of their own; a stop owes the rest, which the write under way pays.
+- **A 7.1 source folded into the E-AC-3 bridge (or the AAC receiver bridge) no longer clips.** libswresample does not
+  normalize a float rematrix; the shaping graph's limiter runs alone on such a fold.
+- **A redirect to another origin carries only the caller's headers that describe the request**, and a session's own
+  redirects scrub the original request's headers as the caller's.
+- **A playlist the origin relay fetched through a redirect resolves its relative URIs against where it was served
+  from.**
+- **The software host's tap sinks are read and written under one lock** (a ThreadSanitizer race).
+- **A PGS set is never closed by its own packet.**
+- **A refused master on picture in picture reloads one that keeps the subtitle renditions first.**
+- **A VOD stage-2 reload on an external screen is placed at the position it died at, once ready.**
+- **The AE#616 clock indexes the text a remote HLS rendition serves after the host rewrites it.**
+- The audio tap's per-segment demuxer opens are labelled "tap", not "pump", in the log.
+
 ## [Unreleased]
 
 _Nothing yet._
