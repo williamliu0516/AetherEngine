@@ -16,6 +16,23 @@ final class AudioOutput: @unchecked Sendable {
     let timeline = RendererTimeline()
 
     private let lock = NSLock()
+
+    /// The clock's writes (`synchronizer.setRate`), one at a time in the order they were decided, and never
+    /// under `lock` (`clockWrite`): a synchronizer call can wait on the audio queue's prime, and `stop()` and
+    /// every buffer take `lock`. Held there, a stop from the main thread waited behind a prime for good (the
+    /// iOS 27 simulator's prime never returned: the player froze; Zool's fork, 2026-10-31). `stop()` never waits
+    /// for it: it owes the clock its rest (`restOwed`), and whoever holds `clockLock` pays it before letting
+    /// go. Always taken before `lock`.
+    private let clockLock = NSLock()
+    /// A `stop()` came and the clock is not at rest yet. Guarded by `lock`.
+    private var restOwed = false
+
+    #if DEBUG
+    /// Test-only: runs in every clock write between its decision and the synchronizer call, holding
+    /// `clockLock` and not `lock`, where a write waiting on the prime waits.
+    var whileSettingClockForTesting: (@Sendable () -> Void)?
+    #endif
+
     /// Explicit host pause owns every clock write, including stale feeder work that carries no
     /// command revision. Buffering pauses leave this intent alone. Guarded by `lock`.
     private var playbackEnabled = true
@@ -215,21 +232,26 @@ final class AudioOutput: @unchecked Sendable {
     /// Update transport authority without starting an unanchored clock. A disabled output can
     /// still seek at rate zero; only an explicit play enables positive rates again.
     func setPlaybackEnabled(_ enabled: Bool) {
-        lock.lock()
-        playbackEnabled = enabled
         // Enabling owns no clock write. A feeder may already hold the revision for an arm
         // whose latch play() has not seen yet; that correction still owes the initial start.
-        guard !enabled else { lock.unlock(); return }
-        _clockCommandRevision &+= 1
-        endPreroll()
-        let at = synchronizer.currentTime()
-        let sourceSeconds = timeline.sourceSeconds(forRenderer: at.seconds)
-        // Unconditional: `synchronizer.rate` reads back asynchronously, and a start issued just
-        // before this can still read 0 here. Skipping the stop on that read let it commit later.
-        synchronizer.setRate(0, time: at)
-        lock.unlock()
-        EngineLog.emit("[AudioOutput] pause at t=\(String(format: "%.3f", sourceSeconds)) (host transport disabled)",
-                       category: .swPlayback)
+        if enabled {
+            lock.lock()
+            playbackEnabled = true
+            lock.unlock()
+            return
+        }
+        clockWrite {
+            playbackEnabled = false
+            _clockCommandRevision &+= 1
+            endPreroll()
+            let at = synchronizer.currentTime()
+            let sourceSeconds = timeline.sourceSeconds(forRenderer: at.seconds)
+            EngineLog.emit("[AudioOutput] pause at t=\(String(format: "%.3f", sourceSeconds)) (host transport disabled)",
+                           category: .swPlayback)
+            // Unconditional: `synchronizer.rate` reads back asynchronously, and a start issued just
+            // before this can still read 0 here. Skipping the stop on that read let it commit later.
+            return { self.synchronizer.setRate(0, time: at) }
+        }
     }
 
     /// Set playback speed (0.5-2.0). Hosts retain their preferred speed; explicit pause wins.
@@ -245,45 +267,43 @@ final class AudioOutput: @unchecked Sendable {
             seekClock(to: currentTime, rate: rate, ifRevision: revision)
             return
         }
-        lock.lock()
-        if (rate != 0 && !playbackEnabled) || (revision != nil && revision != _clockCommandRevision) {
-            lock.unlock()
-            return
+        clockWrite {
+            if (rate != 0 && !playbackEnabled) || (revision != nil && revision != _clockCommandRevision) { return nil }
+            _clockCommandRevision &+= 1
+            endPreroll()
+            let at = synchronizer.currentTime()
+            let sourceSeconds = timeline.sourceSeconds(forRenderer: at.seconds)
+            EngineLog.emit("[AudioOutput] setRate \(rate) at t=\(String(format: "%.3f", sourceSeconds))", category: .swPlayback)
+            return { self.synchronizer.setRate(rate, time: at) }
         }
-        _clockCommandRevision &+= 1
-        endPreroll()
-        let at = synchronizer.currentTime()
-        let sourceSeconds = timeline.sourceSeconds(forRenderer: at.seconds)
-        synchronizer.setRate(rate, time: at)
-        lock.unlock()
-        EngineLog.emit("[AudioOutput] setRate \(rate) at t=\(String(format: "%.3f", sourceSeconds))", category: .swPlayback)
     }
 
     /// Pause audio (and the master clock). Hosts resume via setRate (pausedByHost pattern); deliberately no resume() here.
     func pause() {
-        lock.lock()
-        _clockCommandRevision &+= 1
-        endPreroll()
-        let at = synchronizer.currentTime()
-        let sourceSeconds = timeline.sourceSeconds(forRenderer: at.seconds)
-        synchronizer.setRate(0.0, time: at)
-        lock.unlock()
-        EngineLog.emit("[AudioOutput] pause at t=\(String(format: "%.3f", sourceSeconds))", category: .swPlayback)
+        clockWrite {
+            _clockCommandRevision &+= 1
+            endPreroll()
+            let at = synchronizer.currentTime()
+            let sourceSeconds = timeline.sourceSeconds(forRenderer: at.seconds)
+            EngineLog.emit("[AudioOutput] pause at t=\(String(format: "%.3f", sourceSeconds))", category: .swPlayback)
+            return { self.synchronizer.setRate(0.0, time: at) }
+        }
     }
 
     /// Pause the master clock, at `latest` if it has already run past it. A park deferred to the last
     /// sample runs whenever its task is scheduled, and on a starved main actor that is after the clock
     /// has walked on (#694: 1.149 s on a 1.0 s source on a CI runner).
     func pause(notAfter latest: Double) {
-        lock.lock()
-        _clockCommandRevision &+= 1
-        endPreroll()
-        let now = timeline.sourceTime(forRenderer: synchronizer.currentTime())
-        let seconds = SoftwareEndOfMediaClock.parkSeconds(clockSeconds: CMTimeGetSeconds(now), notAfter: latest)
-        let at = seconds.map { CMTime(seconds: $0, preferredTimescale: 90000) } ?? now
-        synchronizer.setRate(0.0, time: timeline.rendererTime(forSource: at))
-        lock.unlock()
-        EngineLog.emit("[AudioOutput] pause at t=\(String(format: "%.3f", at.seconds))", category: .swPlayback)
+        clockWrite {
+            _clockCommandRevision &+= 1
+            endPreroll()
+            let now = timeline.sourceTime(forRenderer: synchronizer.currentTime())
+            let seconds = SoftwareEndOfMediaClock.parkSeconds(clockSeconds: CMTimeGetSeconds(now), notAfter: latest)
+            let at = seconds.map { CMTime(seconds: $0, preferredTimescale: 90000) } ?? now
+            let parked = timeline.rendererTime(forSource: at)
+            EngineLog.emit("[AudioOutput] pause at t=\(String(format: "%.3f", at.seconds))", category: .swPlayback)
+            return { self.synchronizer.setRate(0.0, time: parked) }
+        }
     }
 
     /// AE#464: set the audio presentation offset. Positive presents audio later than video, which on
@@ -476,17 +496,60 @@ final class AudioOutput: @unchecked Sendable {
 
     func stop() {
         lock.lock()
-        defer { lock.unlock() }
         _clockCommandRevision &+= 1
         _epoch &+= 1
         playbackEnabled = false
         endPreroll()
-        // Hosts discard the output after stop. An already-paused clock needs no time reset;
-        // its native rate is updated synchronously even while the timebase settles.
-        if synchronizer.rate != 0 {
-            synchronizer.setRate(0.0, time: .zero)
-        }
+        // Hosts discard the output after stop. The clock's rest outside `lock`: now if no clock write is
+        // under way, else by that write as it lets go (`clockWrite`); one waiting in the synchronizer could
+        // hold it as long as a prime takes.
+        restOwed = true
         renderer.flush()
+        lock.unlock()
+        payRest()
+    }
+
+    /// Runs `decide` under `lock`, where a clock write reads and changes what it decides by (the command
+    /// revision, the preroll, `playbackEnabled`), and returns the synchronizer call to make, or nil for none.
+    /// That call runs holding only `clockLock`, so the calls land in the order they were decided. Before
+    /// letting go it pays a rest a `stop()` owed meanwhile, so the stop wins as when both held `lock`; after,
+    /// the one a stop owed between that and the unlock, unless the next holder will.
+    private func clockWrite(_ decide: () -> (() -> Void)?) {
+        clockLock.lock()
+        lock.lock()
+        let write = decide()
+        lock.unlock()
+        #if DEBUG
+        whileSettingClockForTesting?()
+        #endif
+        write?()
+        restIfOwed()
+        clockLock.unlock()
+        payRest()
+    }
+
+    /// The owed rest, if `clockLock` is free; a holder pays it otherwise.
+    private func payRest() {
+        while owesRest, clockLock.try() {
+            restIfOwed()
+            clockLock.unlock()
+        }
+    }
+
+    private var owesRest: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return restOwed
+    }
+
+    /// Holding `clockLock`: the clock at rest at zero, if a stop owes it. An already-paused clock needs no
+    /// time reset; its native rate is updated synchronously even while the timebase settles.
+    private func restIfOwed() {
+        lock.lock()
+        let owed = restOwed
+        restOwed = false
+        lock.unlock()
+        if owed, synchronizer.rate != 0 { synchronizer.setRate(0.0, time: .zero) }
     }
 
     /// Atomically jump the master clock to a time and resume at a rate. The ONLY way the clock is (re)anchored:
@@ -496,27 +559,32 @@ final class AudioOutput: @unchecked Sendable {
         // Asked before taking `lock`: the gate reads the video renderer's state under its own lock.
         let preroll = rate > 0 ? videoPrerollSatisfied?(time.seconds) : nil
         let progress = preroll == false ? videoPrerollProgress?() : nil
-        lock.lock()
-        defer { lock.unlock() }
-        if let revision, revision != _clockCommandRevision { return }
-        let rate = playbackEnabled ? rate : 0
-        _clockCommandRevision &+= 1
-        EngineLog.emit("[AudioOutput] seekClock to=\(String(format: "%.3f", time.seconds)) rate=\(rate)", category: .swPlayback)
-        endPreroll()
-        switch rate > 0 ? preroll : nil {
-        case nil:
-            synchronizer.setRate(rate, time: timeline.rendererTime(forSource: time))
-        case true?:
-            startAfterPreroll(rate: rate, time: time)
-        case false?:
-            synchronizer.setRate(0, time: timeline.rendererTime(forSource: time))
-            let gen = prerollGeneration
-            prerollRate = rate
-            let started = CACurrentMediaTime()
-            _onPrerollTransition?(PrerollTransition(generation: gen, event: .began))
-            let wait = PrerollWait(gen: gen, time: time, started: started,
-                                   progress: progress, progressAt: started)
-            prerollQueue.async { [weak self] in self?.pollPreroll(wait) }
+        clockWrite {
+            if let revision, revision != _clockCommandRevision { return nil }
+            let rate = playbackEnabled ? rate : 0
+            _clockCommandRevision &+= 1
+            EngineLog.emit("[AudioOutput] seekClock to=\(String(format: "%.3f", time.seconds)) rate=\(rate)", category: .swPlayback)
+            endPreroll()
+            let at = timeline.rendererTime(forSource: time)
+            switch rate > 0 ? preroll : nil {
+            case nil:
+                return { self.synchronizer.setRate(rate, time: at) }
+            case true?:
+                return startAfterPreroll(rate: rate, time: time)
+            case false?:
+                // The chain belongs to this decision: set up and reported here, under `lock`, so a stop or a
+                // seek that comes before the write retires it (and reports it cancelled after it began).
+                let gen = prerollGeneration
+                prerollRate = rate
+                let started = CACurrentMediaTime()
+                _onPrerollTransition?(PrerollTransition(generation: gen, event: .began))
+                let wait = PrerollWait(gen: gen, time: time, started: started,
+                                       progress: progress, progressAt: started)
+                return {
+                    self.synchronizer.setRate(0, time: at)
+                    self.prerollQueue.async { [weak self] in self?.pollPreroll(wait) }
+                }
+            }
         }
     }
 
@@ -629,24 +697,28 @@ final class AudioOutput: @unchecked Sendable {
             }
             return
         }
-        lock.lock()
-        defer { lock.unlock() }
-        guard playbackEnabled, prerollGeneration == wait.gen, let rate = prerollRate else { return }
-        prerollRate = nil
-        EngineLog.emit("[AudioOutput] preroll \(ready ? "ready" : "timed out") after "
-                       + "\(String(format: "%.0f", waited * 1000)) ms; starting at t=\(String(format: "%.3f", wait.time.seconds)) rate=\(rate)",
-                       category: .swPlayback)
-        startAfterPreroll(rate: rate, time: wait.time)
-        let release: ClockHoldRelease = ready ? .ready(waitedSeconds: waited) : .timedOut(waitedSeconds: waited)
-        _onPrerollTransition?(PrerollTransition(generation: wait.gen, event: .released(release)))
+        clockWrite {
+            guard playbackEnabled, prerollGeneration == wait.gen, let rate = prerollRate else { return nil }
+            prerollRate = nil
+            EngineLog.emit("[AudioOutput] preroll \(ready ? "ready" : "timed out") after "
+                           + "\(String(format: "%.0f", waited * 1000)) ms; starting at t=\(String(format: "%.3f", wait.time.seconds)) rate=\(rate)",
+                           category: .swPlayback)
+            let release: ClockHoldRelease = ready ? .ready(waitedSeconds: waited) : .timedOut(waitedSeconds: waited)
+            _onPrerollTransition?(PrerollTransition(generation: wait.gen, event: .released(release)))
+            return startAfterPreroll(rate: rate, time: wait.time)
+        }
     }
 
-    /// Starts the clock `prerollStartLead` from now. Called with `lock` held.
-    private func startAfterPreroll(rate: Float, time: CMTime) {
-        let hostNow = CMClockGetTime(CMClockGetHostTimeClock())
-        let host = CMTimeAdd(hostNow, CMTime(seconds: Self.prerollStartLead, preferredTimescale: 1_000_000_000))
-        synchronizer.setRate(rate, time: timeline.rendererTime(forSource: time), atHostTime: host)
+    /// The write that starts the clock `prerollStartLead` from when it runs. Decided with `lock` held.
+    private func startAfterPreroll(rate: Float, time: CMTime) -> () -> Void {
+        let at = timeline.rendererTime(forSource: time)
+        return {
+            let hostNow = CMClockGetTime(CMClockGetHostTimeClock())
+            let host = CMTimeAdd(hostNow, CMTime(seconds: Self.prerollStartLead, preferredTimescale: 1_000_000_000))
+            self.synchronizer.setRate(rate, time: at, atHostTime: host)
+        }
     }
+
 
     /// Retires the current preroll chain, and reports a hold that was still waiting as cancelled.
     /// Called with `lock` held.
