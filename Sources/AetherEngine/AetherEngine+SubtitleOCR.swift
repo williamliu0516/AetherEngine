@@ -151,6 +151,7 @@ extension AetherEngine {
     /// Load/stop teardown: forget covered-region state too (new session, new axis).
     func resetSubtitleOCRState() {
         cancelSubtitleOCRWorker()
+        deferredSidecarOCRFill = nil
         subtitleOCRCursors.removeAll()
         subtitleOCRPendingStates.removeAll()
     }
@@ -245,6 +246,12 @@ extension AetherEngine {
               nativeSubtitleTrackTable[ordinal].needsOCR,
               let store = nativeStore(atOrdinal: ordinal),
               !store.isFinished else { return }
+        guard nativeSubtitleOCRWanted else {
+            deferredSidecarOCRFill = (id, source)
+            EngineLog.emit("[SubtitleOCR] sidecar fill deferred until a rendition is shown: track=\(id)",
+                           category: .engine)
+            return
+        }
         let language = nativeSubtitleTrackTable[ordinal].language
         subtitleOCRSidecarFillTask?.cancel()
         EngineLog.emit("[SubtitleOCR] sidecar fill starting: track=\(id) packets=\(source.packets.count)", category: .engine)
@@ -254,6 +261,32 @@ extension AetherEngine {
             }
             if !Task.isCancelled { store.markFinished() }
         }
+    }
+}
+
+extension AetherEngine {
+
+    /// Whether the OCR feeding a bitmap track's rendition should run now: always, unless
+    /// `LoadOptions.deferNativeSubtitleWork` holds it to the host's standing rendering request.
+    var nativeSubtitleOCRWanted: Bool {
+        Self.nativeSubtitleOCRWanted(deferWork: loadedOptions.deferNativeSubtitleWork,
+                                     renderingRequested: nativeSubtitleRenderingRequested)
+    }
+
+    nonisolated static func nativeSubtitleOCRWanted(deferWork: Bool, renderingRequested: Bool) -> Bool {
+        !deferWork || renderingRequested
+    }
+
+    /// `LoadOptions.deferNativeSubtitleWork`: a declared `.sup` sidecar's OCR fill, held while no rendition is shown,
+    /// starts when the host's rendering request comes. Since 7.54 the engine arms an embedded bitmap track's OCR on
+    /// demand itself, only while its rendition is shown (`syncSubtitleOCRWithNativeSelection`), with or without the
+    /// option; only the sidecar's whole-file fill ran at once. A fill started runs to its end.
+    func followDeferredNativeSubtitleWork() {
+        guard loadedOptions.deferNativeSubtitleWork, nativeSubtitleRenderingRequested,
+              let held = deferredSidecarOCRFill, held.externalTrackID == activeSubtitleTrackIndex,
+              subtitleOCRSidecarFillTask == nil else { return }
+        deferredSidecarOCRFill = nil
+        startSidecarOCRFillIfNeeded(externalTrackID: held.externalTrackID, source: held.source)
     }
 }
 

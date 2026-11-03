@@ -805,6 +805,16 @@ public struct LoadOptions: Sendable, Equatable {
     /// Start the native WebVTT subtitle readers eagerly at load (instead of lazily on `setNativeSubtitleSelected`), so the `/subs_N_M.vtt` segments are already populated when AVKit fetches them under a host-independent selection (e.g. an `EXT-X-MEDIA ... DEFAULT=YES` rendition that AVKit auto-selects). Equivalent to a fully-populated static VOD subtitle file. Only meaningful with `prepareNativeSubtitles`. Default `false` (Sodalite#32 probe).
     public var eagerNativeSubtitleReaders: Bool = false
 
+    /// With `prepareNativeSubtitles`, hold back a declared `.sup` sidecar's OCR fill until the host's
+    /// `setNativeSubtitleRendering(true)` stands (a PiP window, an AirPlay receiver, an external display). Without it
+    /// the whole file is recognized at load though the host draws the overlay itself and the rendition is seen only
+    /// while the picture is elsewhere. An embedded bitmap track's OCR (PGS / DVB / DVD), with the forward-prefetch lead
+    /// it raises, is armed only while its rendition is shown with or without this (7.54,
+    /// `syncSubtitleOCRWithNativeSelection`). Leave it off when AVKit may select a rendition by itself (`DEFAULT=YES`,
+    /// `nativeSubtitlePreferredLanguages`) without the host asking. A tuning field: correctable through
+    /// `reloadAtCurrentPosition(applying:)`. Default `false`.
+    public var deferNativeSubtitleWork: Bool = false
+
     /// Serve an I-frame rendition (`EXT-X-I-FRAME-STREAM-INF`) next to the master, so a stock `AVPlayerViewController` shows its own scrub thumbnails and can scan on I-frames, with no host code (AE#682). One still per served segment: the source's own keyframe at full resolution for SDR, and for HDR10, HLG and Dolby Vision a tone-mapped SDR Motion JPEG 640 pixels wide, since AVKit shows no scrub thumbnail from a PQ or Dolby Vision keyframe. Costs a second reader on the source for the whole session, opened shortly after load because AVKit asks for the first keyframe before anyone scrubs. Silently absent, with one log line naming the reason, when the session cannot answer every listed keyframe: live, a source without a trustworthy keyframe index (MPEG-TS), `sequentialOrigin`, `heldSourceConnection`, an origin limited to one request, a disc source, a custom reader that cannot clone, or media-playlist routing. A host with its own transport bar wants `scrubThumbnail` instead. A tuning field: correctable through `reloadAtCurrentPosition(applying:)`. Default `false`.
     public var serveIFramePlaylist: Bool = false
 

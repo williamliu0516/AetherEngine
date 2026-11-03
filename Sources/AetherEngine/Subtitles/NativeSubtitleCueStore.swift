@@ -19,6 +19,10 @@ final class NativeSubtitleCueStore: @unchecked Sendable {
     private let lock = NSLock()
     private var cues: [SubtitleCue] = []
     private var shiftSeconds: Double = 0
+    /// The host's retiming of the track (`AetherEngine.setNativeSubtitleTiming`): a cue timed `t` in the
+    /// source is served at `timingScale * t + timingOffset`, before the playlist shift.
+    private var timingScale: Double = 1
+    private var timingOffset: Double = 0
     private var finished = false
     /// Sodalite#32: the pump tap and a side reader can feed the same store concurrently (and a producer
     /// restart re-reads a region), so appends dedup on (start, end, text) instead of trusting the source.
@@ -35,6 +39,10 @@ final class NativeSubtitleCueStore: @unchecked Sendable {
     }
 
     func setShiftSeconds(_ s: Double) { lock.lock(); shiftSeconds = s; lock.unlock() }
+
+    func setTiming(scale: Double, offset: Double) {
+        lock.lock(); timingScale = scale; timingOffset = offset; lock.unlock()
+    }
 
     /// Set once the reader has read the track to EOF, so a whole-program .vtt consumer knows every cue is present (Sodalite#32).
     func markFinished() { lock.lock(); finished = true; lock.unlock() }
@@ -86,13 +94,13 @@ final class NativeSubtitleCueStore: @unchecked Sendable {
     func cuesInWindow(start: Double, end: Double) -> [(start: Double, end: Double, text: String)] {
         lock.lock()
         let snapshot = cues
-        let shift = shiftSeconds
+        let shift = shiftSeconds, scale = timingScale, offset = timingOffset
         lock.unlock()
         var out: [(start: Double, end: Double, text: String)] = []
         for c in snapshot {
             guard let t = c.text else { continue }
-            let s = c.startTime - shift
-            let e = c.endTime - shift
+            let s = scale * c.startTime + offset - shift
+            let e = scale * c.endTime + offset - shift
             if e > start && s < end { out.append((max(0, s), max(0, e), t)) }
         }
         return out.sorted { $0.start < $1.start }
@@ -109,6 +117,6 @@ final class NativeSubtitleCueStore: @unchecked Sendable {
     func readMaxCueEnd() -> Double {
         lock.lock(); defer { lock.unlock() }
         guard !cues.isEmpty else { return 0 }
-        return maxCueEndSeconds - shiftSeconds
+        return timingScale * maxCueEndSeconds + timingOffset - shiftSeconds
     }
 }
