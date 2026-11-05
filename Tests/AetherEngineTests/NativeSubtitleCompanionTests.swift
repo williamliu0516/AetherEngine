@@ -19,7 +19,8 @@ struct NativeSubtitleCompanionTests {
         })
     }
 
-    private func provider(_ stores: [NativeSubtitleCueStore]) -> VideoSegmentProvider {
+    private func provider(_ stores: [NativeSubtitleCueStore],
+                          revision: NativeSubtitleRevision = NativeSubtitleRevision()) -> VideoSegmentProvider {
         VideoSegmentProvider(
             cache: SegmentCache(),
             segments: [HLSVideoEngine.Segment(startPts: 0, endPts: 4000, startSeconds: 0, durationSeconds: 4.0),
@@ -27,7 +28,7 @@ struct NativeSubtitleCompanionTests {
             codecsString: "avc1.640028", supplementalCodecs: nil,
             resolution: (1920, 1080), videoRange: .sdr, frameRate: 24.0,
             hdcpLevel: nil, sourceBitrate: 1_000_000,
-            nativeSubtitleStores: stores, nativeSubtitleLanguages: ["chi", "eng"],
+            nativeSubtitleStores: stores, nativeSubtitleRevision: revision, nativeSubtitleLanguages: ["chi", "eng"],
             stripASSMarkupInVTT: true
         )
     }
@@ -94,8 +95,8 @@ struct NativeSubtitleCompanionTests {
         #expect(Date().timeIntervalSince(began) < 1)
     }
 
-    /// The timeline moving while a window is read (a restart shifting a store): read again once, then paired;
-    /// still moving, the window goes out with the first line alone.
+    /// A change across the session's stores (a restart's shift, the host's text rewrite) made while a window is
+    /// read: read again once, then paired; still changing, the window goes out with the first line alone.
     @Test("A window read across a timeline change is read again, or served alone")
     func aWindowReadAcrossAChangeIsReadAgainOrServedAlone() {
         final class Moves: @unchecked Sendable {
@@ -107,18 +108,43 @@ struct NativeSubtitleCompanionTests {
         // The rendition's own read takes the first move; the companion's first read meets the second.
         for (moves, paired) in [(2, true), (1_000, false)] {
             let chinese = store([(1.0, 2.0, "一")]), english = store([(1.0, 2.0, "One")])
-            let left = Moves(moves)
-            // Reading the first store moves the second's shift (to where it is, so its cues stay put).
+            let left = Moves(moves), revision = NativeSubtitleRevision()
+            // Reading the first store makes a change across the stores (one that moves nothing).
             chinese.setTextTransform { text in
-                if left.take() { english.setShiftSeconds(0) }
+                if left.take() { revision.change {} }
                 return text
             }
-            let provider = provider([chinese, english])
+            let provider = provider([chinese, english], revision: revision)
             provider.setNativeSubtitleCompanion(ordinal: 1, combine: Self.join)
             let vtt = provider.nativeSubtitleVTT(ordinal: 0, segmentIndex: 0)
             #expect(vtt?.contains("一\nOne") == paired, "\(moves) moves: \(vtt ?? "nil")")
             #expect(vtt?.contains("一") == true)
         }
+    }
+
+    /// A window read while a change runs across the stores (one store's text rewrite set, the other's not yet,
+    /// each store's own state steady) goes out with the first line alone (Codex's third review, 2).
+    @Test("A window read during a change across the stores is served alone")
+    func aWindowReadDuringAChangeIsServedAlone() {
+        let revision = NativeSubtitleRevision()
+        let provider = provider([store([(1.0, 2.0, "一")]), store([(1.0, 2.0, "One")])], revision: revision)
+        provider.setNativeSubtitleCompanion(ordinal: 1, combine: Self.join)
+        var vtt: String?
+        revision.change { vtt = provider.nativeSubtitleVTT(ordinal: 0, segmentIndex: 0) }
+        #expect(vtt?.contains("一") == true && vtt?.contains("One") == false)
+        #expect(provider.nativeSubtitleVTT(ordinal: 0, segmentIndex: 0)?.contains("一\nOne") == true, "after it")
+    }
+
+    /// A load keeps the companion only as a reload of the file and disc title it was set on that keeps the
+    /// session; a disc-title pick (on a URL or a custom reader) or any other load lets it go (Codex's third
+    /// review, 1).
+    @Test("Only a reload of the same title keeps the companion")
+    func onlyAReloadOfTheSameTitleKeepsTheCompanion() {
+        #expect(AetherEngine.keepsNativeSubtitleCompanion(preservingSession: true, title: nil, setOn: nil))
+        #expect(AetherEngine.keepsNativeSubtitleCompanion(preservingSession: true, title: 3, setOn: 3))
+        #expect(!AetherEngine.keepsNativeSubtitleCompanion(preservingSession: true, title: 4, setOn: 3))
+        #expect(!AetherEngine.keepsNativeSubtitleCompanion(preservingSession: true, title: 2, setOn: nil))
+        #expect(!AetherEngine.keepsNativeSubtitleCompanion(preservingSession: false, title: nil, setOn: nil))
     }
 
     /// Two stores read on different axes (a restart moved one's shift and not yet the other's) are not paired:

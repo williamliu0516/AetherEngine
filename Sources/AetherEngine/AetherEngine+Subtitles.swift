@@ -1750,7 +1750,9 @@ extension AetherEngine {
         // truth (the tap's decoder dedup would never refill a cleared store), so subtitles-off keeps
         // them; only the reader-driven path tears them down.
         if nativeVideoSession?.subtitleTapActive != true {
-            nativeVideoSession?.nativeSubtitleCueStoresForSession.forEach { $0.clear() }
+            if let session = nativeVideoSession {
+                session.nativeSubtitleRevision.change { session.nativeSubtitleCueStoresForSession.forEach { $0.clear() } }
+            }
             nativeVideoSession?.nativeSubtitleCueStoresForSession = []
             nativeVideoSession?.nativeSubtitleLanguagesForSession = []
             nativeSubtitleRenditionAvailable = false
@@ -2453,8 +2455,9 @@ extension AetherEngine {
     /// Hands the host's timing to every native store of the session (text, closed captions, OCR).
     func applyNativeSubtitleTiming() {
         let stores = nativeVideoSession?.nativeSubtitleCueStoresForSession ?? []
-        for store in stores {
-            store.setTiming(scale: nativeSubtitleTimingScale, offset: nativeSubtitleTimingOffset)
+        let (scale, offset) = (nativeSubtitleTimingScale, nativeSubtitleTimingOffset)
+        (nativeVideoSession?.nativeSubtitleRevision ?? NativeSubtitleRevision()).change {
+            for store in stores { store.setTiming(scale: scale, offset: offset) }
         }
     }
 
@@ -2478,9 +2481,11 @@ extension AetherEngine {
 
     /// Hands the host's text rewrite to every native store of the session and of a remote HLS stand-in.
     func applyNativeSubtitleText() {
-        NativeSubtitleCueStore.setText(nativeSubtitleTextTransform,
-                                       on: nativeVideoSession?.nativeSubtitleCueStoresForSession ?? [],
-                                       languages: nativeVideoSession?.nativeSubtitleLanguagesForSession ?? [])
+        let (transform, session) = (nativeSubtitleTextTransform, nativeVideoSession)
+        (session?.nativeSubtitleRevision ?? NativeSubtitleRevision()).change {
+            NativeSubtitleCueStore.setText(transform, on: session?.nativeSubtitleCueStoresForSession ?? [],
+                                           languages: session?.nativeSubtitleLanguagesForSession ?? [])
+        }
         remoteHLSSubtitleProxy?.provider?.setText(nativeSubtitleTextTransform)
     }
 
@@ -2517,6 +2522,13 @@ extension AetherEngine {
         applyNativeSubtitleCompanion()
         EngineLog.emit("[AetherEngine] native subtitle companion track=\(track.map(String.init) ?? "-")",
                        category: .engine)
+    }
+
+    /// Whether a load keeps the companion: it names a track of the file and disc title it was set on (`setOn`), so
+    /// only a reload of them that keeps the session (an audio pick, `reloadAtCurrentPosition`) keeps it; a load of
+    /// another file, or of another title (`title`, a disc-title pick, on a URL or a custom reader), goes without.
+    nonisolated static func keepsNativeSubtitleCompanion(preservingSession: Bool, title: Int?, setOn: Int?) -> Bool {
+        preservingSession && title == setOn
     }
 
     /// Hands the host's companion to the session's provider, as this load's rendition ordinal: none for a track

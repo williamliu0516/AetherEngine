@@ -1431,7 +1431,7 @@ extension AetherEngine {
             let stores = session.nativeSubtitleCueStoresForSession
             if !stores.isEmpty {
                 let shift = session.playlistShiftSeconds
-                stores.forEach { $0.setShiftSeconds(shift) }
+                session.nativeSubtitleRevision.change { stores.forEach { $0.setShiftSeconds(shift) } }
                 applyNativeSubtitleTiming()
                 applyNativeSubtitleText()
                 applyNativeSubtitleCompanion()
@@ -2538,6 +2538,12 @@ extension AetherEngine {
                 releaseHeldPicture(reason: "rebuild superseded")
                 return nil
             }
+        }
+        // A custom reader is rebuilt here, past `loadSession`: a disc-title pick lets the companion go as a load does.
+        if let title = discTitleIDOverride,
+           !Self.keepsNativeSubtitleCompanion(preservingSession: true, title: title, setOn: nativeSubtitleCompanionTitle) {
+            nativeSubtitleCompanionTrack = nil
+            nativeSubtitleCompanionCombine = nil
         }
         stopInternal(resetDisplayCriteria: false,
                      keepNativeHost: !targetSoftwarePath && !mediaServicesWereReset,

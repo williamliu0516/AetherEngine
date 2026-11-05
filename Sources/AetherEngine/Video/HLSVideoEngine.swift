@@ -296,6 +296,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// `nativeSubtitleLanguagesForSession`. Re-threaded onto every producer restart so
     /// per-segment cue drain survives seek/audio-switch. Empty = no native subtitles active.
     var nativeSubtitleCueStoresForSession: [NativeSubtitleCueStore] = []
+    /// The changes made to all of them at once (`NativeSubtitleRevision`), which the provider looks at.
+    let nativeSubtitleRevision = NativeSubtitleRevision()
 
     /// ISO 639-2 / BCP-47 language tags parallel to `nativeSubtitleCueStoresForSession`.
     /// nil entry = no language box for that track.
@@ -2256,6 +2258,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             // the cold-start heuristic (abs(index - lastRestartIndex) > 2) restarts it immediately.
             initialRestartIndex: initialProducerBaseIndex,
             nativeSubtitleStores: nativeSubtitleCueStoresForSession,
+            nativeSubtitleRevision: nativeSubtitleRevision,
             nativeSubtitleLanguages: nativeSubtitleLanguagesForSession,
             nativeSubtitleRenditionInfos: nativeSubtitleRenditionInfosForSession,
             stripASSMarkupInVTT: preserveASSMarkupForSubtitleTap,
@@ -4219,7 +4222,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         restartLock.lock()
         let stores = nativeSubtitleCueStoresForSession
         restartLock.unlock()
-        stores.forEach { $0.setShiftSeconds(seconds) }
+        nativeSubtitleRevision.change { stores.forEach { $0.setShiftSeconds(seconds) } }
         onPlaylistShiftChanged?(seconds, seamItemSeconds)
     }
 

@@ -826,6 +826,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     private var nativeSubtitleCompanion: (ordinal: Int, combine: NativeSubtitleCombine)?
     private var nativeSubtitleCompanionGeneration = 0
     private let companionLock = NSLock()
+    /// The session's store changes (`NativeSubtitleRevision`), looked at with the companion's setting.
+    private let nativeSubtitleRevision: NativeSubtitleRevision
     /// How near a second cue a first cue can be and still be its owner in the host's pairing, at most: every
     /// first cue that close to a second cue the host is handed is handed with it (`withCompanion`).
     static let companionReach = 5.0
@@ -1073,6 +1075,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         forwardBackpressureWaitSeconds: TimeInterval = 30.0,
         slowServeThresholdSeconds: TimeInterval = 2.0,
         nativeSubtitleStores: [NativeSubtitleCueStore] = [],
+        nativeSubtitleRevision: NativeSubtitleRevision = NativeSubtitleRevision(),
         nativeSubtitleLanguages: [String?] = [],
         nativeSubtitleRenditionInfos: [NativeSubtitleRenditionInfo] = [],
         stripASSMarkupInVTT: Bool = false,
@@ -1125,6 +1128,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         self.forwardBackpressureWaitSeconds = forwardBackpressureWaitSeconds
         self.slowServeThresholdSeconds = slowServeThresholdSeconds
         self.nativeSubStores = nativeSubtitleStores
+        self.nativeSubtitleRevision = nativeSubtitleRevision
         self.nativeSubLanguages = nativeSubtitleLanguages
         self.nativeSubRenditionInfos = nativeSubtitleRenditionInfos
         self.stripASSMarkupInVTT = stripASSMarkupInVTT
@@ -3325,21 +3329,22 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// as the load starts, so that is rare. A window is combined from its cues' whole extents: the first cues
     /// overlapping it, the companion's within `companionReach` of them, the first cues within reach of those,
     /// so a cue crossing windows is paired alike in each; what the host returns is cut back to the window. The
-    /// reads are taken between two looks at one generation (the companion's setting, each store's axis and text
-    /// rewrite) and on one axis; read again once if either moved, else the window is served alone.
+    /// reads are taken between two looks at one generation (the companion's setting, and the session's store
+    /// changes, `NativeSubtitleRevision`, none running) and on one axis; read again once if it moved, else the
+    /// window is served alone, its first line read again.
     private func withCompanion(_ cues: [(start: Double, end: Double, text: String)], ordinal: Int,
                                window: (start: Double, end: Double)?) -> [(start: Double, end: Double, text: String)] {
-        func look() -> (companion: (ordinal: Int, combine: NativeSubtitleCombine)?, generation: Int) {
+        func look() -> (companion: (ordinal: Int, combine: NativeSubtitleCombine)?, generation: Int, stores: Int) {
             companionLock.lock()
             defer { companionLock.unlock() }
-            return (nativeSubtitleCompanion, nativeSubtitleCompanionGeneration)
+            return (nativeSubtitleCompanion, nativeSubtitleCompanionGeneration, nativeSubtitleRevision.value)
         }
         for _ in 0..<2 {
             let seen = look()
             guard let companion = seen.companion, companion.ordinal != ordinal, companion.ordinal >= 0,
                   companion.ordinal < nativeSubStores.count, ordinal < nativeSubStores.count else { return cues }
             let first = nativeSubStores[ordinal], other = nativeSubStores[companion.ordinal]
-            let before = (seen.generation, first.generation, other.generation)
+            let before = (generation: seen.generation, stores: seen.stores)
             let firsts: (cues: [(start: Double, end: Double, text: String)], axis: NativeSubtitleCueStore.Axis)
             let seconds: (cues: [(start: Double, end: Double, text: String)], axis: NativeSubtitleCueStore.Axis)
             if let window {
@@ -3354,7 +3359,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                 firsts = first.cuesOnAxis(start: 0, end: .greatestFiniteMagnitude)
                 seconds = other.cuesOnAxis(start: 0, end: .greatestFiniteMagnitude)
             }
-            guard before == (look().generation, first.generation, other.generation),
+            let after = look()
+            guard before.stores % 2 == 0, before.generation == after.generation, before.stores == after.stores,
                   firsts.axis == seconds.axis else { continue }
             let combined = companion.combine(stripMarkupIfNeeded(firsts.cues), stripMarkupIfNeeded(seconds.cues))
             let served = window.map { w in combined.filter { $0.end > w.start && $0.start < w.end } } ?? combined
@@ -3362,7 +3368,10 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         }
         EngineLog.emit("[HLSVideoEngine] subtitle companion: the timeline moved while a window was read; served alone",
                        category: .hlsServer)
-        return cues
+        // The first line as it stands now, not as it was read before the change.
+        guard ordinal < nativeSubStores.count else { return cues }
+        let now = nativeSubStores[ordinal]
+        return stripMarkupIfNeeded(window.map { now.cuesInWindow(start: $0.start, end: $0.end) } ?? now.allCues())
     }
 
     /// Sodalite#32 Phase 2: see `stripASSMarkupInVTT`.
