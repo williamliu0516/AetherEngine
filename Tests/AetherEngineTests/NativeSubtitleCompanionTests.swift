@@ -94,18 +94,31 @@ struct NativeSubtitleCompanionTests {
         #expect(Date().timeIntervalSince(began) < 1)
     }
 
-    /// The companion is waited on through the range the window's cues are paired over, not only the window's end:
-    /// its cue at 4.5-5 s, read after the window [0, 4) is asked, is paired with the first cue at 3-5 s (H3).
-    @Test("The companion is waited on through the range its pairing reads")
-    func theCompanionIsWaitedOnThroughThePairingRange() {
-        let english = store([(1.0, 2.0, "One"), (4.0, 4.2, "Tw-")], finished: false)
-        let provider = provider([store([(1.0, 2.0, "一"), (3.0, 5.0, "二")]), english])
-        provider.setNativeSubtitleCompanion(ordinal: 1, combine: Self.join)
-        DispatchQueue.global().asyncAfter(deadline: .now() + 0.3) {
-            Self.append([(4.5, 5.0, "Two"), (7.0, 8.0, "Three")], to: english)
+    /// The timeline moving while a window is read (a restart shifting a store): read again once, then paired;
+    /// still moving, the window goes out with the first line alone.
+    @Test("A window read across a timeline change is read again, or served alone")
+    func aWindowReadAcrossAChangeIsReadAgainOrServedAlone() {
+        final class Moves: @unchecked Sendable {
+            let lock = NSLock()
+            var left: Int
+            init(_ left: Int) { self.left = left }
+            func take() -> Bool { lock.lock(); defer { lock.unlock() }; left -= 1; return left >= 0 }
         }
-        let vtt = provider.nativeSubtitleVTT(ordinal: 0, segmentIndex: 0)
-        #expect(vtt?.contains("Two") == true, "\(vtt ?? "nil")")
+        // The rendition's own read takes the first move; the companion's first read meets the second.
+        for (moves, paired) in [(2, true), (1_000, false)] {
+            let chinese = store([(1.0, 2.0, "一")]), english = store([(1.0, 2.0, "One")])
+            let left = Moves(moves)
+            // Reading the first store moves the second's shift (to where it is, so its cues stay put).
+            chinese.setTextTransform { text in
+                if left.take() { english.setShiftSeconds(0) }
+                return text
+            }
+            let provider = provider([chinese, english])
+            provider.setNativeSubtitleCompanion(ordinal: 1, combine: Self.join)
+            let vtt = provider.nativeSubtitleVTT(ordinal: 0, segmentIndex: 0)
+            #expect(vtt?.contains("一\nOne") == paired, "\(moves) moves: \(vtt ?? "nil")")
+            #expect(vtt?.contains("一") == true)
+        }
     }
 
     /// Two stores read on different axes (a restart moved one's shift and not yet the other's) are not paired:

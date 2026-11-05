@@ -46,15 +46,20 @@ final class NativeSubtitleCueStore: @unchecked Sendable {
         return "\(Int((start * 1000).rounded()))|\(Int((end * 1000).rounded()))|\(text)"
     }
 
-    func setShiftSeconds(_ s: Double) { lock.lock(); shiftSeconds = s; lock.unlock() }
+    func setShiftSeconds(_ s: Double) { lock.lock(); shiftSeconds = s; changes += 1; lock.unlock() }
 
     func setTiming(scale: Double, offset: Double) {
-        lock.lock(); timingScale = scale; timingOffset = offset; lock.unlock()
+        lock.lock(); timingScale = scale; timingOffset = offset; changes += 1; lock.unlock()
     }
 
     func setTextTransform(_ transform: (@Sendable (String) -> String)?) {
-        lock.lock(); textTransform = transform; lock.unlock()
+        lock.lock(); textTransform = transform; changes += 1; lock.unlock()
     }
+
+    /// Counts the changes to how the cues are read (the shift, the timing, the text rewrite), so two reads can be
+    /// told to be of one generation (`VideoSegmentProvider.withCompanion`).
+    private var changes = 0
+    var generation: Int { lock.lock(); defer { lock.unlock() }; return changes }
 
     /// Hands the host's text rewrite to each store with its own track's language (ordinal-aligned; a store
     /// past the end of `languages` gets nil).

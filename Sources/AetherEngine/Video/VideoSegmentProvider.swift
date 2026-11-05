@@ -821,12 +821,14 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// styling); the WebVTT rendition must serve plain text, so strip at build time.
     private let stripASSMarkupInVTT: Bool
     /// The host's second line in the native renditions (`AetherEngine.setNativeSubtitleCompanion`): the
-    /// ordinal whose cues join every other rendition's, through the host's `combine`. nil: off.
-    private var nativeSubtitleCompanion: (ordinal: Int, wholeFile: Bool, combine: NativeSubtitleCombine)?
+    /// ordinal whose cues join every other rendition's, through the host's `combine`. nil: off. `generation`
+    /// counts its changes, so a window read across one is served alone (`withCompanion`).
+    private var nativeSubtitleCompanion: (ordinal: Int, combine: NativeSubtitleCombine)?
+    private var nativeSubtitleCompanionGeneration = 0
     private let companionLock = NSLock()
-    /// How near a second cue a first cue can be and still be its owner, at most, in the host's pairing: every
+    /// How near a second cue a first cue can be and still be its owner in the host's pairing, at most: every
     /// first cue that close to a second cue the host is handed is handed with it (`withCompanion`).
-    static let companionReach = 1.0
+    static let companionReach = 5.0
 
     /// Synchronous teardown + relaunch at the given absolute segment index.
     private let restartHandler: ((Int) -> Void)?
@@ -3268,8 +3270,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             // engine shift (read now, not the possibly-zero load-time value) so cues land on the video's axis.
             let shift = currentShiftSeconds()
             store.setShiftSeconds(shift)
-            let cues = withCompanion(stripMarkupIfNeeded(store.allCues()), ordinal: ordinal, window: nil,
-                                     shift: shift, until: deadline)
+            let cues = withCompanion(stripMarkupIfNeeded(store.allCues()), ordinal: ordinal, window: nil)
             EngineLog.emit("[HLSVideoEngine] whole-program subtitle .vtt ord=\(ordinal) cues=\(cues.count) finished=\(store.isFinished) shift=\(String(format: "%.2f", shift)) first=\(cues.first.map { String(format: "%.1f", $0.start) } ?? "-") last=\(cues.last.map { String(format: "%.1f", $0.end) } ?? "-")", category: .hlsServer)
             // PLAIN WebVTT, NO X-TIMESTAMP-MAP (matches the proven-working whole-file sideload). With the map,
             // AVKit anchors cues to the fMP4 sample PTS (which diverges from currentTime over our loopback) and
@@ -3290,101 +3291,76 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         // that never finishes serialized the loopback connection AVPlayer also uses for video (device:
         // scrubbing wedged while a rendition was selected). Wait only while the reader is plausibly about to
         // cover THIS window (read head within the horizon, or still warming up), and only briefly.
+        let horizonSeconds = 30.0
         let deadline = Date().addingTimeInterval(3.0)
-        Self.waitForCoverage(store, end: end, until: deadline)
+        while !store.isFinished,
+              store.readMaxCueEnd() < end,
+              end <= store.readMaxCueEnd() + horizonSeconds || store.readMaxCueEnd() <= 0,
+              Date() < deadline {
+            usleep(100_000)
+        }
         let cues = withCompanion(stripMarkupIfNeeded(store.cuesInWindow(start: start, end: end)), ordinal: ordinal,
-                                 window: (start, end), shift: nil, until: deadline)
+                                 window: (start, end))
         EngineLog.emit("[HLSVideoEngine] subtitle .vtt ord=\(ordinal) seg=\(segmentIndex) win=[\(String(format: "%.1f", start)),\(String(format: "%.1f", end))) inWin=\(cues.count) readMax=\(String(format: "%.1f", store.readMaxCueEnd()))", category: .hlsServer, level: .verbose)
         // Absolute media-timeline cue times + MPEGTS:0 identity map. Flip to segment-relative here (one line:
         // relativeToStart: true) if on-device PiP shows subtitles shifted by the segment start. See WebVTTBuilder.segment.
         return WebVTTBuilder.segment(cues: cues, segmentStart: start)
     }
 
-    /// Waits, until `deadline` at most, while `store`'s reader is plausibly about to cover a window ending at
-    /// `end` (the comment at its use in `nativeSubtitleVTT`). `warming`: also while it has nothing yet.
-    /// `alongside`: a store the same reader fills in the same pass (the pump tap, the side reader), which has
-    /// passed `end` once it holds a cue ending there: no more is coming for `store` before it either.
-    static func waitForCoverage(_ store: NativeSubtitleCueStore, end: Double, until deadline: Date,
-                                warming: Bool = true, alongside: NativeSubtitleCueStore? = nil) {
-        let horizonSeconds = 30.0
-        while !store.isFinished, Date() < deadline {
-            let have = store.readMaxCueEnd()
-            // Covered, or the reader both stores share has passed it.
-            guard have < end, (alongside?.readMaxCueEnd() ?? 0) < end else { return }
-            // Nothing yet: waited on only while warming up.
-            guard have > 0 || warming else { return }
-            // The read head within the horizon, or still warming up.
-            guard end <= have + horizonSeconds || have <= 0 else { return }
-            usleep(100_000)
-        }
-    }
-
     /// The host's second line (`AetherEngine.setNativeSubtitleCompanion`).
-    /// `wholeFile`: the companion's store is filled from a file in one decode (a declared sidecar), not by the
-    /// reader that fills the rendition's.
-    func setNativeSubtitleCompanion(ordinal: Int?, wholeFile: Bool = false, combine: NativeSubtitleCombine?) {
+    func setNativeSubtitleCompanion(ordinal: Int?, combine: NativeSubtitleCombine?) {
         companionLock.lock()
-        nativeSubtitleCompanion = ordinal.flatMap { ordinal in combine.map { (ordinal, wholeFile, $0) } }
+        nativeSubtitleCompanion = ordinal.flatMap { ordinal in combine.map { (ordinal, $0) } }
+        nativeSubtitleCompanionGeneration += 1
         companionLock.unlock()
     }
 
-    /// `cues` (rendition `ordinal`'s, for `window`, or the whole program when nil) with the companion's lines
-    /// in them, as the host combines the two: the companion's own rendition, and every rendition while none is
-    /// set, are served as they are.
+    /// `cues` (rendition `ordinal`'s, for `window`, or the whole program when nil) with the companion's lines in
+    /// them, as the host combines the two: the companion's own rendition, and every rendition while none is set,
+    /// are served as they are.
     ///
-    /// A window is combined from what each of its cues is paired by, whole, so a cue crossing a window's edge is
-    /// served the same in both (Codex's review of the companion, M1): the first cues overlapping the window, the
-    /// companion's within `companionReach` of them, and the first cues within reach of those, however long the
-    /// cues run; what the host returns is cut back to the window. Both stores are waited on through that range,
-    /// within the window's one deadline, the rendition's own wait included, so a companion adds no wait past it
-    /// (H1): a companion filled by the same reader is waited on only while neither store has passed the range and
-    /// it has had something (an empty one, or one that track has nothing for, is not waited on); one filled from a
-    /// file in one decode (`wholeFile`, a sidecar: a local file, decoded as the load starts) is not waited on, so a
-    /// decode that failed costs nothing. A window served before its companion's cues arrive is served with what
-    /// was there (AVKit keeps what it was served, as it does the rendition's own cues; H3). Both stores are read on one axis
-    /// (shift and timing), read again when either moved meanwhile, and served alone if they kept moving (H4).
+    /// Nothing is waited on for the companion: a window is combined with the companion's cues the store holds
+    /// when it is served, and one served before they arrive goes out with the first line alone (AVKit keeps it).
+    /// The stores are filled by one reader in one pass (the pump tap, the side reader) or a sidecar's one decode
+    /// as the load starts, so that is rare. A window is combined from its cues' whole extents: the first cues
+    /// overlapping it, the companion's within `companionReach` of them, the first cues within reach of those,
+    /// so a cue crossing windows is paired alike in each; what the host returns is cut back to the window. The
+    /// reads are taken between two looks at one generation (the companion's setting, each store's axis and text
+    /// rewrite) and on one axis; read again once if either moved, else the window is served alone.
     private func withCompanion(_ cues: [(start: Double, end: Double, text: String)], ordinal: Int,
-                               window: (start: Double, end: Double)?, shift: Double?,
-                               until deadline: Date) -> [(start: Double, end: Double, text: String)] {
-        companionLock.lock()
-        let companion = nativeSubtitleCompanion
-        companionLock.unlock()
-        guard let companion, companion.ordinal != ordinal, companion.ordinal >= 0,
-              companion.ordinal < nativeSubStores.count, ordinal < nativeSubStores.count else { return cues }
-        let first = nativeSubStores[ordinal], other = nativeSubStores[companion.ordinal]
-        guard let window else {
-            // The whole program, once: the companion read to its end too, on the rendition's shift.
-            if let shift { other.setShiftSeconds(shift) }
-            // Served once: worth the rendition's one deadline (a decode that failed costs it once).
-            while !other.isFinished, Date() < deadline { usleep(100_000) }
-            for _ in 0..<3 {
-                let a = first.cuesOnAxis(start: 0, end: .greatestFiniteMagnitude)
-                let b = other.cuesOnAxis(start: 0, end: .greatestFiniteMagnitude)
-                guard a.axis == b.axis else { continue }
-                return companion.combine(stripMarkupIfNeeded(a.cues), stripMarkupIfNeeded(b.cues))
-                    .sorted { $0.start < $1.start }
-            }
-            return cues
+                               window: (start: Double, end: Double)?) -> [(start: Double, end: Double, text: String)] {
+        func look() -> (companion: (ordinal: Int, combine: NativeSubtitleCombine)?, generation: Int) {
+            companionLock.lock()
+            defer { companionLock.unlock() }
+            return (nativeSubtitleCompanion, nativeSubtitleCompanionGeneration)
         }
-        let reach = Self.companionReach
-        for _ in 0..<3 {
-            let inWindow = first.cuesOnAxis(start: window.start, end: window.end)
-            let lo = min(window.start, inWindow.cues.map(\.start).min() ?? window.start) - reach
-            let hi = max(window.end, inWindow.cues.map(\.end).max() ?? window.end) + reach
-            Self.waitForCoverage(first, end: hi, until: deadline, alongside: companion.wholeFile ? nil : other)
-            if !companion.wholeFile {
-                Self.waitForCoverage(other, end: hi, until: deadline, warming: false, alongside: first)
+        for _ in 0..<2 {
+            let seen = look()
+            guard let companion = seen.companion, companion.ordinal != ordinal, companion.ordinal >= 0,
+                  companion.ordinal < nativeSubStores.count, ordinal < nativeSubStores.count else { return cues }
+            let first = nativeSubStores[ordinal], other = nativeSubStores[companion.ordinal]
+            let before = (seen.generation, first.generation, other.generation)
+            let firsts: (cues: [(start: Double, end: Double, text: String)], axis: NativeSubtitleCueStore.Axis)
+            let seconds: (cues: [(start: Double, end: Double, text: String)], axis: NativeSubtitleCueStore.Axis)
+            if let window {
+                let reach = Self.companionReach
+                let inWindow = first.cuesOnAxis(start: window.start, end: window.end).cues
+                let lo = min(window.start, inWindow.map(\.start).min() ?? window.start) - reach
+                let hi = max(window.end, inWindow.map(\.end).max() ?? window.end) + reach
+                seconds = other.cuesOnAxis(start: lo, end: hi)
+                firsts = first.cuesOnAxis(start: min(lo, seconds.cues.map(\.start).min() ?? lo) - reach,
+                                          end: max(hi, seconds.cues.map(\.end).max() ?? hi) + reach)
+            } else {
+                firsts = first.cuesOnAxis(start: 0, end: .greatestFiniteMagnitude)
+                seconds = other.cuesOnAxis(start: 0, end: .greatestFiniteMagnitude)
             }
-            let seconds = other.cuesOnAxis(start: lo, end: hi)
-            let lo2 = min(lo, seconds.cues.map(\.start).min() ?? lo) - reach
-            let hi2 = max(hi, seconds.cues.map(\.end).max() ?? hi) + reach
-            let firsts = first.cuesOnAxis(start: lo2, end: hi2)
-            guard inWindow.axis == seconds.axis, firsts.axis == seconds.axis else { continue }
-            return companion.combine(stripMarkupIfNeeded(firsts.cues), stripMarkupIfNeeded(seconds.cues))
-                .filter { $0.end > window.start && $0.start < window.end }.sorted { $0.start < $1.start }
+            guard before == (look().generation, first.generation, other.generation),
+                  firsts.axis == seconds.axis else { continue }
+            let combined = companion.combine(stripMarkupIfNeeded(firsts.cues), stripMarkupIfNeeded(seconds.cues))
+            let served = window.map { w in combined.filter { $0.end > w.start && $0.start < w.end } } ?? combined
+            return served.sorted { $0.start < $1.start }
         }
-        EngineLog.emit("[HLSVideoEngine] subtitle companion: the axis kept moving; window "
-                       + "[\(String(format: "%.1f", window.start)),\(String(format: "%.1f", window.end))) served alone",
+        EngineLog.emit("[HLSVideoEngine] subtitle companion: the timeline moved while a window was read; served alone",
                        category: .hlsServer)
         return cues
     }
