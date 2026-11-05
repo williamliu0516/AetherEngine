@@ -100,9 +100,11 @@ final class SoftwarePacketDiskFIFO: @unchecked Sendable {
             // The injectable acquisition is used only by focused interrupted-init tests.
             leaseFD = try (leaseAcquisition ?? Self.acquireNewLease)(storageDirectory)
             guard leaseFD >= 0 else { throw Failure.sessionLeaseLost }
+            // Let go while the host is away, as the segment cache's (`SessionDirectoryLiveness.letGo`).
+            SessionDirectoryLiveness.register(leaseFD)
         } catch {
             try? FileManager.default.removeItem(at: storageDirectory)
-            if leaseFD >= 0 { Darwin.close(leaseFD) }
+            SessionDirectoryLiveness.release(leaseFD)
             throw error
         }
         staleSweepResult = Self.sweepStaleSessionDirs(parentDirectory: parentDirectory,
@@ -112,7 +114,7 @@ final class SoftwarePacketDiskFIFO: @unchecked Sendable {
     deinit {
         try? close()
         // A failed best-effort removal must not leak the advisory lease descriptor.
-        if leaseFD >= 0 { Darwin.close(leaseFD) }
+        SessionDirectoryLiveness.release(leaseFD)
     }
 
     var snapshot: Snapshot {
@@ -354,7 +356,7 @@ final class SoftwarePacketDiskFIFO: @unchecked Sendable {
             try removeOwnedStorage()
             clearCounters()
             if leaseFD >= 0 {
-                Darwin.close(leaseFD)
+                SessionDirectoryLiveness.release(leaseFD)
                 leaseFD = -1
             }
         } catch {
@@ -579,7 +581,8 @@ final class SoftwarePacketDiskFIFO: @unchecked Sendable {
         guard mkdir(storageDirectory.path, 0o700) == 0 else { throw Self.posixError() }
         do {
             let replacement = try Self.acquireNewLease(storageDirectory)
-            if leaseFD >= 0 { Darwin.close(leaseFD) }
+            SessionDirectoryLiveness.release(leaseFD)
+            SessionDirectoryLiveness.register(replacement)
             leaseFD = replacement
         } catch {
             try? FileManager.default.removeItem(at: storageDirectory)
@@ -638,6 +641,8 @@ final class SoftwarePacketDiskFIFO: @unchecked Sendable {
                                   O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
             guard markerFD >= 0 else { failures += 1; continue }
             defer { Darwin.close(markerFD) }
+            // One of this process's own, its lease let go while the host is away (`SessionDirectoryLiveness`).
+            guard !SessionDirectoryLiveness.isRegistered(markerFD) else { continue }
             guard flock(markerFD, LOCK_EX | LOCK_NB) == 0 else {
                 if errno != EWOULDBLOCK && errno != EAGAIN { failures += 1 }
                 continue

@@ -197,7 +197,7 @@ final class SegmentCache: @unchecked Sendable {
         let fd = lockFD
         lockFD = -1
         condition.unlock()
-        if fd >= 0 { Darwin.close(fd) }
+        SessionDirectoryLiveness.release(fd)
     }
 
     static let defaultBaseDirectory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)

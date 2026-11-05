@@ -12,6 +12,14 @@ the public-API contract.
 
 ### Added
 
+- **`releaseSessionLocks()` / `retakeSessionLocks()`: a host leaving the foreground lets go of the sessions' folder
+  locks.** Every session holds an flock on its `aether-segments/` folder's `session.lock` (AE#451), the segment cache's,
+  the DVR ring's and the software FIFO's, and an app suspended while it holds a file lock is killed (RunningBoard's
+  0xdead10cc; an iPad app on a Mac with a player open while its window was away). The host calls the first as it
+  leaves the foreground and the second as it returns; meanwhile the process's own sweeps read its let-go markers as
+  held (an in-process registry by device and inode), so no live session loses its folder, and a session started while
+  away lets go of its own at once. A crashed process leaves unheld markers, swept as before.
+
 - **`setNativeSubtitleText(_:)`: the host's rewrite of subtitle text reaches the native renditions.** Each cue a
   rendition serves goes through `transform(text, language)`, with its own track's language, so a viewer's Simplified or
   Traditional Chinese choice reaches the PiP window, an AirPlay receiver and an external display as it reaches the

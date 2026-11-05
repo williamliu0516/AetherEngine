@@ -148,7 +148,7 @@ final class PacketRingBuffer: @unchecked Sendable {
     }
 
     deinit {
-        if markerFD >= 0 { Darwin.close(markerFD) }
+        SessionDirectoryLiveness.release(markerFD)
     }
 
     /// Idempotent teardown. State is cleared synchronously so the ring is immediately
@@ -176,7 +176,7 @@ final class PacketRingBuffer: @unchecked Sendable {
         DispatchQueue.global(qos: .userInitiated).async { [scratch] in
             try? FileManager.default.removeItem(at: scratch)
             // Released after the removal, so the directory reads live until it is gone.
-            if marker >= 0 { Darwin.close(marker) }
+            SessionDirectoryLiveness.release(marker)
         }
     }
 

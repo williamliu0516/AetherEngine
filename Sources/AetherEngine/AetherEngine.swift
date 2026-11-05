@@ -1586,6 +1586,20 @@ public final class AetherEngine: ObservableObject {
         SegmentCache.sweepStaleSessionDirs()
     }
 
+    /// Lets go of the file locks the sessions hold on their folders (`session.lock`), for a host leaving
+    /// the foreground: an app suspended while it holds a file lock is killed (RunningBoard's 0xdead10cc;
+    /// an iPad app on a Mac with a player open while its window is away). The sessions keep their folders
+    /// and go on as before: this process's sweeps still read them as live. A session that starts meanwhile
+    /// lets go of its own at once. `retakeSessionLocks()` takes them back as the host returns.
+    public nonisolated static func releaseSessionLocks() {
+        SessionDirectoryLiveness.letGo()
+    }
+
+    /// Takes back the locks `releaseSessionLocks()` let go of, as the host returns to the foreground.
+    public nonisolated static func retakeSessionLocks() {
+        SessionDirectoryLiveness.takeBack()
+    }
+
     /// TEST-ONLY: forces every source through SoftwarePlaybackHost so the SW live+DVR path can be exercised
     /// against H.264 fixtures. Set only via `setForceSoftwarePathForTesting(_:)` from `aetherctl`.
     nonisolated(unsafe) static var forceSoftwarePathForTesting = false

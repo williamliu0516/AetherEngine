@@ -43,7 +43,73 @@ enum SessionDirectoryLiveness {
             unlink(staging)
             return -1
         }
+        register(fd)
         return fd
+    }
+
+    // MARK: - A host leaving the foreground (0xdead10cc)
+
+    /// The markers this process holds, by descriptor, with the file each one is: `SegmentCache`'s,
+    /// the DVR ring's and the software FIFO's `session.lock`. An app suspended while it holds a file
+    /// lock is killed (RunningBoard's 0xdead10cc; an iPad app on a Mac, with a player open while its
+    /// window was away: Zool's TestFlight 3203 and 5162). A host lets them go as it leaves the
+    /// foreground and takes them back as it returns (`AetherEngine.releaseSessionLocks`); meanwhile
+    /// this process's own sweeps read a registered marker as held, so none of its sessions loses its
+    /// folder. Only another process could take a let-go marker for a dead one, and none shares an app's
+    /// temporary folder on iOS, tvOS or visionOS.
+    private struct Marker {
+        var device: dev_t
+        var inode: ino_t
+    }
+    private static let registryLock = NSLock()
+    nonisolated(unsafe) private static var registered: [Int32: Marker] = [:]
+    nonisolated(unsafe) private static var lettingGo = false
+
+    /// Keeps `fd`, a marker just locked, as held by this process; let go at once while the host is away.
+    static func register(_ fd: Int32) {
+        var info = stat()
+        guard fd >= 0, fstat(fd, &info) == 0 else { return }
+        registryLock.lock()
+        defer { registryLock.unlock() }
+        registered[fd] = Marker(device: info.st_dev, inode: info.st_ino)
+        if lettingGo { flock(fd, LOCK_UN) }
+    }
+
+    /// Closes a held marker's descriptor, out of the registry first (a later descriptor may reuse its
+    /// number).
+    static func release(_ fd: Int32) {
+        guard fd >= 0 else { return }
+        registryLock.lock()
+        registered[fd] = nil
+        registryLock.unlock()
+        Darwin.close(fd)
+    }
+
+    /// Whether the marker open at `fd` is one this process holds, its lock let go or not.
+    static func isRegistered(_ fd: Int32) -> Bool {
+        var info = stat()
+        guard fd >= 0, fstat(fd, &info) == 0 else { return false }
+        registryLock.lock()
+        defer { registryLock.unlock() }
+        return registered.values.contains { $0.device == info.st_dev && $0.inode == info.st_ino }
+    }
+
+    static func letGo() {
+        registryLock.lock()
+        defer { registryLock.unlock() }
+        lettingGo = true
+        for fd in registered.keys { flock(fd, LOCK_UN) }
+    }
+
+    static func takeBack() {
+        registryLock.lock()
+        defer { registryLock.unlock() }
+        lettingGo = false
+        for fd in registered.keys where flock(fd, LOCK_EX | LOCK_NB) != 0 {
+            // Another process's sweep probing it this instant; still registered, so this process's
+            // sweeps keep it, and the next return takes it.
+            EngineLog.emit("[SessionDirectoryLiveness] live marker not taken back: errno=\(errno)", category: .session)
+        }
     }
 
     enum State {
@@ -61,6 +127,8 @@ enum SessionDirectoryLiveness {
         let fd = open(path, O_RDONLY | O_CLOEXEC)
         guard fd >= 0 else { return .unmarked }
         defer { Darwin.close(fd) }
+        // One of this process's own, its lock let go while the host is away (`letGo`).
+        if isRegistered(fd) { return .held }
         if flock(fd, LOCK_EX | LOCK_NB) == 0 {
             flock(fd, LOCK_UN)
             return .free
