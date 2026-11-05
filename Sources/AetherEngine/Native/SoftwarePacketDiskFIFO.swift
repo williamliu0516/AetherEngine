@@ -100,8 +100,9 @@ final class SoftwarePacketDiskFIFO: @unchecked Sendable {
             // The injectable acquisition is used only by focused interrupted-init tests.
             leaseFD = try (leaseAcquisition ?? Self.acquireNewLease)(storageDirectory)
             guard leaseFD >= 0 else { throw Failure.sessionLeaseLost }
-            // Let go while the host is away, as the segment cache's (`SessionDirectoryLiveness.letGo`).
-            SessionDirectoryLiveness.register(leaseFD)
+            // Let go while the host is away, as the segment cache's (`SessionDirectoryLiveness.letGo`); the
+            // default acquisition registered it already, a lease handed in is registered here.
+            SessionDirectoryLiveness.adopt(leaseFD)
         } catch {
             try? FileManager.default.removeItem(at: storageDirectory)
             SessionDirectoryLiveness.release(leaseFD)
@@ -582,7 +583,6 @@ final class SoftwarePacketDiskFIFO: @unchecked Sendable {
         do {
             let replacement = try Self.acquireNewLease(storageDirectory)
             SessionDirectoryLiveness.release(leaseFD)
-            SessionDirectoryLiveness.register(replacement)
             leaseFD = replacement
         } catch {
             try? FileManager.default.removeItem(at: storageDirectory)
@@ -599,7 +599,9 @@ final class SoftwarePacketDiskFIFO: @unchecked Sendable {
         let path = directory.appendingPathComponent(liveMarkerName).path
         let fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard fd >= 0 else { throw posixError() }
-        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+        // Locked and registered in one step, or no lock taken while the host is away
+        // (`SessionDirectoryLiveness.takeHold`).
+        guard SessionDirectoryLiveness.takeHold(fd, publish: { true }) else {
             let error = posixError()
             Darwin.close(fd)
             throw error
@@ -641,10 +643,13 @@ final class SoftwarePacketDiskFIFO: @unchecked Sendable {
                                   O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
             guard markerFD >= 0 else { failures += 1; continue }
             defer { Darwin.close(markerFD) }
-            // One of this process's own, its lease let go while the host is away (`SessionDirectoryLiveness`).
-            guard !SessionDirectoryLiveness.isRegistered(markerFD) else { continue }
-            guard flock(markerFD, LOCK_EX | LOCK_NB) == 0 else {
-                if errno != EWOULDBLOCK && errno != EAGAIN { failures += 1 }
+            // One of this process's own, its lease let go while the host is away: decided with the probe under
+            // the registry's lock (`SessionDirectoryLiveness.probeForSweep`).
+            switch SessionDirectoryLiveness.probeForSweep(markerFD) {
+            case .taken: break
+            case .live: continue
+            case .failed:
+                failures += 1
                 continue
             }
             // Recheck identity rather than following a replaced directory or marker symlink.

@@ -1590,14 +1590,26 @@ public final class AetherEngine: ObservableObject {
     /// the foreground: an app suspended while it holds a file lock is killed (RunningBoard's 0xdead10cc;
     /// an iPad app on a Mac with a player open while its window is away). The sessions keep their folders
     /// and go on as before: this process's sweeps still read them as live. A session that starts meanwhile
-    /// lets go of its own at once. `retakeSessionLocks()` takes them back as the host returns.
+    /// takes no lock. `retakeSessionLocks()` takes them back as the host returns.
+    ///
+    /// Assumes one engine process per temporary folder, as a sandboxed app has (iOS, tvOS, visionOS, a
+    /// sandboxed Mac app): another process sweeping the same folder would read a let-go folder as a dead
+    /// session's. A non-sandboxed Mac host running two processes on one folder should not call it.
     public nonisolated static func releaseSessionLocks() {
         SessionDirectoryLiveness.letGo()
     }
 
-    /// Takes back the locks `releaseSessionLocks()` let go of, as the host returns to the foreground.
+    /// Takes back the locks `releaseSessionLocks()` let go of, as the host returns to the foreground. One
+    /// another process holds that instant (its sweep's probe) is tried again at the next return and at the
+    /// next session's start (`sessionLocksNotRetaken`).
     public nonisolated static func retakeSessionLocks() {
         SessionDirectoryLiveness.takeBack()
+    }
+
+    /// How many sessions are without their folder's lock while the host is in the foreground: a retake
+    /// that failed and has not succeeded since. 0 normally; for the host's diagnostics.
+    public nonisolated static var sessionLocksNotRetaken: Int {
+        SessionDirectoryLiveness.notTakenBackCount
     }
 
     /// TEST-ONLY: forces every source through SoftwarePlaybackHost so the SW live+DVR path can be exercised

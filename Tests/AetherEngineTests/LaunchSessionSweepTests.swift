@@ -23,7 +23,8 @@ struct LaunchSessionSweepTests {
                                        contents: Data(repeating: 0xAA, count: 4096))
         let fd = SessionDirectoryLiveness.acquire(sessionDir: dir, logPrefix: "[test]")
         #expect(fd >= 0)
-        close(fd)
+        // As its owner's end does: out of this process's registry, the lock gone with the descriptor.
+        SessionDirectoryLiveness.release(fd)
         return dir
     }
 

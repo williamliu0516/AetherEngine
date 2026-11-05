@@ -29,21 +29,24 @@ enum SessionDirectoryLiveness {
                            category: .session)
             return -1
         }
-        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+        // Locked, put in place and registered in one step under the registry's lock, so a host letting
+        // go meanwhile either finds it registered and lets go of it, or is seen letting go and no lock
+        // is taken at all (Codex's review of zool/suspend-locks, 1).
+        let held = takeHold(fd) {
+            guard rename(staging, path) == 0 else {
+                EngineLog.emit("\(logPrefix) live marker rename failed at \(path): errno=\(errno)",
+                               category: .session)
+                return false
+            }
+            return true
+        }
+        guard held else {
             EngineLog.emit("\(logPrefix) live marker lock failed at \(path): errno=\(errno)",
                            category: .session)
             Darwin.close(fd)
             unlink(staging)
             return -1
         }
-        guard rename(staging, path) == 0 else {
-            EngineLog.emit("\(logPrefix) live marker rename failed at \(path): errno=\(errno)",
-                           category: .session)
-            Darwin.close(fd)
-            unlink(staging)
-            return -1
-        }
-        register(fd)
         return fd
     }
 
@@ -55,8 +58,17 @@ enum SessionDirectoryLiveness {
     /// window was away: Zool's TestFlight 3203 and 5162). A host lets them go as it leaves the
     /// foreground and takes them back as it returns (`AetherEngine.releaseSessionLocks`); meanwhile
     /// this process's own sweeps read a registered marker as held, so none of its sessions loses its
-    /// folder. Only another process could take a let-go marker for a dead one, and none shares an app's
-    /// temporary folder on iOS, tvOS or visionOS.
+    /// folder.
+    ///
+    /// One protocol under `registryLock`: a marker's lock, its publication and its registration; the
+    /// host's letting go and taking back; and every sweep's liveness decision (the registry's word and
+    /// the lock's probe). So no sweep sees a marker between its owner's registration and its unlock,
+    /// and no acquisition keeps a lock through a let go.
+    ///
+    /// The assumption: one engine process per temporary folder, as every sandboxed app has (its
+    /// container's tmp on iOS, tvOS, visionOS and a sandboxed Mac app). Another process sweeping the
+    /// same folder would read a let-go marker as a dead session's; a non-sandboxed Mac host that runs
+    /// two processes on one folder should not let go (docs/architecture.md).
     private struct Marker {
         var device: dev_t
         var inode: ino_t
@@ -64,13 +76,46 @@ enum SessionDirectoryLiveness {
     private static let registryLock = NSLock()
     nonisolated(unsafe) private static var registered: [Int32: Marker] = [:]
     nonisolated(unsafe) private static var lettingGo = false
+    /// Registered markers whose lock a take back could not take (another process's probe that
+    /// instant): tried again at the next return and at the next session's acquisition.
+    nonisolated(unsafe) private static var notTakenBack: Set<Int32> = []
 
-    /// Keeps `fd`, a marker just locked, as held by this process; let go at once while the host is away.
-    static func register(_ fd: Int32) {
-        var info = stat()
-        guard fd >= 0, fstat(fd, &info) == 0 else { return }
+    /// TEST-ONLY: run under the registry's lock, after an acquisition's flock and before its
+    /// registration, and in a sweep's decision between the registry's word and the lock's probe.
+    nonisolated(unsafe) static var holdHookForTesting: (() -> Void)?
+    nonisolated(unsafe) static var probeHookForTesting: (() -> Void)?
+
+    /// Locks `fd` (unless the host is away, when no lock is taken), runs `publish` (the marker's
+    /// rename into place), and registers it, as one step; false when the lock or `publish` failed,
+    /// with nothing held or registered.
+    static func takeHold(_ fd: Int32, publish: () -> Bool) -> Bool {
         registryLock.lock()
         defer { registryLock.unlock() }
+        if !lettingGo { retakePending() }
+        let locks = !lettingGo
+        if locks {
+            guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { return false }
+            holdHookForTesting?()
+        }
+        guard publish() else {
+            if locks { flock(fd, LOCK_UN) }
+            return false
+        }
+        registerLocked(fd)
+        return true
+    }
+
+    /// Registers a marker locked by its owner already (a lease handed in): let go of at once while the
+    /// host is away.
+    static func adopt(_ fd: Int32) {
+        registryLock.lock()
+        defer { registryLock.unlock() }
+        registerLocked(fd)
+    }
+
+    private static func registerLocked(_ fd: Int32) {
+        var info = stat()
+        guard fd >= 0, fstat(fd, &info) == 0 else { return }
         registered[fd] = Marker(device: info.st_dev, inode: info.st_ino)
         if lettingGo { flock(fd, LOCK_UN) }
     }
@@ -81,23 +126,45 @@ enum SessionDirectoryLiveness {
         guard fd >= 0 else { return }
         registryLock.lock()
         registered[fd] = nil
+        notTakenBack.remove(fd)
         registryLock.unlock()
         Darwin.close(fd)
     }
 
     /// Whether the marker open at `fd` is one this process holds, its lock let go or not.
     static func isRegistered(_ fd: Int32) -> Bool {
-        var info = stat()
-        guard fd >= 0, fstat(fd, &info) == 0 else { return false }
         registryLock.lock()
         defer { registryLock.unlock() }
+        return isRegisteredLocked(fd)
+    }
+
+    private static func isRegisteredLocked(_ fd: Int32) -> Bool {
+        var info = stat()
+        guard fd >= 0, fstat(fd, &info) == 0 else { return false }
         return registered.values.contains { $0.device == info.st_dev && $0.inode == info.st_ino }
+    }
+
+    /// A sweep's probe of a marker open at `fd`, under the registry's lock: `taken` leaves the sweep
+    /// holding its lock (nobody else does, and this process has not registered it), `live` and `failed`
+    /// leave nothing held.
+    enum SweepProbe { case taken, live, failed }
+
+    static func probeForSweep(_ fd: Int32) -> SweepProbe {
+        registryLock.lock()
+        defer { registryLock.unlock() }
+        if isRegisteredLocked(fd) { return .live }
+        probeHookForTesting?()
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+            return errno == EWOULDBLOCK || errno == EAGAIN ? .live : .failed
+        }
+        return .taken
     }
 
     static func letGo() {
         registryLock.lock()
         defer { registryLock.unlock() }
         lettingGo = true
+        notTakenBack.removeAll()
         for fd in registered.keys { flock(fd, LOCK_UN) }
     }
 
@@ -105,10 +172,25 @@ enum SessionDirectoryLiveness {
         registryLock.lock()
         defer { registryLock.unlock() }
         lettingGo = false
-        for fd in registered.keys where flock(fd, LOCK_EX | LOCK_NB) != 0 {
-            // Another process's sweep probing it this instant; still registered, so this process's
-            // sweeps keep it, and the next return takes it.
-            EngineLog.emit("[SessionDirectoryLiveness] live marker not taken back: errno=\(errno)", category: .session)
+        notTakenBack = Set(registered.keys)
+        retakePending()
+    }
+
+    /// How many registered markers are without their lock while the host is here: a take back that
+    /// failed and has not been retried yet. For the host's diagnostics.
+    static var notTakenBackCount: Int {
+        registryLock.lock()
+        defer { registryLock.unlock() }
+        return lettingGo ? 0 : notTakenBack.count
+    }
+
+    private static func retakePending() {
+        for fd in notTakenBack where flock(fd, LOCK_EX | LOCK_NB) == 0 { notTakenBack.remove(fd) }
+        if !notTakenBack.isEmpty {
+            // Another process's sweep probing them this instant; still registered, so this process's
+            // sweeps keep them, and the next return or acquisition tries again.
+            EngineLog.emit("[SessionDirectoryLiveness] \(notTakenBack.count) live marker(s) not taken back: errno=\(errno)",
+                           category: .session)
         }
     }
 
@@ -127,13 +209,15 @@ enum SessionDirectoryLiveness {
         let fd = open(path, O_RDONLY | O_CLOEXEC)
         guard fd >= 0 else { return .unmarked }
         defer { Darwin.close(fd) }
-        // One of this process's own, its lock let go while the host is away (`letGo`).
-        if isRegistered(fd) { return .held }
-        if flock(fd, LOCK_EX | LOCK_NB) == 0 {
+        // One of this process's own, its lock let go while the host is away (`letGo`): decided with
+        // the probe under the registry's lock (Codex's review of zool/suspend-locks, 2).
+        switch probeForSweep(fd) {
+        case .taken:
             flock(fd, LOCK_UN)
             return .free
+        case .live, .failed:
+            return .held
         }
-        return .held
     }
 
     /// Whether some open file description still holds `entry`'s marker. A missing marker answers
