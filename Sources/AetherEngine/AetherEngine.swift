@@ -4457,6 +4457,12 @@ public final class AetherEngine: ObservableObject {
         setPendingRecoverySeekTarget(nil)
         nativeSubtitleTrackTable = []
         nativeSubtitleReapplyOrdinal = nil
+        // The companion names a track of the file it was set on: a load of a file goes without it, a reload
+        // that keeps the session (an audio or disc-title pick, `reloadAtCurrentPosition`) keeps it.
+        if !sessionPreservingReloadInFlight {
+            nativeSubtitleCompanionTrack = nil
+            nativeSubtitleCompanionCombine = nil
+        }
         nativeSubtitleTracks = []
         nativeSubtitleReaderParams = nil
         metadata = nil

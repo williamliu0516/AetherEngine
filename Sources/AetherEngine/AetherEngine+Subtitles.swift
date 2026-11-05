@@ -2487,32 +2487,38 @@ extension AetherEngine {
     /// Serve a second track's lines inside the native renditions, for a host that wants two subtitle lines where
     /// the system draws the rendition and nothing of the host's shows over the picture (Vision Pro's expanded and
     /// docked player). Each text rendition other than `track`'s own is served as `combine(first, second)`: its cues
-    /// and `track`'s, for the segment's window and a margin around it, both plain text, on the AVPlayer axis, with
-    /// the host's timing and text rewrite applied; what it returns is served, cut back to the window. The host
-    /// pairs the lines (one cue whose text carries both, or a second cue of its own), so the rule is the host's.
-    /// `track` is an engine subtitle track id (embedded or declared sidecar) with a native rendition; nil, or a
-    /// nil `combine`, turns it off (the default). Kept across loads like `setNativeSubtitleText`, the track
-    /// looked up in each load's renditions; a change made while a rendition is shown is replayed through the
-    /// selection. `combine` runs on the loopback server's thread for each window served: keep it quick and free
-    /// of the main actor. Not for a remote HLS origin's injected renditions. The host's overlay, `subtitleCues`
-    /// and `secondarySubtitleCues` are not affected.
+    /// and `track`'s, plain text, on the AVPlayer axis, with the host's timing and text rewrite applied, for each
+    /// window's cues and those near them (every first cue within `VideoSegmentProvider.companionReach`, 1 s, of a
+    /// second cue handed in is handed in too); what it returns is served, cut back to the window. The host pairs
+    /// the lines (one cue whose text carries both, or a second cue of its own), so the rule is the host's.
+    ///
+    /// `track` is an engine subtitle track id of the file loaded now (embedded or declared sidecar) with a text
+    /// rendition; a picture track read by OCR, or a track with none, is no companion. nil, or a nil `combine`,
+    /// turns it off (the default). It holds for the file it was set on, through the reloads that keep the session
+    /// (an audio or disc-title pick, `reloadAtCurrentPosition`), and the next load goes without it. It applies to the windows served from then on:
+    /// AVKit keeps the windows it was served, so a host that changes it while a rendition shows reloads in place
+    /// to have them served again (this call replays nothing). `combine` runs on the loopback server's thread for
+    /// each window served: keep it quick and free of the main actor. Not for a remote HLS origin's injected
+    /// renditions. The host's overlay, `subtitleCues` and `secondarySubtitleCues` are not affected.
     public func setNativeSubtitleCompanion(track: Int?, combine: NativeSubtitleCombine?) {
-        nativeSubtitleCompanionTrack = combine == nil ? nil : track
+        let track = combine == nil ? nil : track
+        guard track != nil || nativeSubtitleCompanionTrack != nil else { return }
+        nativeSubtitleCompanionTrack = track
         nativeSubtitleCompanionCombine = track == nil ? nil : combine
         applyNativeSubtitleCompanion()
-        EngineLog.emit("[AetherEngine] native subtitle companion track=\(nativeSubtitleCompanionTrack.map(String.init) ?? "-")",
+        EngineLog.emit("[AetherEngine] native subtitle companion track=\(track.map(String.init) ?? "-")",
                        category: .engine)
-        if nativeSubtitleRenderingRequested, let ordinal = nativeSubtitleReapplyOrdinal {
-            setNativeSubtitleSelected(track: ordinal)
-        }
     }
 
-    /// Hands the host's companion to the session's provider, as this load's rendition ordinal.
+    /// Hands the host's companion to the session's provider, as this load's rendition ordinal: none for a track
+    /// with no text rendition.
     func applyNativeSubtitleCompanion() {
         let ordinal = nativeSubtitleCompanionTrack.flatMap {
             Self.nativeSubtitleOrdinal(forActiveTrack: $0, in: nativeSubtitleTrackTable)
-        }
-        nativeVideoSession?.provider?.setNativeSubtitleCompanion(ordinal: ordinal, combine: nativeSubtitleCompanionCombine)
+        }.flatMap { nativeSubtitleTrackTable[$0].needsOCR ? nil : $0 }
+        nativeVideoSession?.provider?.setNativeSubtitleCompanion(
+            ordinal: ordinal, wholeFile: ordinal.map { nativeSubtitleTrackTable[$0].externalID != nil } ?? false,
+            combine: ordinal == nil ? nil : nativeSubtitleCompanionCombine)
     }
 
     // MARK: - Session-preserving reload carryover (#170)

@@ -112,9 +112,22 @@ final class NativeSubtitleCueStore: @unchecked Sendable {
         return cues.sorted { $0.startTime < $1.startTime }
     }
 
+    /// The axis a store's cues are read on: its playlist shift and the host's timing.
+    struct Axis: Equatable {
+        let shift: Double
+        let scale: Double
+        let offset: Double
+    }
+
     /// Cues overlapping `[start, end)` in AVPlayer-axis seconds, text only (rewritten by the host's
     /// text transform), sorted by start.
     func cuesInWindow(start: Double, end: Double) -> [(start: Double, end: Double, text: String)] {
+        cuesOnAxis(start: start, end: end).cues
+    }
+
+    /// `cuesInWindow`, with the axis they were read on (one snapshot), so two stores' reads can be told to be
+    /// on one axis (`VideoSegmentProvider.withCompanion`).
+    func cuesOnAxis(start: Double, end: Double) -> (cues: [(start: Double, end: Double, text: String)], axis: Axis) {
         lock.lock()
         let snapshot = cues
         let shift = shiftSeconds, scale = timingScale, offset = timingOffset, transform = textTransform
@@ -126,7 +139,7 @@ final class NativeSubtitleCueStore: @unchecked Sendable {
             let e = scale * c.endTime + offset - shift
             if e > start && s < end { out.append((max(0, s), max(0, e), transform?(t) ?? t)) }
         }
-        return out.sorted { $0.start < $1.start }
+        return (out.sorted { $0.start < $1.start }, Axis(shift: shift, scale: scale, offset: offset))
     }
 
     /// All text cues, shift-applied, sorted by start (whole-program VOD .vtt source). #15.

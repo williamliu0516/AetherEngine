@@ -6,13 +6,17 @@ import Testing
 /// not show over the picture (Vision Pro's expanded player): the rendition served carries what the host combines.
 @Suite("Native subtitle companion", .offCooperativePool)
 struct NativeSubtitleCompanionTests {
-    private func store(_ cues: [(Double, Double, String)]) -> NativeSubtitleCueStore {
+    private func store(_ cues: [(Double, Double, String)], finished: Bool = true) -> NativeSubtitleCueStore {
         let store = NativeSubtitleCueStore()
-        store.appendCues(cues.enumerated().map { i, cue in
-            SubtitleCue(id: i + 1, startTime: cue.0, endTime: cue.1, body: .text(cue.2))
-        })
-        store.markFinished()
+        Self.append(cues, to: store)
+        if finished { store.markFinished() }
         return store
+    }
+
+    private static func append(_ cues: [(Double, Double, String)], to store: NativeSubtitleCueStore) {
+        store.appendCues(cues.enumerated().map { i, cue in
+            SubtitleCue(id: Int(cue.0 * 1000) + i, startTime: cue.0, endTime: cue.1, body: .text(cue.2))
+        })
     }
 
     private func provider(_ stores: [NativeSubtitleCueStore]) -> VideoSegmentProvider {
@@ -67,6 +71,54 @@ struct NativeSubtitleCompanionTests {
         provider.setNativeSubtitleCompanion(ordinal: 1, combine: Self.join)
         #expect(provider.nativeSubtitleVTT(ordinal: 0, segmentIndex: 0)?.contains("跨过\nAcross") == true)
         #expect(provider.nativeSubtitleVTT(ordinal: 0, segmentIndex: 1)?.contains("跨过\nAcross") == true)
+    }
+
+    /// A first cue that runs through several windows (0-30 s) and a companion cue near its end (29-30 s) are
+    /// served together in every window, however long the cue (Codex's review, M1: a fixed margin missed it).
+    @Test("A long cue carries its second line in every window it crosses")
+    func aLongCueIsPairedInEveryWindow() throws {
+        let provider = provider([store([(0.0, 30.0, "长")]), store([(29.0, 30.0, "Long")])])
+        provider.setNativeSubtitleCompanion(ordinal: 1, combine: Self.join)
+        #expect(provider.nativeSubtitleVTT(ordinal: 0, segmentIndex: 0)?.contains("长\nLong") == true)
+        #expect(provider.nativeSubtitleVTT(ordinal: 0, segmentIndex: 1)?.contains("长\nLong") == true)
+    }
+
+    /// A companion the reader has given nothing (an empty track, a reader not started) is not waited on: the
+    /// window is served at once (H1: every request on a connection AVPlayer shares with video waited 3 s).
+    @Test("An empty companion is not waited on")
+    func anEmptyCompanionIsNotWaitedOn() {
+        let provider = provider([store([(1.0, 2.0, "一")]), store([], finished: false)])
+        provider.setNativeSubtitleCompanion(ordinal: 1, combine: Self.join)
+        let began = Date()
+        #expect(provider.nativeSubtitleVTT(ordinal: 0, segmentIndex: 0)?.contains("一") == true)
+        #expect(Date().timeIntervalSince(began) < 1)
+    }
+
+    /// The companion is waited on through the range the window's cues are paired over, not only the window's end:
+    /// its cue at 4.5-5 s, read after the window [0, 4) is asked, is paired with the first cue at 3-5 s (H3).
+    @Test("The companion is waited on through the range its pairing reads")
+    func theCompanionIsWaitedOnThroughThePairingRange() {
+        let english = store([(1.0, 2.0, "One"), (4.0, 4.2, "Tw-")], finished: false)
+        let provider = provider([store([(1.0, 2.0, "一"), (3.0, 5.0, "二")]), english])
+        provider.setNativeSubtitleCompanion(ordinal: 1, combine: Self.join)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.3) {
+            Self.append([(4.5, 5.0, "Two"), (7.0, 8.0, "Three")], to: english)
+        }
+        let vtt = provider.nativeSubtitleVTT(ordinal: 0, segmentIndex: 0)
+        #expect(vtt?.contains("Two") == true, "\(vtt ?? "nil")")
+    }
+
+    /// Two stores read on different axes (a restart moved one's shift and not yet the other's) are not paired:
+    /// the window is served alone (H4).
+    @Test("Stores on two axes are served alone")
+    func storesOnTwoAxesAreServedAlone() {
+        // Read on its own shift, 6-7 s lands on 1-2 s, beside 一: on one axis they would not meet.
+        let english = store([(6.0, 7.0, "One")])
+        english.setShiftSeconds(5)
+        let provider = provider([store([(1.0, 2.0, "一")]), english])
+        provider.setNativeSubtitleCompanion(ordinal: 1, combine: Self.join)
+        let vtt = provider.nativeSubtitleVTT(ordinal: 0, segmentIndex: 0)
+        #expect(vtt?.contains("一") == true && vtt?.contains("One") == false)
     }
 
     /// An ordinal past the renditions is no companion.
