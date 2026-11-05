@@ -820,6 +820,13 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// Sodalite#32 Phase 2: tap-fed stores can carry raw ASS event lines (the overlay renders the
     /// styling); the WebVTT rendition must serve plain text, so strip at build time.
     private let stripASSMarkupInVTT: Bool
+    /// The host's second line in the native renditions (`AetherEngine.setNativeSubtitleCompanion`): the
+    /// ordinal whose cues join every other rendition's, through the host's `combine`. nil: off.
+    private var nativeSubtitleCompanion: (ordinal: Int, combine: NativeSubtitleCombine)?
+    private let companionLock = NSLock()
+    /// How far around a segment's window the companion's pairing looks, so a cue crossing the window's edge
+    /// is paired the same in both segments that serve it.
+    static let companionMargin = 15.0
 
     /// Synchronous teardown + relaunch at the given absolute segment index.
     private let restartHandler: ((Int) -> Void)?
@@ -3261,7 +3268,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             // engine shift (read now, not the possibly-zero load-time value) so cues land on the video's axis.
             let shift = currentShiftSeconds()
             store.setShiftSeconds(shift)
-            let cues = stripMarkupIfNeeded(store.allCues())
+            let cues = withCompanion(stripMarkupIfNeeded(store.allCues()), ordinal: ordinal, window: nil)
             EngineLog.emit("[HLSVideoEngine] whole-program subtitle .vtt ord=\(ordinal) cues=\(cues.count) finished=\(store.isFinished) shift=\(String(format: "%.2f", shift)) first=\(cues.first.map { String(format: "%.1f", $0.start) } ?? "-") last=\(cues.last.map { String(format: "%.1f", $0.end) } ?? "-")", category: .hlsServer)
             // PLAIN WebVTT, NO X-TIMESTAMP-MAP (matches the proven-working whole-file sideload). With the map,
             // AVKit anchors cues to the fMP4 sample PTS (which diverges from currentTime over our loopback) and
@@ -3282,6 +3289,18 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         // that never finishes serialized the loopback connection AVPlayer also uses for video (device:
         // scrubbing wedged while a rendition was selected). Wait only while the reader is plausibly about to
         // cover THIS window (read head within the horizon, or still warming up), and only briefly.
+        Self.waitForCoverage(store, end: end)
+        let cues = withCompanion(stripMarkupIfNeeded(store.cuesInWindow(start: start, end: end)), ordinal: ordinal,
+                                 window: (start, end))
+        EngineLog.emit("[HLSVideoEngine] subtitle .vtt ord=\(ordinal) seg=\(segmentIndex) win=[\(String(format: "%.1f", start)),\(String(format: "%.1f", end))) inWin=\(cues.count) readMax=\(String(format: "%.1f", store.readMaxCueEnd()))", category: .hlsServer, level: .verbose)
+        // Absolute media-timeline cue times + MPEGTS:0 identity map. Flip to segment-relative here (one line:
+        // relativeToStart: true) if on-device PiP shows subtitles shifted by the segment start. See WebVTTBuilder.segment.
+        return WebVTTBuilder.segment(cues: cues, segmentStart: start)
+    }
+
+    /// Waits, briefly, while `store`'s reader is plausibly about to cover a window ending at `end` (the comment
+    /// at its use in `nativeSubtitleVTT`).
+    static func waitForCoverage(_ store: NativeSubtitleCueStore, end: Double) {
         let horizonSeconds = 30.0
         let deadline = Date().addingTimeInterval(3.0)
         while !store.isFinished,
@@ -3290,11 +3309,40 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
               Date() < deadline {
             usleep(100_000)
         }
-        let cues = stripMarkupIfNeeded(store.cuesInWindow(start: start, end: end))
-        EngineLog.emit("[HLSVideoEngine] subtitle .vtt ord=\(ordinal) seg=\(segmentIndex) win=[\(String(format: "%.1f", start)),\(String(format: "%.1f", end))) inWin=\(cues.count) readMax=\(String(format: "%.1f", store.readMaxCueEnd()))", category: .hlsServer, level: .verbose)
-        // Absolute media-timeline cue times + MPEGTS:0 identity map. Flip to segment-relative here (one line:
-        // relativeToStart: true) if on-device PiP shows subtitles shifted by the segment start. See WebVTTBuilder.segment.
-        return WebVTTBuilder.segment(cues: cues, segmentStart: start)
+    }
+
+    /// The host's second line (`AetherEngine.setNativeSubtitleCompanion`).
+    func setNativeSubtitleCompanion(ordinal: Int?, combine: NativeSubtitleCombine?) {
+        companionLock.lock()
+        nativeSubtitleCompanion = ordinal.flatMap { ordinal in combine.map { (ordinal, $0) } }
+        companionLock.unlock()
+    }
+
+    /// `cues` (rendition `ordinal`'s, for `window`, or the whole program when nil) with the companion's lines
+    /// in them, as the host combines the two: the companion's own rendition and any other with no companion
+    /// set are served as they are. Both sides are read `companionMargin` around the window and plain, and
+    /// what the host makes is cut back to the cues overlapping it. The companion's store is waited on the way
+    /// the rendition's own is (`waitForCoverage`).
+    private func withCompanion(_ cues: [(start: Double, end: Double, text: String)], ordinal: Int,
+                               window: (start: Double, end: Double)?) -> [(start: Double, end: Double, text: String)] {
+        companionLock.lock()
+        let companion = nativeSubtitleCompanion
+        companionLock.unlock()
+        guard let companion, companion.ordinal != ordinal, companion.ordinal >= 0,
+              companion.ordinal < nativeSubStores.count, ordinal < nativeSubStores.count else { return cues }
+        let other = nativeSubStores[companion.ordinal]
+        guard let window else {
+            let deadline = Date().addingTimeInterval(30.0)
+            while !other.isFinished, Date() < deadline { usleep(100_000) }
+            return companion.combine(cues, stripMarkupIfNeeded(other.allCues())).sorted { $0.start < $1.start }
+        }
+        Self.waitForCoverage(other, end: window.end)
+        let margin = Self.companionMargin
+        let firsts = stripMarkupIfNeeded(nativeSubStores[ordinal].cuesInWindow(start: window.start - margin,
+                                                                               end: window.end + margin))
+        let seconds = stripMarkupIfNeeded(other.cuesInWindow(start: window.start - margin, end: window.end + margin))
+        return companion.combine(firsts, seconds).filter { $0.end > window.start && $0.start < window.end }
+            .sorted { $0.start < $1.start }
     }
 
     /// Sodalite#32 Phase 2: see `stripASSMarkupInVTT`.

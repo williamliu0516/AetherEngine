@@ -2484,6 +2484,37 @@ extension AetherEngine {
         remoteHLSSubtitleProxy?.provider?.setText(nativeSubtitleTextTransform)
     }
 
+    /// Serve a second track's lines inside the native renditions, for a host that wants two subtitle lines where
+    /// the system draws the rendition and nothing of the host's shows over the picture (Vision Pro's expanded and
+    /// docked player). Each text rendition other than `track`'s own is served as `combine(first, second)`: its cues
+    /// and `track`'s, for the segment's window and a margin around it, both plain text, on the AVPlayer axis, with
+    /// the host's timing and text rewrite applied; what it returns is served, cut back to the window. The host
+    /// pairs the lines (one cue whose text carries both, or a second cue of its own), so the rule is the host's.
+    /// `track` is an engine subtitle track id (embedded or declared sidecar) with a native rendition; nil, or a
+    /// nil `combine`, turns it off (the default). Kept across loads like `setNativeSubtitleText`, the track
+    /// looked up in each load's renditions; a change made while a rendition is shown is replayed through the
+    /// selection. `combine` runs on the loopback server's thread for each window served: keep it quick and free
+    /// of the main actor. Not for a remote HLS origin's injected renditions. The host's overlay, `subtitleCues`
+    /// and `secondarySubtitleCues` are not affected.
+    public func setNativeSubtitleCompanion(track: Int?, combine: NativeSubtitleCombine?) {
+        nativeSubtitleCompanionTrack = combine == nil ? nil : track
+        nativeSubtitleCompanionCombine = track == nil ? nil : combine
+        applyNativeSubtitleCompanion()
+        EngineLog.emit("[AetherEngine] native subtitle companion track=\(nativeSubtitleCompanionTrack.map(String.init) ?? "-")",
+                       category: .engine)
+        if nativeSubtitleRenderingRequested, let ordinal = nativeSubtitleReapplyOrdinal {
+            setNativeSubtitleSelected(track: ordinal)
+        }
+    }
+
+    /// Hands the host's companion to the session's provider, as this load's rendition ordinal.
+    func applyNativeSubtitleCompanion() {
+        let ordinal = nativeSubtitleCompanionTrack.flatMap {
+            Self.nativeSubtitleOrdinal(forActiveTrack: $0, in: nativeSubtitleTrackTable)
+        }
+        nativeVideoSession?.provider?.setNativeSubtitleCompanion(ordinal: ordinal, combine: nativeSubtitleCompanionCombine)
+    }
+
     // MARK: - Session-preserving reload carryover (#170)
 
     /// True when `nativeSubtitleReapplyOrdinal` equals the active track's mapping through the

@@ -3765,6 +3765,9 @@ public final class AetherEngine: ObservableObject {
 
     /// `setNativeSubtitleText`: the host's rewrite of every native rendition's text, kept across loads.
     var nativeSubtitleTextTransform: (@Sendable (_ text: String, _ language: String?) -> String)?
+    /// `setNativeSubtitleCompanion`: the track whose lines join the native renditions, and how; kept across loads.
+    var nativeSubtitleCompanionTrack: Int?
+    var nativeSubtitleCompanionCombine: NativeSubtitleCombine?
 
     /// AE#464 round 2: the position the load currently in flight was handed, parked across the window
     /// in which `load` has already zeroed the clock but the rebuilt session has not reached it yet.

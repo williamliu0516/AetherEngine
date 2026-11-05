@@ -14,6 +14,12 @@ public struct NativeSubtitleTrack: Sendable, Equatable {
     }
 }
 
+/// How a host joins a second track's lines to a native rendition's (`AetherEngine.setNativeSubtitleCompanion`): the
+/// rendition's cues and the second track's, each `(start, end, text)` on the AVPlayer axis, in; the cues to serve out.
+public typealias NativeSubtitleCombine = @Sendable (
+    _ first: [(start: Double, end: Double, text: String)], _ second: [(start: Double, end: Double, text: String)]
+) -> [(start: Double, end: Double, text: String)]
+
 /// Sole owner of the decoded-cue array backing the native mov_text track (#55). Text `SubtitleCue`s only, never packet data, so footprint is bounded by cue count (leak guard). Producer drains `cuesInWindow` per segment cut to build mov_text samples on the AVPlayer axis.
 final class NativeSubtitleCueStore: @unchecked Sendable {
     private let lock = NSLock()
