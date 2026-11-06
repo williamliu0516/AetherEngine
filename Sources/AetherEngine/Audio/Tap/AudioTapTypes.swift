@@ -42,22 +42,19 @@ enum AudioTapPacing {
         case reanchor     // playhead moved away; jump to the playhead's segment
     }
 
-    /// `previousPlayhead`: the playhead at the reader's last step. Decoded further ahead than lead + tolerance is a
-    /// backward seek only when the playhead moved back since then: decoding one segment routinely carries the reader
-    /// past lead + tolerance (6 s segments from a paused playhead at 3 s end 15 s ahead), and re-anchoring on that
-    /// alone sent it back to the playhead's segment to decode the same seconds again, without end while paused and
-    /// again and again while playing (Zool's paused film: the tap's thread at 165 ms a second and its consumer
-    /// classifying the same audio at 888 ms, 2026-11-05). Nil: unknown, any lead past the tolerance counts as a seek,
-    /// as before.
-    static func decide(lastDecodedEndPTS: Double?, playhead: Double, previousPlayhead: Double? = nil,
+    /// By the stretch the reader holds, `readStart` (where it anchored: the start of the first segment it decoded
+    /// there) to `lastDecodedEndPTS`: the playhead outside it, by more than the tolerance either way, is a seek and
+    /// re-anchors at the playhead; inside it, the reader decodes on while it is less than `leadSeconds` ahead, else
+    /// sleeps. It judged by the lead alone, and went back to the playhead's segment whenever it stood more than lead +
+    /// tolerance ahead, which decoding one segment routinely carries it to (6 s segments from a paused playhead at 3 s
+    /// end 15 s ahead): it decoded the same seconds again without end while paused, and over and over while playing
+    /// (Zool's paused film, 2026-11-05: the tap's thread at 165 ms a second, its consumer classifying the same audio at
+    /// 888 ms). A playhead moved back in any number of small steps, or by one large one at any point, is outside the
+    /// stretch once it is before its start. Nothing decoded yet (`lastDecodedEndPTS` or `readStart` nil): decode.
+    static func decide(readStart: Double?, lastDecodedEndPTS: Double?, playhead: Double,
                        leadSeconds: Double, toleranceSeconds: Double) -> Decision {
-        guard let last = lastDecodedEndPTS else { return .decodeNext }
-        if last < playhead - toleranceSeconds { return .reanchor }
-        if last - playhead > leadSeconds + toleranceSeconds {
-            let movedBack = previousPlayhead.map { playhead < $0 - toleranceSeconds } ?? true
-            return movedBack ? .reanchor : .sleep
-        }
-        if last - playhead >= leadSeconds { return .sleep }
-        return .decodeNext
+        guard let last = lastDecodedEndPTS, let start = readStart else { return .decodeNext }
+        if playhead < start - toleranceSeconds || playhead > last + toleranceSeconds { return .reanchor }
+        return last - playhead < leadSeconds ? .decodeNext : .sleep
     }
 }

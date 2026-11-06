@@ -43,8 +43,8 @@ final class LoopbackAudioReader: @unchecked Sendable {
     private var lastDecodedEndPTS: Double?
     private var pendingDiscontinuity = true
     private var missStreak = 0
-    /// The playhead at the last step, for the pacing to tell a backward seek from decoding past the lead.
-    private var lastPlayhead: Double?
+    /// Where the stretch it holds starts: the first chunk decoded since it anchored (`AudioTapPacing.decide`).
+    private var readStart: Double?
 
     init(deps: Dependencies) {
         self.deps = deps
@@ -81,11 +81,8 @@ final class LoopbackAudioReader: @unchecked Sendable {
     /// One loop iteration. Internal (not private) so tests drive it directly.
     func runOnce() -> StepResult {
         let playhead = deps.playhead() ?? 0
-        let previous = lastPlayhead ?? playhead
-        lastPlayhead = playhead
 
-        switch AudioTapPacing.decide(lastDecodedEndPTS: lastDecodedEndPTS, playhead: playhead,
-                                     previousPlayhead: previous,
+        switch AudioTapPacing.decide(readStart: readStart, lastDecodedEndPTS: lastDecodedEndPTS, playhead: playhead,
                                      leadSeconds: AudioTapDefaults.leadSeconds,
                                      toleranceSeconds: AudioTapDefaults.toleranceSeconds) {
         case .sleep:
@@ -93,6 +90,7 @@ final class LoopbackAudioReader: @unchecked Sendable {
         case .reanchor:
             nextIndex = deps.anchorIndex(playhead)
             lastDecodedEndPTS = nil
+            readStart = nil
             pendingDiscontinuity = true
             missStreak = 0
             return .reanchored
@@ -132,6 +130,7 @@ final class LoopbackAudioReader: @unchecked Sendable {
         }
 
         let shift = deps.shiftSeconds()
+        if readStart == nil { readStart = chunks[0].ptsSeconds }
         for chunk in chunks {
             deps.emit(AudioTapBuffer(buffer: chunk.buffer,
                                      sourceTime: chunk.ptsSeconds + shift,

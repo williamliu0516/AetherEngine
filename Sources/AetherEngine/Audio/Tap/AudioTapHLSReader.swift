@@ -32,8 +32,8 @@ final class AudioTapHLSReader: @unchecked Sendable {
     private var tracker = HLSPlaylistTracker()
     private var nextIndex: Int?
     private var lastDecodedEndPTS: Double?
-    /// The playhead at the last VOD step (`AudioTapPacing.decide`'s `previousPlayhead`).
-    private var lastPlayhead: Double?
+    /// Where the stretch it holds starts: the first chunk emitted since it anchored (`AudioTapPacing.decide`).
+    private var readStart: Double?
     private var pendingDiscontinuity = true
 
     init(deps: Dependencies) { self.deps = deps }
@@ -78,10 +78,7 @@ final class AudioTapHLSReader: @unchecked Sendable {
     func stepVOD() async -> StepResult {
         guard let media = playlist else { return .finished }
         let playhead = deps.playhead() ?? 0
-        let previous = lastPlayhead ?? playhead
-        lastPlayhead = playhead
-        switch AudioTapPacing.decide(lastDecodedEndPTS: lastDecodedEndPTS, playhead: playhead,
-                                     previousPlayhead: previous,
+        switch AudioTapPacing.decide(readStart: readStart, lastDecodedEndPTS: lastDecodedEndPTS, playhead: playhead,
                                      leadSeconds: AudioTapDefaults.leadSeconds,
                                      toleranceSeconds: AudioTapDefaults.toleranceSeconds) {
         case .sleep:
@@ -89,6 +86,7 @@ final class AudioTapHLSReader: @unchecked Sendable {
         case .reanchor:
             nextIndex = VideoSegmentProvider.segmentIndex(forPlaylistTime: playhead, durations: durations)
             lastDecodedEndPTS = nil
+            readStart = nil
             pendingDiscontinuity = true
             return .reanchored
         case .decodeNext:
@@ -137,6 +135,7 @@ final class AudioTapHLSReader: @unchecked Sendable {
     /// from lastDecodedEndPTS so seams abut (the monotonic filter trims priming overlaps).
     private func emit(chunks: [AudioTapChunk], segmentStart: Double) {
         var cursor = pendingDiscontinuity ? segmentStart : (lastDecodedEndPTS ?? segmentStart)
+        if readStart == nil { readStart = cursor }
         for chunk in chunks {
             deps.emit(AudioTapBuffer(buffer: chunk.buffer, sourceTime: cursor, discontinuity: pendingDiscontinuity))
             pendingDiscontinuity = false

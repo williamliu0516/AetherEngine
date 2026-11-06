@@ -15,6 +15,9 @@ final class LoopbackAudioReaderTests: XCTestCase {
         var decoded: [Int] = []              // one entry per decode call
         var emitted: [AudioTapBuffer] = []
         var segmentSeconds: Double = 1.0
+        /// Each decoded chunk at its segment's own place and as long as it (index × segmentSeconds), not at the
+        /// decode count's 1 s steps: for the seeks.
+        var ptsByIndex = false
     }
 
     private func makeReader(_ w: World) -> LoopbackAudioReader {
@@ -23,14 +26,15 @@ final class LoopbackAudioReaderTests: XCTestCase {
             shiftSeconds: { w.shift },
             anchorIndex: { Int($0 / w.segmentSeconds) },
             initData: { _ in Data([0]) },
-            segmentData: { w.segments.contains($0) ? Data([1]) : nil },
+            segmentData: { w.segments.contains($0) ? Data([UInt8(truncatingIfNeeded: $0)]) : nil },
             highestStoredIndex: { w.highestStored },
-            decodeSegment: { _, _ in
+            decodeSegment: { _, seg in
                 w.decoded.append(w.decoded.count)
-                let idx = Double(w.decoded.count - 1)
+                let idx = w.ptsByIndex ? Double(seg[0]) : Double(w.decoded.count - 1)
+                let frames = AVAudioFrameCount(w.ptsByIndex ? w.segmentSeconds * 48_000 : 48_000)
                 let buf = AVAudioPCMBuffer(pcmFormat: AetherEngine.audioTapFormat,
-                                           frameCapacity: 48_000)!
-                buf.frameLength = 48_000
+                                           frameCapacity: frames)!
+                buf.frameLength = frames
                 return [AudioTapChunk(buffer: buf, ptsSeconds: idx * w.segmentSeconds)]
             },
             emit: { w.emitted.append($0) }
@@ -106,5 +110,47 @@ final class LoopbackAudioReaderTests: XCTestCase {
         XCTAssertEqual(w.decoded.count, 3)
         XCTAssertFalse(results.contains(.reanchored))
         XCTAssertEqual(results.suffix(37), Array(repeating: .slept, count: 37))
+    }
+
+    /// Paused at 100 s with the lead decoded, then scrubbed back a second at a time to 0: the reader goes back each
+    /// time the playhead is before what it holds, and ends up decoding from 0, its first buffer there a discontinuity
+    /// (Codex's review of 7438e058: judged by the playhead's last step, small steps never re-anchored).
+    func testScrubbingBackInSmallStepsReachesThePlayhead() {
+        let w = World()
+        w.ptsByIndex = true
+        w.segmentSeconds = 2
+        w.playhead = 100
+        w.segments = Set(0...200); w.highestStored = 200
+        let reader = makeReader(w)
+        for _ in 0..<8 { _ = reader.runOnce() }
+        XCTAssertEqual(reader.runOnce(), .slept)               // 100-110 s held
+        var results: [LoopbackAudioReader.StepResult] = []
+        for second in stride(from: 99.0, through: 0, by: -1) {
+            w.playhead = second
+            results.append(reader.runOnce())
+        }
+        for _ in 0..<12 { results.append(reader.runOnce()) }
+        XCTAssertTrue(results.contains(.reanchored))
+        let atStart = w.emitted.last { $0.sourceTime == 0 }
+        XCTAssertNotNil(atStart)
+        XCTAssertTrue(atStart?.discontinuity ?? false)
+        XCTAssertEqual(reader.runOnce(), .slept)
+    }
+
+    /// One seek back from 100 s to 20 s right after the first segment, the reader nowhere near its lead yet: it goes
+    /// back at once.
+    func testABigSeekBackBeforeTheLeadIsDecodedReanchors() {
+        let w = World()
+        w.ptsByIndex = true
+        w.segmentSeconds = 2
+        w.playhead = 100
+        w.segments = Set(0...200); w.highestStored = 200
+        let reader = makeReader(w)
+        XCTAssertEqual(reader.runOnce(), .decoded)            // 100-102 s
+        w.playhead = 20
+        XCTAssertEqual(reader.runOnce(), .reanchored)
+        XCTAssertEqual(reader.runOnce(), .decoded)
+        XCTAssertEqual(w.emitted.last?.sourceTime ?? -1, 20, accuracy: 0.001)
+        XCTAssertTrue(w.emitted.last?.discontinuity ?? false)
     }
 }
