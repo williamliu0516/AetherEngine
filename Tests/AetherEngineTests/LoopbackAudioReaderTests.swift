@@ -90,4 +90,21 @@ final class LoopbackAudioReaderTests: XCTestCase {
         XCTAssertEqual(reader.runOnce(), .decoded)
         XCTAssertTrue(w.emitted.last!.discontinuity)
     }
+
+    /// A paused playhead with segments long enough to carry the reader past lead + tolerance: it decodes up to the
+    /// lead once and then sleeps, never going back to decode the same seconds again (Zool's paused film, 2026-11-05:
+    /// the tap decoding and its consumer classifying the same three segments without end).
+    func testAFixedPlayheadSettlesToSleepAfterOvershootingTheLead() {
+        let w = World()
+        w.segmentSeconds = 8
+        w.playhead = 3
+        w.segments = Set(0...30); w.highestStored = 30
+        let reader = makeReader(w)
+        var results: [LoopbackAudioReader.StepResult] = []
+        for _ in 0..<40 { results.append(reader.runOnce()) }
+        // Decoded at 0, 8 and 16 s (the last ending 14 s ahead of the playhead), then asleep for good.
+        XCTAssertEqual(w.decoded.count, 3)
+        XCTAssertFalse(results.contains(.reanchored))
+        XCTAssertEqual(results.suffix(37), Array(repeating: .slept, count: 37))
+    }
 }

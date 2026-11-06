@@ -32,6 +32,8 @@ final class AudioTapHLSReader: @unchecked Sendable {
     private var tracker = HLSPlaylistTracker()
     private var nextIndex: Int?
     private var lastDecodedEndPTS: Double?
+    /// The playhead at the last VOD step (`AudioTapPacing.decide`'s `previousPlayhead`).
+    private var lastPlayhead: Double?
     private var pendingDiscontinuity = true
 
     init(deps: Dependencies) { self.deps = deps }
@@ -76,7 +78,10 @@ final class AudioTapHLSReader: @unchecked Sendable {
     func stepVOD() async -> StepResult {
         guard let media = playlist else { return .finished }
         let playhead = deps.playhead() ?? 0
+        let previous = lastPlayhead ?? playhead
+        lastPlayhead = playhead
         switch AudioTapPacing.decide(lastDecodedEndPTS: lastDecodedEndPTS, playhead: playhead,
+                                     previousPlayhead: previous,
                                      leadSeconds: AudioTapDefaults.leadSeconds,
                                      toleranceSeconds: AudioTapDefaults.toleranceSeconds) {
         case .sleep:

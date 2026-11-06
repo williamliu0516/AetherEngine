@@ -43,6 +43,8 @@ final class LoopbackAudioReader: @unchecked Sendable {
     private var lastDecodedEndPTS: Double?
     private var pendingDiscontinuity = true
     private var missStreak = 0
+    /// The playhead at the last step, for the pacing to tell a backward seek from decoding past the lead.
+    private var lastPlayhead: Double?
 
     init(deps: Dependencies) {
         self.deps = deps
@@ -79,8 +81,11 @@ final class LoopbackAudioReader: @unchecked Sendable {
     /// One loop iteration. Internal (not private) so tests drive it directly.
     func runOnce() -> StepResult {
         let playhead = deps.playhead() ?? 0
+        let previous = lastPlayhead ?? playhead
+        lastPlayhead = playhead
 
         switch AudioTapPacing.decide(lastDecodedEndPTS: lastDecodedEndPTS, playhead: playhead,
+                                     previousPlayhead: previous,
                                      leadSeconds: AudioTapDefaults.leadSeconds,
                                      toleranceSeconds: AudioTapDefaults.toleranceSeconds) {
         case .sleep:

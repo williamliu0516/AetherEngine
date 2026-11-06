@@ -42,4 +42,22 @@ final class AudioTapPacingTests: XCTestCase {
         XCTAssertEqual(decide(300.0, 100.0), .reanchor)
         XCTAssertEqual(decide(112.5, 100.0), .reanchor)     // > lead + tolerance
     }
+
+    // Decoding past the lead with the playhead where it was is no seek (Zool's paused film, 2026-11-05).
+    func testDecodedPastTheLeadWithTheSamePlayheadSleeps() {
+        XCTAssertEqual(AudioTapPacing.decide(lastDecodedEndPTS: 18, playhead: 3, previousPlayhead: 3,
+                                             leadSeconds: 10, toleranceSeconds: 2), .sleep)
+        XCTAssertEqual(AudioTapPacing.decide(lastDecodedEndPTS: 118, playhead: 103.4, previousPlayhead: 103,
+                                             leadSeconds: 10, toleranceSeconds: 2), .sleep)
+    }
+
+    func testThePlayheadMovingBackStillReanchors() {
+        XCTAssertEqual(AudioTapPacing.decide(lastDecodedEndPTS: 60, playhead: 10, previousPlayhead: 50,
+                                             leadSeconds: 10, toleranceSeconds: 2), .reanchor)
+    }
+
+    func testFallingBehindReanchorsWhateverThePlayheadDid() {
+        XCTAssertEqual(AudioTapPacing.decide(lastDecodedEndPTS: 100, playhead: 300, previousPlayhead: 300,
+                                             leadSeconds: 10, toleranceSeconds: 2), .reanchor)
+    }
 }
