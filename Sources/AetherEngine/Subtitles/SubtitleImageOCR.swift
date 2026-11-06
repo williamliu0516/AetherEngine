@@ -2,8 +2,8 @@ import CoreGraphics
 import Foundation
 import Vision
 
-/// Phase D: on-device recognition of bitmap subtitle images (PGS / DVB / DVD) into plain-text
-/// cues for the native WebVTT rendition (PiP / AirPlay / external display). Lossy by design;
+/// On-device recognition of bitmap subtitle images (PGS / DVB / DVD), shared by the host's translated second line
+/// and the native WebVTT rendition (PiP / AirPlay / external display). Lossy by design;
 /// a failed or empty recognition drops that cue and the rendition just misses the line, the
 /// fullscreen overlay keeps the pixel-accurate bitmaps.
 enum SubtitleImageOCR {
@@ -36,12 +36,31 @@ enum SubtitleImageOCR {
     /// Track tags are ISO 639-1/2 ("ger"), Vision wants BCP-47 primary codes ("de"). The engine's
     /// synonym classes resolve the bibliographic 639-2/B forms Foundation cannot ("ger", "fre").
     nonisolated static func recognitionLanguage(forTrackLanguage tag: String?) -> String? {
-        guard let raw = tag?.trimmingCharacters(in: .whitespaces).lowercased(), !raw.isEmpty else { return nil }
-        if let set = AetherEngine.languageSynonyms.first(where: { $0.contains(raw) }),
+        guard let raw = tag?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().replacingOccurrences(of: "_", with: "-"),
+              !raw.isEmpty else { return nil }
+        let parts = raw.split(separator: "-").map(String.init)
+        guard let base = parts.first else { return nil }
+        let language: String
+        if let set = AetherEngine.languageSynonyms.first(where: { $0.contains(base) }),
            let twoLetter = set.first(where: { $0.count == 2 }) {
-            return twoLetter
+            language = twoLetter
+        } else {
+            language = Locale.LanguageCode(base).identifier(.alpha2) ?? base
         }
-        return Locale.LanguageCode(raw).identifier(.alpha2) ?? raw
+        if language == "zh" {
+            if parts.contains("hant") || parts.contains("tw") || parts.contains("hk") || parts.contains("mo") {
+                return "zh-Hant"
+            }
+            if parts.contains("hans") || parts.contains("cn") || parts.contains("sg") { return "zh-Hans" }
+        }
+        return language
+    }
+
+    /// Exact script first; a model that only knows the other Chinese script runs unpinned.
+    nonisolated static func supportedLanguage(_ language: String, among supported: [String]) -> String? {
+        let wanted = language.lowercased()
+        return supported.first { $0.lowercased() == wanted }
+            ?? supported.first { $0.lowercased().hasPrefix(wanted + "-") }
     }
 
     /// Subtitle bitmaps are white glyphs with an outline on transparency; an opaque black
@@ -74,24 +93,28 @@ enum SubtitleImageOCR {
     /// `recognizeText`, once per picture: what a picture read (or that it read as nothing) is kept by its pixels and
     /// the language asked (`Readings`), so the native rendition and the host's translated second line
     /// (`AetherEngine.recognizedText(in:trackLanguage:)`), which ask for the same cues, recognise each once. A
-    /// cancelled call keeps nothing. `readings` nil reads every time.
+    /// call cancelled before admission keeps nothing. `readings` nil reads every time.
     /// A failed pass is not kept: the picture is read again when next asked. Nil when the call was cancelled before
     /// its turn.
     nonisolated static func read(
         _ image: CGImage, language: String?, readings: Readings? = SubtitleImageOCR.readings,
         recognition: @escaping @Sendable (CGImage, String?) -> Reading = recognizeReading
     ) async -> Reading? {
-        let key = readings == nil ? nil : Readings.Key(picture: fingerprint(image), language: language)
-        if let readings, let key, let kept = await readings.reading(key) { return kept.map(Reading.words) ?? .nothing }
-        guard let reading = await executor.run({ recognition(image, language) }) else { return nil }
-        if let readings, let key, reading != .failed, !Task.isCancelled { await readings.keep(reading.text, for: key) }
-        return reading
+        // Check and keep inside the one admitted operation: two simultaneous consumers used to both miss the
+        // cache before queueing, then recognise the same picture twice. Pixel hashing also stays off the main actor.
+        await executor.run {
+            let key = readings == nil ? nil : Readings.Key(picture: fingerprint(image), language: language)
+            if let readings, let key, let kept = readings.reading(key) { return kept.map(Reading.words) ?? .nothing }
+            let reading = recognition(image, language)
+            if let readings, let key, reading != .failed { readings.keep(reading.text, for: key) }
+            return reading
+        }
     }
 
-    /// The readings kept, text only (the pictures are not), the oldest let go past `capacity`.
     static let readings = Readings()
 
-    actor Readings {
+    /// Text only, protected because the recognition thread and tests may inspect it from different executors.
+    final class Readings: @unchecked Sendable {
         struct Key: Hashable, Sendable {
             let picture: Int
             let language: String?
@@ -104,20 +127,21 @@ enum SubtitleImageOCR {
         }
 
         static let capacity = 2_000
+        private let lock = NSLock()
         private var kept: [Key: String?] = [:]
         private var order: [Key] = []
 
-        /// The kept reading: `.some(nil)` for a picture that read as nothing, nil for one not read.
-        func reading(_ key: Key) -> String?? { kept[key] }
+        func reading(_ key: Key) -> String?? { lock.withLock { kept[key] } }
 
         func keep(_ text: String?, for key: Key) {
-            if kept.updateValue(text, forKey: key) == nil { order.append(key) }
-            if order.count > Self.capacity { kept.removeValue(forKey: order.removeFirst()) }
+            lock.withLock {
+                if kept.updateValue(text, forKey: key) == nil { order.append(key) }
+                if order.count > Self.capacity { kept.removeValue(forKey: order.removeFirst()) }
+            }
         }
 
         func removeAll() {
-            kept = [:]
-            order = []
+            lock.withLock { kept = [:]; order = [] }
         }
     }
 
@@ -136,6 +160,11 @@ enum SubtitleImageOCR {
         hasher.combine(image.bitmapInfo.rawValue)
         hasher.combine(image.alphaInfo.rawValue)
         hasher.combine(image.colorSpace?.name as String?)
+        if let space = image.colorSpace, let profile = space.copyICCData() { hasher.combine(profile as Data) }
+        if let decode = image.decode {
+            let count = (image.colorSpace?.numberOfComponents ?? 0) * 2
+            for i in 0..<count { hasher.combine(decode[i]) }
+        }
         hasher.combine(bytes: UnsafeRawBufferPointer(start: CFDataGetBytePtr(data), count: CFDataGetLength(data)))
         return hasher.finalize()
     }
@@ -173,13 +202,89 @@ enum SubtitleImageOCR {
 
     /// `recognizeSynchronously`, saying a failed pass from one that read nothing.
     nonisolated static func recognizeReading(_ image: CGImage, language: String?) -> Reading {
-        guard let flat = flattenedOntoBlack(image) else { return .failed }
-        if !accurateIsUnavailable, let observations = recognize(flat, at: .accurate, language: language) {
+        recognizeReading(image, language: language) { image in
+            if !accurateIsUnavailable, let observations = recognize(image, at: .accurate, language: language) {
+                return assembleLines(observations).map(Reading.words) ?? .nothing
+            }
+            markAccurateUnavailable()
+            guard let observations = recognize(image, at: .fast, language: language) else { return .failed }
             return assembleLines(observations).map(Reading.words) ?? .nothing
         }
-        markAccurateUnavailable()
-        guard let observations = recognize(flat, at: .fast, language: language) else { return .failed }
-        return assembleLines(observations).map(Reading.words) ?? .nothing
+    }
+
+    /// Contrast fallback is only for a successful pass that read nothing, never a good reading or a failed request.
+    nonisolated static func recognizeReading(_ image: CGImage, language: String?, pass: (CGImage) -> Reading) -> Reading {
+        guard let prepared = preparedImage(image), let flat = flattenedOntoBlack(prepared) else { return .failed }
+        let first = pass(flat)
+        guard first == .nothing, let fallback = thresholdedInversion(flat) else { return first }
+        return pass(fallback)
+    }
+
+    /// Scan a bounded RGBA rendition for its alpha bounds, keeping every rectangle's relative place. The input may
+    /// be an entire PGS canvas with two distant signs; never concatenate independently cropped rectangles.
+    nonisolated static func alphaBounds(_ image: CGImage, margin: Int = 4) -> CGRect? {
+        let w = image.width, h = image.height
+        guard w > 0, h > 0, w <= 4096, h <= 4096, w * h <= 4_194_304,
+              let ctx = rgbaContext(width: w, height: h), let data = ctx.data else { return nil }
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        let bytes = data.assumingMemoryBound(to: UInt8.self)
+        var left = w, top = h, right = -1, bottom = -1
+        for y in 0..<h {
+            for x in 0..<w where bytes[y * ctx.bytesPerRow + x * 4 + 3] > 0 {
+                left = min(left, x); right = max(right, x)
+                top = min(top, y); bottom = max(bottom, y)
+            }
+        }
+        guard right >= left else { return nil }
+        let pad = max(0, margin)
+        left = max(0, left - pad); top = max(0, top - pad)
+        right = min(w - 1, right + pad); bottom = min(h - 1, bottom + pad)
+        return CGRect(x: left, y: top, width: right - left + 1, height: bottom - top + 1)
+    }
+
+    nonisolated static func preparedImage(_ image: CGImage) -> CGImage? {
+        let w = CGFloat(image.width), h = CGFloat(image.height)
+        guard w > 0, h > 0 else { return nil }
+        let cap = min(1, 4096 / max(w, h), sqrt(4_194_304 / (w * h)))
+        guard let bounded = resized(image, scale: cap) else { return nil }
+        let bounds = alphaBounds(bounded) ?? CGRect(x: 0, y: 0, width: bounded.width, height: bounded.height)
+        guard let cropped = bounded.cropping(to: bounds) else { return nil }
+        let width = CGFloat(cropped.width), height = CGFloat(cropped.height)
+        let scale = min(3, max(1, 64 / height), 2048 / width, 512 / height)
+        return resized(cropped, scale: scale)
+    }
+
+    private nonisolated static func rgbaContext(width: Int, height: Int) -> CGContext? {
+        CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4,
+                  space: CGColorSpaceCreateDeviceRGB(),
+                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue)
+    }
+
+    private nonisolated static func resized(_ image: CGImage, scale: CGFloat) -> CGImage? {
+        if scale == 1 { return image }
+        let w = max(1, Int((CGFloat(image.width) * scale).rounded(.down)))
+        let h = max(1, Int((CGFloat(image.height) * scale).rounded(.down)))
+        guard let ctx = rgbaContext(width: w, height: h) else { return nil }
+        ctx.interpolationQuality = .high
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return ctx.makeImage()
+    }
+
+    /// White glyphs on black become dark glyphs on white. Kept as a second pass: thresholding erases fine strokes.
+    private nonisolated static func thresholdedInversion(_ image: CGImage) -> CGImage? {
+        let w = image.width, h = image.height
+        guard let ctx = rgbaContext(width: w, height: h), let data = ctx.data else { return nil }
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        let bytes = data.assumingMemoryBound(to: UInt8.self)
+        for y in 0..<h {
+            for x in 0..<w {
+                let i = y * ctx.bytesPerRow + x * 4
+                let light = (Int(bytes[i]) * 54 + Int(bytes[i + 1]) * 183 + Int(bytes[i + 2]) * 19) / 256
+                let value: UInt8 = light >= 96 ? 0 : 255
+                bytes[i] = value; bytes[i + 1] = value; bytes[i + 2] = value; bytes[i + 3] = 255
+            }
+        }
+        return ctx.makeImage()
     }
 
     /// nil when the REQUEST failed, which is what the fallback turns on. An empty array is a
@@ -197,11 +302,10 @@ enum SubtitleImageOCR {
         request.usesLanguageCorrection = true
         if let language,
            let supported = try? request.supportedRecognitionLanguages(),
-           let match = supported.first(where: {
-               let s = $0.lowercased()
-               return s == language || s.hasPrefix(language + "-")
-           }) {
+           let match = supportedLanguage(language, among: supported) {
             request.recognitionLanguages = [match]
+        } else {
+            request.automaticallyDetectsLanguage = true
         }
         do {
             try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
@@ -280,6 +384,7 @@ enum SubtitleImageOCR {
                     return true
                 }
                 return await withCheckedContinuation {
+                    guard waiting.count < 64 else { $0.resume(returning: false); return }
                     waiting.append(Waiter(id: id, continuation: $0))
                 }
             } onCancel: {

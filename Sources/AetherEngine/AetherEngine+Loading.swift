@@ -644,8 +644,8 @@ extension AetherEngine {
         detachRemoteHLSCueClock()
         // Item time until a line says otherwise, and for the whole session without injected renditions.
         clock.sourceTimeFollowsPicture = false
-        guard let provider = remoteHLSSubtitleProxy?.provider,
-              let item = host.currentPlayerItem else { return }
+        guard let item = host.currentPlayerItem else { return }
+        let provider = remoteHLSSubtitleProxy?.provider
         remoteHLSCueClock = RemoteHLSCueClockObserver(
             item: item, provider: provider,
             onOffset: { [weak self] offset in
@@ -659,10 +659,17 @@ extension AetherEngine {
             onTimeJump: { [weak self] in
                 guard let self, self.loadGeneration == expectedGeneration else { return }
                 self.clock.sourceTimeFollowsPicture = false
+                self.clearLegibleSubtitleCues()
+            },
+            onText: { [weak self] texts, itemTime, trackID in
+                guard let self, self.loadGeneration == expectedGeneration else { return }
+                self.receiveLegibleSubtitle(texts, at: itemTime - self.remoteHLSItemOffset,
+                                             trackID: trackID)
             })
     }
 
     func detachRemoteHLSCueClock() {
+        clearLegibleSubtitleCues()
         remoteHLSCueClock?.detach()
         remoteHLSCueClock = nil
         remoteHLSItemOffset = 0

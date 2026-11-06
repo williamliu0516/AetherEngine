@@ -1283,6 +1283,12 @@ public final class AetherEngine: ObservableObject {
     /// Decoded cues for the active subtitle source (sidecar or embedded side-demuxer). When
     /// `LoadOptions.prepareNativeSubtitles` is set, cues also flow into NativeSubtitleCueStore for mov_text injection (#55).
     @Published public internal(set) var subtitleCues: [SubtitleCue] = []
+
+    /// Selected remote AVPlayer rendition's plain words on the `sourceTime` axis, for host translation or search.
+    /// The system keeps rendering the original. A cue's end is unknown until the next output (including an empty
+    /// clear); the current cue uses infinity. Cleared on seek, selection and load; at most 128 recent cues retained.
+    @Published public internal(set) var legibleSubtitleCues: [SubtitleCue] = []
+    var legibleSubtitleSequence = 0
     /// #100: per-channel holdback for PGS cues arriving behind the playhead (catch-up bursts after
     /// side-reader starvation). Reset wherever the cue arrays reset (track switch, seek re-anchor,
     /// clear, load/stop) so a hold can never leak across subtitle sessions.
@@ -1410,7 +1416,11 @@ public final class AetherEngine: ObservableObject {
     /// Active primary embedded subtitle stream index (matches TrackInfo.id), or nil when subtitles are off or
     /// a sidecar (not an embedded track) is active. Mirrors `activeAudioTrackIndex` so a host picker reflects
     /// the track auto-selected by `LoadOptions.preferredSubtitleLanguages` (#73) as well as host `selectSubtitleTrack` calls.
-    @Published public internal(set) var activeSubtitleTrackIndex: Int?
+    @Published public internal(set) var activeSubtitleTrackIndex: Int? {
+        didSet {
+            if activeSubtitleTrackIndex != oldValue { clearLegibleSubtitleCues() }
+        }
+    }
 
     /// ASS script header ([Script Info] + [V4+ Styles] + [Events] Format line) for the primary sidecar, or nil.
     /// Populated when `LoadOptions.preserveASSMarkup` is set and the file is ASS/SSA; `subtitleCues` then carry
@@ -2525,8 +2535,8 @@ public final class AetherEngine: ObservableObject {
     /// every live source, every source without declared sidecars, and every refused rewrite.
     var remoteHLSSubtitleProxy: RemoteHLSSubtitleProxy.Prepared?
 
-    /// AE#616: measures how far AVPlayer's item time leads the presented frame on the bypass, off the
-    /// injected renditions. Nil whenever `remoteHLSSubtitleProxy` serves none.
+    /// The bypass item's selected subtitle text for the host, including origins without injected sidecars.
+    /// AE#616 also measures how far item time leads the presented frame when injected text supplies a reference.
     var remoteHLSCueClock: RemoteHLSCueClockObserver?
 
     /// AE#616: the last offset `remoteHLSCueClock` measured, subtracted from item time to publish

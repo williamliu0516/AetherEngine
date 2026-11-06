@@ -39,3 +39,29 @@ extension AetherEngine {
         return reading.text.map { .text($0) } ?? .unreadable
     }
 }
+
+extension AetherEngine {
+    func clearLegibleSubtitleCues() {
+        if !legibleSubtitleCues.isEmpty { legibleSubtitleCues = [] }
+    }
+
+    /// Legible output has presentation starts and clear events, not cue durations. Close the previous line when
+    /// its replacement/clear arrives; never guess a five-second lifetime or translate text from the old selection.
+    func receiveLegibleSubtitle(_ strings: [String], at time: Double, trackID: Int) {
+        guard time.isFinite, activeSubtitleTrackIndex == trackID else { return }
+        let text = strings.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }.joined(separator: "\n")
+        var cues = legibleSubtitleCues
+        if let last = cues.last, last.endTime.isInfinite {
+            if last.text == text { return }
+            if time <= last.startTime { cues.removeAll() }
+            else { cues[cues.count - 1] = last.with(endTime: time) }
+        }
+        if !text.isEmpty {
+            legibleSubtitleSequence += 1
+            cues.append(SubtitleCue(id: legibleSubtitleSequence, startTime: time, endTime: .infinity, body: .text(text)))
+        }
+        cues = Array(cues.filter { $0.endTime > time - 120 }.suffix(128))
+        legibleSubtitleCues = cues
+    }
+}

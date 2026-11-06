@@ -38,6 +38,22 @@ struct Issue460SessionOptionCorrectionTests {
         #expect(SessionOptionCorrection.refusedFields(from: base, to: proposed).isEmpty)
     }
 
+    @Test("the remote HLS relay preference is accounted for as a correctable tuning field")
+    func relayPreferenceIsCorrectable() {
+        #expect(SessionOptionCorrection.knownFields.contains("relaysRemoteHLS"))
+        let base = LoadOptions()
+        var relayed = base
+        relayed.relaysRemoteHLS = true
+        for (current, proposed) in [(base, relayed), (relayed, base)] {
+            #expect(SessionOptionCorrection.refusedFields(from: current, to: proposed).isEmpty)
+            let changed = SessionOptionCorrection.changedFields(from: current, to: proposed)
+            #expect(changed == ["relaysRemoteHLS"])
+            let split = SessionOptionCorrection.partitionChanges(changed, sessionOwnsTransport: true)
+            #expect(split.applied == ["relaysRemoteHLS"])
+            #expect(split.sessionOwned.isEmpty)
+        }
+    }
+
     @Test("each load-identity field is refused by name")
     func identityChangesAreRefused() {
         let base = LoadOptions()

@@ -754,8 +754,8 @@ public struct LoadOptions: Sendable, Equatable {
     /// send them (`CredentialScope`: all of them to the origin the URL names, elsewhere only the headers that
     /// describe the request). For a source whose headers carry a secret, a reverse proxy's `Authorization` or a
     /// Cloudflare Access pair. Where the relay cannot be mounted, AVPlayer opens the origin without the headers,
-    /// which an origin that needs them refuses. Every byte of the session passes through the process. Default
-    /// `false`.
+    /// which an origin that needs them refuses. Every byte of the session passes through the process. A tuning
+    /// field: correctable through `reloadAtCurrentPosition(applying:)`. Default `false`.
     public var relaysRemoteHLS: Bool = false
 
     /// Emit raw ASS event lines (`ReadOrder,Layer,Style,...,Text` including override tags) instead of plain-text extraction. Opt-in for hosts that render ASS styling themselves; pair with `TrackInfo.assHeader`. Only affects ASS / SSA codecs, on embedded and sidecar tracks alike: libavcodec normalises SubRip, WebVTT and mov_text through `ff_ass_add_rect` as well, so those carry an ASS payload the engine could emit but never does, and a session that mixes an ASS track with a SubRip one needs no reload to cross between them (AE#587). Default `false` (AetherEngine#30).
@@ -1346,7 +1346,7 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
     public let isExternal: Bool
     /// True when the playback backend, rather than `subtitleCues`, renders this
     /// track. Hosts can avoid presenting overlay controls that cannot affect it.
-    public let isNativelyRenderedSubtitle: Bool
+    public internal(set) var isNativelyRenderedSubtitle: Bool
 
     /// AE#658, audio only: sample rate in Hz, 0 when undeclared.
     public let sampleRate: Int

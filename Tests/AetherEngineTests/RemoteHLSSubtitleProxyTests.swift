@@ -249,7 +249,8 @@ struct RemoteHLSSubtitleProxyTests {
         ]
 
         let merged = RemoteHLSMediaSelection.mergedSubtitleTracks(
-            existing: declared, legible: legible, injectedNames: ["English"])
+            existing: declared, legible: legible,
+            injectedRenditions: [AetherEngine.externalSubtitleTrackIDBase: "English"])
 
         #expect(merged.map(\.name) == ["English", "Français"])
         // The surviving rendition keeps its index in the FULL group, which is what selection indexes back.
@@ -269,7 +270,7 @@ struct RemoteHLSSubtitleProxyTests {
             isDefault: false, isForced: false, isSDH: false, playlistName: "DE")
 
         let merged = RemoteHLSMediaSelection.mergedSubtitleTracks(
-            existing: [], legible: [localized], injectedNames: ["DE"])
+            existing: [], legible: [localized], injectedRenditions: [AetherEngine.externalSubtitleTrackIDBase: "DE"])
 
         #expect(merged.isEmpty)
     }

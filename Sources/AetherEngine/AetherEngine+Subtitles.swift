@@ -2767,15 +2767,11 @@ extension AetherEngine {
         remoteHLSSubtitleDiscoveryTask?.cancel()
         guard let item = host.avPlayer.currentItem else { return }
         remoteHLSSubtitleDiscoveryTask = Task { @MainActor [weak self] in
-            var group = try? await item.asset.loadMediaSelectionGroup(for: .legible)
-            if group?.options.isEmpty ?? true {
-                // Early-empty group: wait for readyToPlay (AVFoundation's guarantee point for HLS
-                // media selection) and load once more. Cancelled by the next load()/stop().
-                for await ready in host.$isReady.values where ready { break }
-                guard !Task.isCancelled else { return }
-                group = try? await item.asset.loadMediaSelectionGroup(for: .legible)
-            }
-            guard let group, !group.options.isEmpty else { return }
+            guard let group = await RemoteHLSMediaSelection.legibleGroup(
+                load: { try await item.asset.loadMediaSelectionGroup(for: .legible) },
+                isEmpty: { $0.options.isEmpty },
+                waitUntilReady: { for await ready in host.$isReady.values where ready { break } }
+            ) else { return }
             guard let self, !Task.isCancelled,
                   self.currentAVPlayer?.currentItem === item else { return }
             var snapshots: [RemoteHLSMediaSelection.LegibleOption] = []
@@ -2792,9 +2788,12 @@ extension AetherEngine {
             // #316: merge, don't assign; the host's load-declared external tracks must survive. The
             // renditions the proxy injected for those same tracks are dropped here: they are already
             // listed under their external ids, and a second entry would offer one file as two tracks.
-            let injected = Set(self.injectedSubtitleRenditionNames.values)
+            guard !Task.isCancelled, self.currentAVPlayer?.currentItem === item else { return }
+            let injected = self.injectedSubtitleRenditionNames
+            let trackIDs = RemoteHLSMediaSelection.trackIDs(from: snapshots, injectedRenditions: injected)
             self.subtitleTracks = RemoteHLSMediaSelection.mergedSubtitleTracks(
-                existing: self.subtitleTracks, legible: snapshots, injectedNames: injected)
+                existing: self.subtitleTracks, legible: snapshots, injectedRenditions: injected)
+            self.remoteHLSCueClock?.setLegibleGroup(group, trackIDs: trackIDs)
             EngineLog.emit(
                 "[AetherEngine] AE#154: remote-HLS legible group surfaced \(group.options.count) subtitle "
                 + "rendition(s)\(injected.isEmpty ? "" : ", \(injected.count) of them engine-injected (#316)")",
@@ -2808,11 +2807,7 @@ extension AetherEngine {
                let ordinal = group.options.firstIndex(of: selected) {
                 // #316: an auto-selected injected rendition mirrors back as the EXTERNAL id it was
                 // declared under, not as a second identity in the legible id range.
-                let selectedName = await RemoteHLSMediaSelection.playlistName(of: selected)
-                    ?? selected.displayName
-                self.activeSubtitleTrackIndex = self.injectedSubtitleRenditionNames
-                    .first { $0.value == selectedName }?.key
-                    ?? RemoteHLSMediaSelection.subtitleTrackIDBase + ordinal
+                self.activeSubtitleTrackIndex = trackIDs[ordinal]
                 self.isSubtitleActive = true
                 EngineLog.emit(
                     "[AetherEngine] AE#154: mirrored auto-selected legible option ordinal=\(ordinal)",

@@ -1885,7 +1885,7 @@ final class NativeAVPlayerHost {
         guard let item = playerItem else { return nil }
         // A playing item vends at the host clock, a paused one only at the time it holds.
         let paused = avPlayer.rate == 0
-        let read = Task.detached(priority: .userInitiated) { () async -> SendableBuffer? in
+        let read = BlockingWork.detached(priority: .userInitiated) { () async -> SendableBuffer? in
             let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
                 kCVPixelBufferIOSurfacePropertiesKey as String: [String: String]()
             ])

@@ -48,6 +48,7 @@ enum RemoteHLSMediaSelection {
     /// that is the only stable handle on a rendition the engine declared itself (#316).
     static let playlistNameIdentifier = AVMetadataIdentifier(rawValue: "m3u8/NAME")
 
+    @MainActor
     static func playlistName(of option: AVMediaSelectionOption) async -> String? {
         for item in option.commonMetadata where item.identifier == playlistNameIdentifier {
             if let value = try? await item.load(.stringValue) { return value }
@@ -60,6 +61,28 @@ enum RemoteHLSMediaSelection {
     /// language label). Used for both the dedupe and the selection lookup so they cannot disagree.
     static func injectionKey(_ option: LegibleOption) -> String {
         option.playlistName ?? option.displayName
+    }
+
+    /// Discovery, auto-selection and legible text must agree on an injected sidecar's external identity.
+    static func trackIDs(from options: [LegibleOption], injectedRenditions: [Int: String]) -> [Int] {
+        options.enumerated().map { ordinal, option in
+            injectedRenditions.first { $0.value == injectionKey(option) }?.key ?? subtitleTrackIDBase + ordinal
+        }
+    }
+
+    /// Some HLS assets publish nil or an empty group before readyToPlay. The picker and text observer share
+    /// this discovery, so neither can retain an early empty answer for the rest of the session.
+    @MainActor
+    static func legibleGroup<Group>(load: @MainActor () async throws -> Group?, isEmpty: (Group) -> Bool,
+                                    waitUntilReady: @MainActor () async -> Void) async -> Group? {
+        var group = try? await load()
+        if group.map(isEmpty) ?? true {
+            await waitUntilReady()
+            guard !Task.isCancelled else { return nil }
+            group = try? await load()
+        }
+        guard !Task.isCancelled, let group, !isEmpty(group) else { return nil }
+        return group
     }
 
     /// The option that carries an injected rendition's served NAME (audit NAT-104). Matched on
@@ -162,9 +185,12 @@ enum RemoteHLSMediaSelection {
     /// registered, which is why a bypass sidecar looked like it had never been declared.
     static func mergedSubtitleTracks(existing: [TrackInfo],
                                      legible: [LegibleOption],
-                                     injectedNames: Set<String> = []) -> [TrackInfo] {
-        existing.filter(\.isExternal)
-            + subtitleTrackInfos(from: legible, skippingNames: injectedNames)
+                                     injectedRenditions: [Int: String] = [:]) -> [TrackInfo] {
+        existing.filter(\.isExternal).map { track in
+            var track = track
+            track.isNativelyRenderedSubtitle = injectedRenditions[track.id] != nil
+            return track
+        } + subtitleTrackInfos(from: legible, skippingNames: Set(injectedRenditions.values))
     }
 
     /// Group-order ordinal backing a synthetic track id; nil for ids outside the remote-HLS range.
