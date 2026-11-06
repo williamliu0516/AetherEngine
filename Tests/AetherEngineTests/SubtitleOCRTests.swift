@@ -266,7 +266,7 @@ struct SubtitleOCRExecutorTests {
             ) { _, _ in
                 entered.set(true)
                 release.wait()
-                return "completed cue"
+                return .words("completed cue")
             }
         }
         defer { fill.cancel() }

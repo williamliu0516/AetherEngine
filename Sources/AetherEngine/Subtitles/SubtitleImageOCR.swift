@@ -75,15 +75,17 @@ enum SubtitleImageOCR {
     /// the language asked (`Readings`), so the native rendition and the host's translated second line
     /// (`AetherEngine.recognizedText(in:trackLanguage:)`), which ask for the same cues, recognise each once. A
     /// cancelled call keeps nothing. `readings` nil reads every time.
+    /// A failed pass is not kept: the picture is read again when next asked. Nil when the call was cancelled before
+    /// its turn.
     nonisolated static func read(
         _ image: CGImage, language: String?, readings: Readings? = SubtitleImageOCR.readings,
-        recognition: @escaping @Sendable (CGImage, String?) -> String? = recognizeSynchronously
-    ) async -> String? {
+        recognition: @escaping @Sendable (CGImage, String?) -> Reading = recognizeReading
+    ) async -> Reading? {
         let key = readings == nil ? nil : Readings.Key(picture: fingerprint(image), language: language)
-        if let readings, let key, let kept = await readings.reading(key) { return kept }
-        let text = await recognizeText(in: image, language: language, recognition: recognition)
-        if let readings, let key, !Task.isCancelled { await readings.keep(text, for: key) }
-        return text
+        if let readings, let key, let kept = await readings.reading(key) { return kept.map(Reading.words) ?? .nothing }
+        guard let reading = await executor.run({ recognition(image, language) }) else { return nil }
+        if let readings, let key, reading != .failed, !Task.isCancelled { await readings.keep(reading.text, for: key) }
+        return reading
     }
 
     /// The readings kept, text only (the pictures are not), the oldest let go past `capacity`.
@@ -127,6 +129,13 @@ enum SubtitleImageOCR {
         hasher.combine(image.width)
         hasher.combine(image.height)
         hasher.combine(image.bytesPerRow)
+        // How the bytes are read: the same bytes as another layout or colour space are another picture (Codex's
+        // review of subtitle-ocr, 2026-11-05).
+        hasher.combine(image.bitsPerPixel)
+        hasher.combine(image.bitsPerComponent)
+        hasher.combine(image.bitmapInfo.rawValue)
+        hasher.combine(image.alphaInfo.rawValue)
+        hasher.combine(image.colorSpace?.name as String?)
         hasher.combine(bytes: UnsafeRawBufferPointer(start: CFDataGetBytePtr(data), count: CFDataGetLength(data)))
         return hasher.finalize()
     }
@@ -148,13 +157,29 @@ enum SubtitleImageOCR {
     /// evidence, it is the state the process stays in, and the alternative is paying a minute of
     /// stall per cue to learn it again.
     nonisolated static func recognizeSynchronously(_ image: CGImage, language: String?) -> String? {
-        guard let flat = flattenedOntoBlack(image) else { return nil }
+        recognizeReading(image, language: language).text
+    }
+
+    /// One recognition's outcome: words, a pass that ran and read none, or a pass that could not run (both models'
+    /// requests failed, the picture could not be drawn), which says nothing of the picture and is never kept
+    /// (`read`: kept as "no words", the native rendition dropped that line for good).
+    enum Reading: Sendable, Equatable {
+        case words(String)
+        case nothing
+        case failed
+
+        var text: String? { if case .words(let text) = self { text } else { nil } }
+    }
+
+    /// `recognizeSynchronously`, saying a failed pass from one that read nothing.
+    nonisolated static func recognizeReading(_ image: CGImage, language: String?) -> Reading {
+        guard let flat = flattenedOntoBlack(image) else { return .failed }
         if !accurateIsUnavailable, let observations = recognize(flat, at: .accurate, language: language) {
-            return assembleLines(observations)
+            return assembleLines(observations).map(Reading.words) ?? .nothing
         }
         markAccurateUnavailable()
-        guard let observations = recognize(flat, at: .fast, language: language) else { return nil }
-        return assembleLines(observations)
+        guard let observations = recognize(flat, at: .fast, language: language) else { return .failed }
+        return assembleLines(observations).map(Reading.words) ?? .nothing
     }
 
     /// nil when the REQUEST failed, which is what the fallback turns on. An empty array is a
@@ -196,7 +221,7 @@ enum SubtitleImageOCR {
     nonisolated static func appendRecognized(
         cues: [SubtitleCue], language trackLanguage: String?, to store: NativeSubtitleCueStore,
         readings: Readings? = SubtitleImageOCR.readings,
-        recognition: @escaping @Sendable (CGImage, String?) -> String? = recognizeSynchronously
+        recognition: @escaping @Sendable (CGImage, String?) -> Reading = recognizeReading
     ) async {
         let language = recognitionLanguage(forTrackLanguage: trackLanguage)
         var out: [SubtitleCue] = []
@@ -205,7 +230,7 @@ enum SubtitleImageOCR {
             switch cue.body {
             case .image(let image):
                 if let text = await read(image.cgImage, language: language, readings: readings,
-                                         recognition: recognition) {
+                                         recognition: recognition)?.text {
                     out.append(cue.with(body: .text(text)))
                 }
             case .text, .richText:
@@ -227,7 +252,7 @@ enum SubtitleImageOCR {
         private var waiting: [Waiter] = []
         var pendingCount: Int { waiting.count }
 
-        func run(_ recognition: @escaping @Sendable () -> String?) async -> String? {
+        func run<Result: Sendable>(_ recognition: @escaping @Sendable () -> Result?) async -> Result? {
             guard await acquire() else { return nil }
             guard !Task.isCancelled else {
                 release()

@@ -15,7 +15,7 @@ struct SubtitleTextTests {
         for _ in 0..<2 {
             let reading = await AetherEngine.recognizedText(in: cue, trackLanguage: "eng", readings: readings) { _, _ in
                 calls.add()
-                return "Where are you going?"
+                return .words("Where are you going?")
             }
             #expect(reading == .text("Where are you going?"))
         }
@@ -29,9 +29,9 @@ struct SubtitleTextTests {
         let noise = pictureCue(1, shade: 20), line = pictureCue(2, shade: 200)
         guard case .image(let wanted) = line.body else { return }
         let lineImage = wanted.cgImage
-        let recognition: @Sendable (CGImage, String?) -> String? = { image, _ in
+        let recognition: @Sendable (CGImage, String?) -> SubtitleImageOCR.Reading = { image, _ in
             calls.add()
-            return image === lineImage ? "Next line" : nil
+            return image === lineImage ? .words("Next line") : .nothing
         }
         #expect(await AetherEngine.recognizedText(in: noise, trackLanguage: nil, readings: readings,
                                                   recognition: recognition) == .unreadable)
@@ -42,10 +42,41 @@ struct SubtitleTextTests {
         #expect(calls.count == 2)
     }
 
+    @Test("a pass that could not run is not kept: the next ask reads the picture again")
+    func failureNotKept() async {
+        let readings = SubtitleImageOCR.Readings()
+        let calls = Calls()
+        let cue = pictureCue(1, shade: 90)
+        let first = await AetherEngine.recognizedText(in: cue, trackLanguage: nil, readings: readings) { _, _ in
+            calls.add()
+            return .failed
+        }
+        #expect(first == .unreadable)
+        let second = await AetherEngine.recognizedText(in: cue, trackLanguage: nil, readings: readings) { _, _ in
+            calls.add()
+            return .words("Read at last")
+        }
+        #expect(second == .text("Read at last"))
+        #expect(calls.count == 2)
+    }
+
+    @Test("the same bytes read another way are another picture")
+    func fingerprintReadsTheLayout() throws {
+        let bytes: [UInt8] = [10, 20, 30, 255, 40, 50, 60, 255]
+        let provider = try #require(CGDataProvider(data: Data(bytes) as CFData))
+        func image(_ info: CGImageAlphaInfo) -> CGImage? {
+            CGImage(width: 2, height: 1, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: 8,
+                    space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: info.rawValue),
+                    provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+        }
+        let last = try #require(image(.premultipliedLast)), first = try #require(image(.premultipliedFirst))
+        #expect(SubtitleImageOCR.fingerprint(last) != SubtitleImageOCR.fingerprint(first))
+    }
+
     @Test("a text cue has no reading")
     func textCue() async {
         let cue = SubtitleCue(id: 1, startTime: 0, endTime: 1, body: .text("Hello"))
-        #expect(await AetherEngine.recognizedText(in: cue, trackLanguage: nil, readings: nil) { _, _ in "x" } == nil)
+        #expect(await AetherEngine.recognizedText(in: cue, trackLanguage: nil, readings: nil) { _, _ in .words("x") } == nil)
     }
 
     @Test("lines under the confidence floor are left out, and a cue of only those reads as nothing")
