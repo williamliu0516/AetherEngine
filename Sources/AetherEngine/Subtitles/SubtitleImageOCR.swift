@@ -21,6 +21,18 @@ enum SubtitleImageOCR {
         return lines.joined(separator: "\n")
     }
 
+    /// The least confidence a recognised line keeps (`VNRecognizedText.confidence`, 0...1). Below it a line is more
+    /// likely an outline, a sign's fragment or noise than words: a cue whose lines all fall below reads as nothing, and
+    /// its picture stays as it is with no words beside it. Vision's accurate model answers 0.3, 0.5 or 1.0 for most
+    /// real subtitle lines; the floor sits under its lowest.
+    static let minimumConfidence: Float = 0.2
+
+    /// `assembleLines` over the lines at `floor` or above.
+    nonisolated static func assembleLines(_ observations: [(text: String, midY: CGFloat, confidence: Float)],
+                                          floor: Float = minimumConfidence) -> String? {
+        assembleLines(observations.filter { $0.confidence >= floor }.map { (text: $0.text, midY: $0.midY) })
+    }
+
     /// Track tags are ISO 639-1/2 ("ger"), Vision wants BCP-47 primary codes ("de"). The engine's
     /// synonym classes resolve the bibliographic 639-2/B forms Foundation cannot ("ger", "fre").
     nonisolated static func recognitionLanguage(forTrackLanguage tag: String?) -> String? {
@@ -59,6 +71,66 @@ enum SubtitleImageOCR {
         }
     }
 
+    /// `recognizeText`, once per picture: what a picture read (or that it read as nothing) is kept by its pixels and
+    /// the language asked (`Readings`), so the native rendition and the host's translated second line
+    /// (`AetherEngine.recognizedText(in:trackLanguage:)`), which ask for the same cues, recognise each once. A
+    /// cancelled call keeps nothing. `readings` nil reads every time.
+    nonisolated static func read(
+        _ image: CGImage, language: String?, readings: Readings? = SubtitleImageOCR.readings,
+        recognition: @escaping @Sendable (CGImage, String?) -> String? = recognizeSynchronously
+    ) async -> String? {
+        let key = readings == nil ? nil : Readings.Key(picture: fingerprint(image), language: language)
+        if let readings, let key, let kept = await readings.reading(key) { return kept }
+        let text = await recognizeText(in: image, language: language, recognition: recognition)
+        if let readings, let key, !Task.isCancelled { await readings.keep(text, for: key) }
+        return text
+    }
+
+    /// The readings kept, text only (the pictures are not), the oldest let go past `capacity`.
+    static let readings = Readings()
+
+    actor Readings {
+        struct Key: Hashable, Sendable {
+            let picture: Int
+            let language: String?
+
+            init?(picture: Int?, language: String?) {
+                guard let picture else { return nil }
+                self.picture = picture
+                self.language = language
+            }
+        }
+
+        static let capacity = 2_000
+        private var kept: [Key: String?] = [:]
+        private var order: [Key] = []
+
+        /// The kept reading: `.some(nil)` for a picture that read as nothing, nil for one not read.
+        func reading(_ key: Key) -> String?? { kept[key] }
+
+        func keep(_ text: String?, for key: Key) {
+            if kept.updateValue(text, forKey: key) == nil { order.append(key) }
+            if order.count > Self.capacity { kept.removeValue(forKey: order.removeFirst()) }
+        }
+
+        func removeAll() {
+            kept = [:]
+            order = []
+        }
+    }
+
+    /// A picture's identity by its pixels and size (a cue's id can come again for another picture after a seek or on
+    /// another track); nil where its bytes cannot be read, which is then read every time.
+    nonisolated static func fingerprint(_ image: CGImage) -> Int? {
+        guard let data = image.dataProvider?.data else { return nil }
+        var hasher = Hasher()
+        hasher.combine(image.width)
+        hasher.combine(image.height)
+        hasher.combine(image.bytesPerRow)
+        hasher.combine(bytes: UnsafeRawBufferPointer(start: CFDataGetBytePtr(data), count: CFDataGetLength(data)))
+        return hasher.finalize()
+    }
+
     /// One synchronous Vision pass, called only by the recognition thread.
     ///
     /// `.accurate` is the better reader and it is also an OPTIONAL system model: it runs on the
@@ -75,7 +147,7 @@ enum SubtitleImageOCR {
     /// The drop is remembered for the process. A single accurate failure is not a fluke on this
     /// evidence, it is the state the process stays in, and the alternative is paying a minute of
     /// stall per cue to learn it again.
-    private nonisolated static func recognizeSynchronously(_ image: CGImage, language: String?) -> String? {
+    nonisolated static func recognizeSynchronously(_ image: CGImage, language: String?) -> String? {
         guard let flat = flattenedOntoBlack(image) else { return nil }
         if !accurateIsUnavailable, let observations = recognize(flat, at: .accurate, language: language) {
             return assembleLines(observations)
@@ -94,7 +166,7 @@ enum SubtitleImageOCR {
     /// recognition of a line beats no line.
     private nonisolated static func recognize(_ image: CGImage,
                                               at level: VNRequestTextRecognitionLevel,
-                                              language: String?) -> [(text: String, midY: CGFloat)]? {
+                                              language: String?) -> [(text: String, midY: CGFloat, confidence: Float)]? {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = level
         request.usesLanguageCorrection = true
@@ -112,9 +184,9 @@ enum SubtitleImageOCR {
             logFailureOnce("Vision \(level == .accurate ? "accurate" : "fast") perform failed: \(error)")
             return nil
         }
-        return (request.results ?? []).compactMap { obs -> (String, CGFloat)? in
+        return (request.results ?? []).compactMap { obs -> (String, CGFloat, Float)? in
             guard let top = obs.topCandidates(1).first else { return nil }
-            return (top.string, obs.boundingBox.midY)
+            return (top.string, obs.boundingBox.midY, top.confidence)
         }
     }
 
@@ -123,6 +195,7 @@ enum SubtitleImageOCR {
     /// The worker/fill task awaits each recognition; Vision itself runs on a dedicated thread.
     nonisolated static func appendRecognized(
         cues: [SubtitleCue], language trackLanguage: String?, to store: NativeSubtitleCueStore,
+        readings: Readings? = SubtitleImageOCR.readings,
         recognition: @escaping @Sendable (CGImage, String?) -> String? = recognizeSynchronously
     ) async {
         let language = recognitionLanguage(forTrackLanguage: trackLanguage)
@@ -131,8 +204,8 @@ enum SubtitleImageOCR {
             if Task.isCancelled { break }
             switch cue.body {
             case .image(let image):
-                if let text = await recognizeText(in: image.cgImage, language: language,
-                                                  recognition: recognition) {
+                if let text = await read(image.cgImage, language: language, readings: readings,
+                                         recognition: recognition) {
                     out.append(cue.with(body: .text(text)))
                 }
             case .text, .richText:

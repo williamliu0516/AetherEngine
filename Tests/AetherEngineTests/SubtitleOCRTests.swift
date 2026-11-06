@@ -262,7 +262,7 @@ struct SubtitleOCRExecutorTests {
         let fill = Task {
             await SubtitleImageOCR.appendRecognized(
                 cues: [imageCue(1, 10, 12), imageCue(2, 12, 14)], language: "eng",
-                to: original
+                to: original, readings: nil
             ) { _, _ in
                 entered.set(true)
                 release.wait()
