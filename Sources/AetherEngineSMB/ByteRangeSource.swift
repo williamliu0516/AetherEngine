@@ -7,6 +7,10 @@ public protocol ByteRangeSource: AnyObject, Sendable {
     /// Total size of the underlying object in bytes.
     var byteSize: Int64 { get }
 
+    /// For disposable probes only: at most this many source requests per `read`, each asking
+    /// for no more than `length` bytes, with no speculative reads. Nil cannot promise that bound.
+    var maximumProbeReadAttempts: Int? { get }
+
     /// Read up to `length` bytes starting at absolute `offset`. May return
     /// fewer bytes than requested at end of file, and an empty `Data` at or
     /// past EOF. Throws on a genuine I/O error.
@@ -14,4 +18,8 @@ public protocol ByteRangeSource: AnyObject, Sendable {
 
     /// Release the underlying resource. Must be idempotent.
     func close()
+}
+
+public extension ByteRangeSource {
+    var maximumProbeReadAttempts: Int? { nil }
 }

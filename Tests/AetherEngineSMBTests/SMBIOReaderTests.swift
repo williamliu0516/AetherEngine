@@ -6,10 +6,15 @@ private final class FakeByteRangeSource: ByteRangeSource, @unchecked Sendable {
     let data: Data
     private(set) var closeCount = 0
     private(set) var requests: [Int] = []
-    init(_ data: Data) { self.data = data }
+    let maximumProbeReadAttempts: Int?
+    init(_ data: Data, attempts: Int? = 1) {
+        self.data = data
+        maximumProbeReadAttempts = attempts
+    }
     var byteSize: Int64 { Int64(data.count) }
     func read(at offset: Int64, length: Int) async throws -> Data {
-        requests.append(length)
+        // Exercise the declared worst case: each retry asks for the same range before one answers.
+        for _ in 0..<max(1, maximumProbeReadAttempts ?? 1) { requests.append(length) }
         guard offset >= 0, offset < data.count, length > 0 else { return Data() }
         let end = min(Int(offset) + length, data.count)
         return data.subdata(in: Int(offset)..<end)
@@ -129,6 +134,30 @@ final class SMBIOReaderTests: XCTestCase {
         probe.close()
         XCTAssertEqual(source.closeCount, 0)
         XCTAssertEqual(readN(primary, 2), Data([0, 1]))
+    }
+
+    func testBoundedIndependentReaderReservesInternalRetriesToo() throws {
+        let source = FakeByteRangeSource(payload, attempts: 3)
+        let primary = SMBIOReader(source: source)
+        let probe = try XCTUnwrap(primary.makeIndependentReader(limits: ProbeLimits(maxInputBytes: 10)) as? SMBIOReader)
+        defer { probe.close(); primary.close() }
+        XCTAssertEqual(readN(probe, 4), Data([0, 1, 2]))
+        XCTAssertEqual(probe.seek(offset: 100, whence: SEEK_SET), 100)
+        XCTAssertEqual(readN(probe, 1), Data())
+        XCTAssertEqual(source.requests, [3, 3, 3])
+        XCTAssertLessThanOrEqual(source.requests.reduce(0, +), 10)
+    }
+
+    func testBoundedIndependentReaderSkipsSourcesWithoutARequestBound() {
+        let bounds: [Int?] = [nil, 0, -1]
+        for attempts in bounds {
+            let source = FakeByteRangeSource(payload, attempts: attempts)
+            let primary = SMBIOReader(source: source)
+            defer { primary.close() }
+            XCTAssertNil(primary.makeIndependentReader(limits: ProbeLimits()))
+            XCTAssertTrue(source.requests.isEmpty)
+            XCTAssertNotNil(primary.makeIndependentReader())
+        }
     }
 
     func testBoundedIndependentReaderCannotReadAfterCancelOrClose() throws {

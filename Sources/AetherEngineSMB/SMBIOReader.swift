@@ -21,6 +21,7 @@ public final class SMBIOReader: IOReader, @unchecked Sendable {
     /// Only disposable bounded readers latch cancellation and reserve every requested source byte.
     /// Protected by inFlightLock together with publishing the next read.
     private var auditBytesRemaining: Int64?
+    private var auditReadAttempts: Int64 = 1
     private var auditStopped = false
     /// Per-read in-flight state, published so cancel() (a different thread) can both cancel the
     /// background work and, crucially, unblock read()'s semaphore wait. The underlying SMB read
@@ -62,9 +63,11 @@ public final class SMBIOReader: IOReader, @unchecked Sendable {
         let outcome = ReadOutcome()
         let requested = inFlightLock.withLock { state -> Int in
             guard !auditStopped else { return 0 }
-            let want = Int(min(Int64(size), auditBytesRemaining ?? Int64(size)))
+            let want = Int(min(Int64(size), auditBytesRemaining.map { $0 / auditReadAttempts } ?? Int64(size)))
             guard want > 0 else { return 0 }
-            if let remaining = auditBytesRemaining { auditBytesRemaining = remaining - Int64(want) }
+            if let remaining = auditBytesRemaining {
+                auditBytesRemaining = remaining - Int64(want) * auditReadAttempts
+            }
             let task = Task { [source] in
                 do {
                     try Task.checkCancellation()
@@ -144,8 +147,10 @@ public final class SMBIOReader: IOReader, @unchecked Sendable {
     }
 
     public func makeIndependentReader(limits: ProbeLimits) -> IOReader? {
-        guard limits.maxInputBytes >= 0 else { return nil }
+        guard limits.maxInputBytes >= 0, let attempts = source.maximumProbeReadAttempts,
+              attempts > 0 else { return nil }
         let reader = SMBIOReader(source: source, ownsSource: false, discImageProbeEnabled: discImageProbeEnabled)
+        reader.auditReadAttempts = Int64(attempts)
         reader.auditBytesRemaining = limits.maxInputBytes
         return reader
     }
