@@ -129,7 +129,7 @@ public enum DolbyVisionRecordAudit {
     }
 
     /// Run the recordless audit on a freshly probed video stream: when it is a candidate, read the first
-    /// RPU from a second open of `url` and add the Profile 5 record if it says so. Called by the demuxer
+    /// RPU from a second URL open or independent custom cursor and add the Profile 5 record if it says so. Called by the demuxer
     /// at the end of its own probe, so the load, the HLS producer's own open and every rebuild see the
     /// same stream and none of them needs the verdict carried to it. A failed read is no evidence.
     @discardableResult
