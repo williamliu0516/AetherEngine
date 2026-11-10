@@ -136,6 +136,15 @@ public enum DolbyVisionRecordAudit {
     static func addRecordIfProfile5(
         codecpar: UnsafeMutablePointer<AVCodecParameters>, url: URL, extraHeaders: [String: String]
     ) -> Bool {
+        addRecordIfProfile5(codecpar: codecpar) { packetBudget in
+            rpuProfileOfSource(url: url, extraHeaders: extraHeaders, packetBudget: packetBudget)
+        }
+    }
+
+    @discardableResult
+    static func addRecordIfProfile5(
+        codecpar: UnsafeMutablePointer<AVCodecParameters>, readProfile: (Int) -> Int?
+    ) -> Bool {
         let hasRecord = (0..<Int(codecpar.pointee.nb_coded_side_data)).contains {
             codecpar.pointee.coded_side_data?[$0].type == AV_PKT_DATA_DOVI_CONF
         }
@@ -144,8 +153,7 @@ public enum DolbyVisionRecordAudit {
             pixelFormat: codecpar.pointee.format,
             colorTransfer: codecpar.pointee.color_trc, colorMatrix: codecpar.pointee.color_space,
             colorPrimaries: codecpar.pointee.color_primaries) else { return false }
-        let rpu = rpuProfileOfSource(
-            url: url, extraHeaders: extraHeaders, packetBudget: recordlessPacketBudget)
+        let rpu = readProfile(recordlessPacketBudget)
         guard rpuProvesProfile5(rpu), synthesizeProfile5Record(codecpar) else {
             EngineLog.emit(
                 "[AetherEngine] AE#recordless: untagged 10-bit HEVC with no DV record, RPU "
@@ -193,6 +201,48 @@ public enum DolbyVisionRecordAudit {
             return nil
         }
         return rpuProfile(walking: demuxer, packetBudget: packetBudget)
+    }
+
+    /// A custom source supplies a second cursor, never the playback reader itself. The controlled
+    /// wrapper counts input from open onward and cancels only that cursor; all verdicts stay optional.
+    static func rpuProfileOfSource(
+        reader: IOReader, formatHint: String? = nil, packetBudget: Int = auditPacketBudget,
+        cancellation: ProbeCancellation? = nil
+    ) -> Int? {
+        guard cancellation?.isCancelled != true,
+              let independent = autoreleasepool(invoking: { reader.makeIndependentReader() }),
+              independent !== reader else { return nil }
+        let (packetLimit, overflow) = packetBudget.multipliedReportingOverflow(by: foreignPacketFuseMultiplier)
+        let limits = ProbeLimits(
+            maxInputBytes: Int64(walkByteBudget),
+            maxPackets: overflow ? Int.max : packetLimit,
+            maxPacketBytes: walkByteBudget,
+            timeBudget: .greatestFiniteMagnitude)
+        guard let control = try? ProbeControl(
+            limits: limits, cancellation: cancellation, scheduleDeadline: false) else {
+            independent.close()
+            return nil
+        }
+        let demuxer = Demuxer()
+        defer {
+            control.finish()
+            demuxer.close()
+            independent.close()
+        }
+        let counted = ProbeIOReader(reader: independent, control: control)
+        demuxer.probeControl = control
+        do {
+            // Check the disposable cursor, not the playback cursor. A one-shot clone is no evidence.
+            guard counted.seek(offset: 0, whence: SEEK_SET) == 0 else { return nil }
+            try demuxer.open(
+                reader: counted, formatHint: formatHint,
+                profile: .dolbyVisionRecordAuditDemuxer(callerProbesize: nil, callerMaxAnalyzeDuration: nil))
+            let profile = rpuProfile(walking: demuxer, packetBudget: packetBudget)
+            try control.complete()
+            return profile
+        } catch {
+            return nil
+        }
     }
 
     /// The walk over an opened demuxer, split out so a test can hand it a counting reader.

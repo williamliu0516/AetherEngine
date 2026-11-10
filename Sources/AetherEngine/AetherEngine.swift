@@ -4711,16 +4711,15 @@ public final class AetherEngine: ObservableObject {
                 // AE#532: a Profile 5 record over a VUI that contradicts it is the one claim in a
                 // container worth checking against the bitstream, because a Profile 5 RPU cannot carry a
                 // residual or an NLQ and the RPU is therefore proof rather than a guess. Gated on that
-                // pairing, so no other source reads a packet here. `.url` only: a custom reader has no
-                // second open to give, and live is not a class this was reported on.
-                if case .url(let auditURL) = source, !options.isLive,
+                // pairing, so no other source reads a packet here. Seekable custom sources supply an
+                // independent cursor through the probe; live sources keep their existing path.
+                if !options.isLive,
                    DolbyVisionRecordAudit.recordIsContradicted(
                        codecID: detectedCodecID, dvProfile: detectedDVProfileNum,
                        colorTransfer: stream.pointee.codecpar.pointee.color_trc,
                        colorMatrix: stream.pointee.codecpar.pointee.color_space) {
-                    let auditHeaders = options.httpHeaders
                     detectedDVRPUProfile = await BlockingWork.detached(priority: .userInitiated) {
-                        DolbyVisionRecordAudit.rpuProfileOfSource(url: auditURL, extraHeaders: auditHeaders)
+                        probe.dolbyVisionRPUProfile()
                     }.value
                     correctedDVProfile = DolbyVisionRecordAudit.correctedProfile(
                         record: detectedDVProfileNum, rpu: detectedDVRPUProfile)

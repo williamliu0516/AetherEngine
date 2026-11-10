@@ -342,9 +342,24 @@ public final class Demuxer: @unchecked Sendable {
     }
     private var trackSnapshot = TrackSnapshot()
 
-    /// The URL and headers this demuxer was opened from, kept for the recordless Dolby Vision audit's
-    /// second open. nil for a custom reader (no second open to give) and for a live source.
-    private var auditSource: (url: URL, headers: [String: String])?
+    /// The source for bounded DV checks. Custom sources lend an independent cursor; live and disc
+    /// sources keep their existing paths. Cancelling this demuxer also unblocks its disposable audit.
+    private var auditSource: (source: MediaSource, headers: [String: String])?
+    private let auditCancellation = ProbeCancellation()
+
+    func dolbyVisionRPUProfile(packetBudget: Int = 16) -> Int? {
+        guard !isCloseRequested, let source = auditSource else { return nil }
+        switch source.source {
+        case .url(let url):
+            return DolbyVisionRecordAudit.rpuProfileOfSource(
+                url: url, extraHeaders: source.headers, packetBudget: packetBudget)
+        case .custom(let reader, let formatHint):
+            guard isSourceSeekable, !openProfile.avioSequentialOnly else { return nil }
+            return DolbyVisionRecordAudit.rpuProfileOfSource(
+                reader: reader, formatHint: formatHint, packetBudget: packetBudget,
+                cancellation: auditCancellation)
+        }
+    }
 
     /// #409: rewrites the timestamps of an MP4 whose writer dropped the composition-offset table.
     /// Lives here rather than in a playback host so that every consumer of this demuxer (the fMP4
@@ -672,7 +687,7 @@ public final class Demuxer: @unchecked Sendable {
         if isCloseRequested { throw DemuxerError.openFailed(code: -1) }
         self.openProfile = profile
         beginOpenTiming()
-        self.auditSource = isLive ? nil : (url, extraHeaders)
+        self.auditSource = isLive ? nil : (.url(url), extraHeaders)
         let isHTTP = url.scheme == "http" || url.scheme == "https"
 
         if isHTTP {
@@ -740,6 +755,7 @@ public final class Demuxer: @unchecked Sendable {
             try openWithProvider(bridge, inputFormat: inputFormat, isLive: isLive)
             return
         }
+        self.auditSource = isLive ? nil : (.custom(reader, formatHint: formatHint), [:])
         let bridge = CustomIOReaderBridge(reader: reader, preservesSourcePosition: isLive)
         let inputFormat: UnsafePointer<AVInputFormat>? = formatHint.flatMap { av_find_input_format($0) }
         try openWithProvider(bridge, inputFormat: inputFormat, isLive: isLive)
@@ -1088,11 +1104,12 @@ public final class Demuxer: @unchecked Sendable {
             clipBase0Sec = Double(ctx.pointee.start_time) / Double(AV_TIME_BASE)
         }
         armGeneratedPTSSuppression(ctx)
-        if openProfile.auditsRecordlessDolbyVision, let source = auditSource {
+        if openProfile.auditsRecordlessDolbyVision, auditSource != nil {
             let idx = av_find_best_stream(ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nil, 0)
             if idx >= 0, let codecpar = ctx.pointee.streams[Int(idx)]?.pointee.codecpar {
-                DolbyVisionRecordAudit.addRecordIfProfile5(
-                    codecpar: codecpar, url: source.url, extraHeaders: source.headers)
+                DolbyVisionRecordAudit.addRecordIfProfile5(codecpar: codecpar) { packetBudget in
+                    self.dolbyVisionRPUProfile(packetBudget: packetBudget)
+                }
             }
         }
     }
@@ -2919,6 +2936,7 @@ public final class Demuxer: @unchecked Sendable {
     /// Fast lock-free unblock: AVIO read callback returns -1, av_read_frame returns
     /// at once. No resource freeing. Call before close() when cancelling a pump.
     func markClosed() {
+        auditCancellation.cancel()
         interrupt.requestClose()
         closeRequestLock.lock()
         closeRequested = true
@@ -2967,6 +2985,7 @@ public final class Demuxer: @unchecked Sendable {
     }
 
     func close() {
+        auditCancellation.cancel()
         interrupt.requestClose()
         avioProvider?.markClosed()  // unblocks av_read_frame (tvOS suspends threads in background)
         accessLock.lock()
@@ -2992,6 +3011,7 @@ public final class Demuxer: @unchecked Sendable {
 
         avioProvider?.close()
         avioProvider = nil
+        auditSource = nil
         releaseOwnedSourceReader()
     }
 

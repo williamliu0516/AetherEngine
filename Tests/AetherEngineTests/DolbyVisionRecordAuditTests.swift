@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 import AetherLibavcodec
+import AetherLibavformat
 import AetherLibavutil
 @testable import AetherEngine
 
@@ -445,4 +446,335 @@ private func genuineProfile5FixtureURL() -> URL {
 
 private func genuineProfile5FixtureExists() -> Bool {
     FileManager.default.fileExists(atPath: genuineProfile5FixtureURL().path)
+}
+
+// The same real RPUs above, remuxed into tiny synthetic media, exercise the custom source's actual
+// demux/open path without depending on optional downloaded fixtures or a decoder/display.
+extension DolbyVisionRecordAuditTests {
+    private final class AuditReader: IOReader, @unchecked Sendable {
+        let playback: ProbeRecordingReader
+        private let independent: @Sendable () -> IOReader?
+        private let seekable: Bool
+        private let clones = ProbeTestBox(0)
+        var cloneCount: Int { clones.value }
+        let discImageProbeEnabled = false
+
+        init(data: Data, seekable: Bool = true, independent: @escaping @Sendable () -> IOReader?) {
+            playback = ProbeRecordingReader(data: data)
+            self.seekable = seekable
+            self.independent = independent
+        }
+        func read(_ buffer: UnsafeMutablePointer<UInt8>?, size: Int32) -> Int32 {
+            playback.read(buffer, size: size)
+        }
+        func seek(offset: Int64, whence: Int32) -> Int64 {
+            seekable ? playback.seek(offset: offset, whence: whence) : -1
+        }
+        func cancel() { playback.cancel() }
+        func close() { playback.close() }
+        func makeIndependentReader() -> IOReader? {
+            clones.update { $0 += 1 }
+            return independent()
+        }
+    }
+
+    // Existing 64x64 HDR10 fixture, with only its SPS colour description set to unspecified by
+    // hevc_metadata=colour_primaries=2:transfer_characteristics=2:matrix_coefficients=2.
+    // The mux below also clears container colour fields, so stream analysis sees the recordless gate.
+    private static let unspecifiedHEVC = """
+    AAAAHGZ0eXBpc29tAAACAGlzb21pc28ybXA0MQAAAAhmcmVlAAAALm1kYXQAAAAOKAGveOuu+//8
+    W2VfLTwAAAAQKAGvCeAkBMh//ydhHsNI/AAAA8Ftb292AAAAbG12aGQAAAAAAAAAAAAAAAAAEk+AAAOpg
+    AABAAABAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAA
+    AAAAAAAAAAAAAAAAAAAAAAAAAAACAAAC7HRyYWsAAABcdGtoZAAAAAMAAAAAAAAAAAAAAAEAAAAA
+    AAOpgAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAA
+    QAAAAEAAAAAAACRlZHRzAAAAHGVsc3QAAAAAAAAAAQADqYAAAAAAAAEAAAAAAmRtZGlhAAAAIG1kaGQA
+    AAAAAAAAAAAAAAAAEk+AAAOpgFXEAAAAAAAtaGRscgAAAAAAAAAAdmlkZQAAAAAAAAAAAAAAAFZpZGVv
+    SGFuZGxlcgAAAAIPbWluZgAAABR2bWhkAAAAAQAAAAAAAAAAAAAAJGRpbmYAAAAcZHJlZgAAAAAAAAAB
+    AAAADHVybCAAAAABAAABz3N0YmwAAAFjc3RzZAAAAAAAAAABAAABU2h2YzEAAAAAAAAAAQAAAAAAAAAA
+    AAAAAAAAAAAAQABAAEgAAABIAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY
+    //8AAADGaHZjQwEECAAAAJ2oAAAAAB7wAPz9+voAAA8DoAACABdAAQwB//8ECAAAAwCdqAAAAwAA
+    HroCQAAXQAEMAf//BAgAAAMAnagAAAMAAB66AkChAAIAK0IBAQQIAAADAJ2oAAADAAAeoCCBBNlupJMr
+    wFqBAQECAAADAAIAAAMAFBAAK0IBAQQIAAADAJ2oAAADAAAeoCCBBNlupJMrwFqBAQECAAADAAIAAAMA
+    FBCiAAIAB0QBwXKwIkAAB0QBwXKwIkAAAAATY29scm5jbHgACQAQAAkAAAAAEHBhc3AAAAABAAAA
+    AQAAABRidHJ0AAAAAAAABfAAAAXwAAAAGHN0dHMAAAAAAAAAAQAAAAIAAdTAAAAAHHN0c2MAAAAAAAAA
+    AQAAAAEAAAACAAAAAQAAABxzdHN6AAAAAAAAAAAAAAACAAAAEgAAABQAAAAUc3RjbwAAAAAAAAABAAAA
+    LAAAAGF1ZHRhAAAAWW1ldGEAAAAAAAAAIWhkbHIAAAAAAAAAAG1kaXJhcHBsAAAAAAAAAAAAAAAALGlsc3Q
+    AAAAkqXRvbwAAABxkYXRhAAAAAQAAAABMYXZmNjMuMS4xMDI=
+    """
+
+    private static func customFixture(
+        rpu: [UInt8]?, record: Bool = false, unspecified: Bool = false, leadingPackets: Int = 0
+    ) throws -> Data {
+        let input = try ProbeTestFixtures.decode(
+            unspecified ? unspecifiedHEVC : HDR10PlusProbeIntegrationTests.hdr10Base64)
+        let source = Demuxer()
+        defer { source.close() }
+        try source.open(reader: DataIOReader(data: input), formatHint: "mp4")
+        let stream = try #require(source.stream(at: source.videoStreamIndex))
+        let first = try #require(try source.readPacket())
+        var owned: UnsafeMutablePointer<AVPacket>? = first
+        defer { av_packet_free(&owned) }
+
+        var output: UnsafeMutablePointer<AVFormatContext>?
+        try #require(avformat_alloc_output_context2(&output, nil, "mp4", nil) >= 0)
+        let context = try #require(output)
+        defer { avformat_free_context(context) }
+        var io: UnsafeMutablePointer<AVIOContext>?
+        try #require(avio_open_dyn_buf(&io) >= 0)
+        let buffer = try #require(io)
+        context.pointee.pb = buffer
+        context.pointee.strict_std_compliance = -2
+        var bytes: UnsafeMutablePointer<UInt8>?
+        var closed = false
+        defer {
+            if !closed { _ = avio_close_dyn_buf(buffer, &bytes) }
+            av_free(bytes)
+        }
+        let target = try #require(avformat_new_stream(context, nil))
+        let codecpar = try #require(target.pointee.codecpar)
+        try #require(avcodec_parameters_copy(codecpar, stream.pointee.codecpar) >= 0)
+        if unspecified {
+            codecpar.pointee.color_primaries = AVCOL_PRI_UNSPECIFIED
+            codecpar.pointee.color_trc = AVCOL_TRC_UNSPECIFIED
+            codecpar.pointee.color_space = AVCOL_SPC_UNSPECIFIED
+        }
+        if record { try #require(DolbyVisionRecordAudit.synthesizeProfile5Record(codecpar)) }
+        target.pointee.time_base = stream.pointee.time_base
+        try #require(avformat_write_header(context, nil) >= 0)
+        for index in 0...leadingPackets {
+            var packet: UnsafeMutablePointer<AVPacket>? = av_packet_clone(first)
+            defer { av_packet_free(&packet) }
+            let copy = try #require(packet)
+            if index == leadingPackets, let rpu {
+                let original = Int(copy.pointee.size)
+                try #require(av_grow_packet(copy, Int32(rpu.count + 4)) >= 0)
+                var nal = withUnsafeBytes(of: UInt32(rpu.count).bigEndian) { Array($0) }
+                nal += rpu
+                nal.withUnsafeBytes { raw in
+                    _ = memcpy(copy.pointee.data + original, raw.baseAddress, nal.count)
+                }
+            }
+            copy.pointee.pts = Int64(index) * 7500
+            copy.pointee.dts = copy.pointee.pts
+            copy.pointee.duration = 7500
+            av_packet_rescale_ts(copy, stream.pointee.time_base, target.pointee.time_base)
+            copy.pointee.stream_index = 0
+            copy.pointee.pos = -1
+            try #require(av_interleaved_write_frame(context, copy) >= 0)
+        }
+        try #require(av_write_trailer(context) >= 0)
+        let count = avio_close_dyn_buf(buffer, &bytes)
+        closed = true
+        context.pointee.pb = nil
+        try #require(count > 0)
+        return Data(bytes: try #require(bytes), count: Int(count))
+    }
+
+    @Test("custom recordless P5 is repaired without consuming the playback packet")
+    func customRecordlessP5IsRepaired() throws {
+        let data = try Self.customFixture(rpu: Self.bytes(Self.genuineProfile5RPU), unspecified: true)
+        let clone = ProbeRecordingReader(data: data)
+        let reader = AuditReader(data: data) { clone }
+        let demuxer = Demuxer()
+        defer { demuxer.close() }
+        try demuxer.open(reader: reader, formatHint: "mp4")
+        let stream = try #require(demuxer.stream(at: demuxer.videoStreamIndex))
+        #expect(AetherEngine.dvConfig(stream: stream)?.profile == 5)
+        #expect(reader.cloneCount == 1)
+        #expect(clone.closeCount == 1)
+        #expect(reader.playback.cancelCount == 0)
+        #expect(reader.playback.closeCount == 0)
+        let packet = try #require(try demuxer.readPacket())
+        defer { Self.free(packet) }
+        #expect(DolbyVisionRecordAudit.rpuProfile(packet) == 5)
+        #expect(packet.pointee.pts == 0)
+    }
+
+    @Test("a recorded P5 custom source keeps its record and does not create an audit cursor")
+    func customRecordedP5IsUnchanged() throws {
+        let data = try Self.customFixture(
+            rpu: Self.bytes(Self.genuineProfile5RPU), record: true, unspecified: true)
+        let reader = AuditReader(data: data) { nil }
+        let demuxer = Demuxer()
+        defer { demuxer.close() }
+        try demuxer.open(reader: reader, formatHint: "mp4")
+        let stream = try #require(demuxer.stream(at: demuxer.videoStreamIndex))
+        #expect(AetherEngine.dvConfig(stream: stream)?.profile == 5)
+        #expect(reader.cloneCount == 0)
+    }
+
+    @Test("contradictory custom P5 records follow the parsed P7/P8 RPU", arguments: [7, 8])
+    func customContradictoryRecordIsCorrected(profile: Int) throws {
+        let nal = profile == 7
+            ? DoviRpuGuardTests.craft(pieces: Array(repeating: [.polynomial], count: 3), residual: .mel)
+            : Self.bytes(Self.realProfile81RPU)
+        let data = try Self.customFixture(rpu: nal, record: true)
+        let clone = ProbeRecordingReader(data: data)
+        let reader = AuditReader(data: data) { clone }
+        let demuxer = Demuxer()
+        defer { demuxer.close() }
+        try demuxer.open(reader: reader, formatHint: "mp4")
+        let stream = try #require(demuxer.stream(at: demuxer.videoStreamIndex))
+        let record = AetherEngine.dvConfig(stream: stream)?.profile
+        #expect(record == 5)
+        #expect(DolbyVisionRecordAudit.recordIsContradicted(
+            codecID: stream.pointee.codecpar.pointee.codec_id, dvProfile: record,
+            colorTransfer: stream.pointee.codecpar.pointee.color_trc,
+            colorMatrix: stream.pointee.codecpar.pointee.color_space))
+        let reads = reader.playback.reads.count
+        let seeks = reader.playback.seeks.count
+        let parsed = demuxer.dolbyVisionRPUProfile()
+        #expect(parsed == profile)
+        #expect(DolbyVisionRecordAudit.correctedProfile(record: record, rpu: parsed) == profile)
+        let route = try Self.route(Self.relabelledProfile5(), rpuProfile: parsed)
+        #expect(route.doviConfig == .rewriteToProfile81)
+        #expect(route.convertP7ToProfile81 == (profile == 7))
+        #expect(reader.playback.reads.count == reads)
+        #expect(reader.playback.seeks.count == seeks)
+        #expect(reader.playback.cancelCount == 0)
+        #expect(reader.playback.closeCount == 0)
+        #expect(clone.closeCount == 1)
+    }
+
+    @Test("missing or malformed custom RPU never invents DV", arguments: [false, true])
+    func customUnreadableRPULeavesRecordAlone(malformed: Bool) throws {
+        let data = try Self.customFixture(rpu: malformed ? [0x7C, 1, 0] : nil, unspecified: true)
+        let clone = ProbeRecordingReader(data: data)
+        let reader = AuditReader(data: data) { clone }
+        let demuxer = Demuxer()
+        defer { demuxer.close() }
+        try demuxer.open(reader: reader, formatHint: "mp4")
+        let stream = try #require(demuxer.stream(at: demuxer.videoStreamIndex))
+        #expect(AetherEngine.dvConfig(stream: stream) == nil)
+        #expect(reader.cloneCount == 1)
+        #expect(clone.closeCount == 1)
+    }
+
+    @Test("live and nonseekable custom inputs never request an independent cursor", arguments: [false, true])
+    func customIneligibleSourceIsSkipped(live: Bool) throws {
+        let data = try Self.customFixture(rpu: Self.bytes(Self.genuineProfile5RPU), unspecified: true)
+        let reader = AuditReader(data: data, seekable: live) { nil }
+        let demuxer = Demuxer()
+        defer { demuxer.close() }
+        try demuxer.open(reader: reader, formatHint: "mp4", isLive: live)
+        let stream = try #require(demuxer.stream(at: demuxer.videoStreamIndex))
+        #expect(AetherEngine.dvConfig(stream: stream) == nil)
+        #expect(demuxer.dolbyVisionRPUProfile() == nil)
+        #expect(reader.cloneCount == 0)
+    }
+
+    @Test("a missing, nonseekable or failing audit cursor leaves playback alone", arguments: [0, 1, 2])
+    func customUnavailableCursorIsSkipped(kind: Int) throws {
+        let data = try Self.customFixture(rpu: Self.bytes(Self.genuineProfile5RPU), unspecified: true)
+        let clone = ProbeRecordingReader(data: Data())
+        let nonseekable = AuditReader(data: data, seekable: false) { nil }
+        let reader = AuditReader(data: data) {
+            if kind == 0 { return nil }
+            if kind == 1 { return nonseekable }
+            return clone
+        }
+        let demuxer = Demuxer()
+        defer { demuxer.close() }
+        try demuxer.open(reader: reader, formatHint: "mp4")
+        let stream = try #require(demuxer.stream(at: demuxer.videoStreamIndex))
+        #expect(AetherEngine.dvConfig(stream: stream) == nil)
+        #expect(reader.playback.cancelCount == 0)
+        #expect(reader.playback.closeCount == 0)
+        let packet = try #require(try demuxer.readPacket())
+        defer { Self.free(packet) }
+        #expect(DolbyVisionRecordAudit.rpuProfile(packet) == 5)
+        if kind == 1 { #expect(nonseekable.playback.closeCount == 1) }
+        if kind == 2 { #expect(clone.closeCount == 1) }
+    }
+
+    @Test("a clone factory returning playback itself cannot move or close playback")
+    func customSameCursorIsRejected() {
+        let holder = ProbeTestBox<IOReader?>(nil)
+        let reader = AuditReader(data: Data()) { holder.value }
+        holder.update { $0 = reader }
+        defer { holder.update { $0 = nil } }
+        let parsed = DolbyVisionRecordAudit.rpuProfileOfSource(reader: reader)
+        #expect(parsed == nil)
+        #expect(reader.playback.reads.isEmpty)
+        #expect(reader.playback.seeks.isEmpty)
+        #expect(reader.playback.cancelCount == 0)
+        #expect(reader.playback.closeCount == 0)
+    }
+
+    @Test("cancellation wins over bytes containing a valid custom RPU", arguments: [false, true])
+    func customCancelledPositiveIsDiscarded(beforeOpen: Bool) throws {
+        let data = try Self.customFixture(rpu: Self.bytes(Self.genuineProfile5RPU), unspecified: true)
+        let cancellation = ProbeCancellation()
+        let clone = ProbeRecordingReader(data: data, afterRead: { cancellation.cancel() })
+        let reader = AuditReader(data: data) { clone }
+        if beforeOpen { cancellation.cancel() }
+        let parsed = DolbyVisionRecordAudit.rpuProfileOfSource(
+            reader: reader, formatHint: "mp4", cancellation: cancellation)
+        #expect(parsed == nil)
+        #expect(reader.cloneCount == (beforeOpen ? 0 : 1))
+        #expect(clone.closeCount == (beforeOpen ? 0 : 1))
+        #expect(reader.playback.cancelCount == 0)
+        #expect(reader.playback.closeCount == 0)
+    }
+
+    @Test("custom audit honours both video packet budgets", arguments: [4, 16])
+    func customPacketBudgetIsKept(budget: Int) throws {
+        for leading in [budget - 1, budget] {
+            let data = try Self.customFixture(rpu: Self.bytes(Self.realProfile81RPU), leadingPackets: leading)
+            let clone = ProbeRecordingReader(data: data)
+            let reader = AuditReader(data: data) { clone }
+            let parsed = DolbyVisionRecordAudit.rpuProfileOfSource(
+                reader: reader, formatHint: "mp4", packetBudget: budget)
+            let expected: Int? = leading < budget ? 8 : nil
+            #expect(parsed == expected)
+            #expect(reader.playback.reads.isEmpty)
+            #expect(reader.playback.seeks.isEmpty)
+            #expect(clone.closeCount == 1)
+        }
+    }
+
+    @Test("audit cancellation interrupts only the clone and joins its callback", .timeLimit(.minutes(1)),
+          arguments: ProbeParkedReader.Operation.allCases)
+    func customCancellationDoesNotTouchPlayback(operation: ProbeParkedReader.Operation) async throws {
+        let clone = ProbeParkedReader(operation: operation)
+        defer { clone.release() }
+        let reader = AuditReader(data: Data()) { clone }
+        let cancellation = ProbeCancellation()
+        let job = ProbeTestJob {
+            DolbyVisionRecordAudit.rpuProfileOfSource(
+                reader: reader, formatHint: "mp4", cancellation: cancellation)
+        }
+        try await waitFor { clone.interrupted.entered }
+        cancellation.cancel()
+        #expect(clone.cancelCount == 1)
+        #expect(!job.isFinished)
+        clone.mayReturn.open()
+        let result = try await job.outcome().get()
+        #expect(result == nil)
+        #expect(clone.closeCount == 1)
+        #expect(reader.playback.reads.isEmpty)
+        #expect(reader.playback.seeks.isEmpty)
+        #expect(reader.playback.cancelCount == 0)
+        #expect(reader.playback.closeCount == 0)
+    }
+
+    @Test("closing the parent demuxer cancels its independent audit", .timeLimit(.minutes(1)))
+    func closingParentCancelsCustomAudit() async throws {
+        let data = try Self.customFixture(rpu: Self.bytes(Self.realProfile81RPU), record: true)
+        let clone = ProbeParkedReader(operation: .read)
+        defer { clone.release() }
+        let reader = AuditReader(data: data) { clone }
+        let demuxer = Demuxer()
+        defer { demuxer.close() }
+        try demuxer.open(reader: reader, formatHint: "mp4")
+        let job = ProbeTestJob { demuxer.dolbyVisionRPUProfile() }
+        try await waitFor { clone.interrupted.entered }
+        demuxer.markClosed()
+        #expect(clone.cancelCount == 1)
+        #expect(!job.isFinished)
+        clone.mayReturn.open()
+        let result = try await job.outcome().get()
+        #expect(result == nil)
+        #expect(clone.closeCount == 1)
+    }
 }
