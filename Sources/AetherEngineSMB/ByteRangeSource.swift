@@ -16,10 +16,17 @@ public protocol ByteRangeSource: AnyObject, Sendable {
     /// past EOF. Throws on a genuine I/O error.
     func read(at offset: Int64, length: Int) async throws -> Data
 
+    /// A disposable probe's read. Cancellation must not abandon a connection playback shares;
+    /// an already-issued read may drain before another cursor takes its turn.
+    func readForProbe(at offset: Int64, length: Int) async throws -> Data
+
     /// Release the underlying resource. Must be idempotent.
     func close()
 }
 
 public extension ByteRangeSource {
     var maximumProbeReadAttempts: Int? { nil }
+    func readForProbe(at offset: Int64, length: Int) async throws -> Data {
+        try await read(at: offset, length: length)
+    }
 }

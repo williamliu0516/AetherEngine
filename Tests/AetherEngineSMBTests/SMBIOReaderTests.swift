@@ -6,6 +6,7 @@ private final class FakeByteRangeSource: ByteRangeSource, @unchecked Sendable {
     let data: Data
     private(set) var closeCount = 0
     private(set) var requests: [Int] = []
+    private(set) var probeReads = 0
     let maximumProbeReadAttempts: Int?
     init(_ data: Data, attempts: Int? = 1) {
         self.data = data
@@ -18,6 +19,10 @@ private final class FakeByteRangeSource: ByteRangeSource, @unchecked Sendable {
         guard offset >= 0, offset < data.count, length > 0 else { return Data() }
         let end = min(Int(offset) + length, data.count)
         return data.subdata(in: Int(offset)..<end)
+    }
+    func readForProbe(at offset: Int64, length: Int) async throws -> Data {
+        probeReads += 1
+        return try await read(at: offset, length: length)
     }
     func close() { closeCount += 1 }
 }
@@ -131,6 +136,7 @@ final class SMBIOReaderTests: XCTestCase {
         XCTAssertEqual(readN(probe, 4), Data([100, 101]))
         XCTAssertEqual(readN(probe, 1), Data())
         XCTAssertEqual(source.requests, [4, 2])
+        XCTAssertEqual(source.probeReads, 2)
         probe.close()
         XCTAssertEqual(source.closeCount, 0)
         XCTAssertEqual(readN(primary, 2), Data([0, 1]))

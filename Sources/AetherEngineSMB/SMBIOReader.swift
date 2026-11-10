@@ -68,10 +68,14 @@ public final class SMBIOReader: IOReader, @unchecked Sendable {
             if let remaining = auditBytesRemaining {
                 auditBytesRemaining = remaining - Int64(want) * auditReadAttempts
             }
+            let probe = auditBytesRemaining != nil
             let task = Task { [source] in
                 do {
                     try Task.checkCancellation()
-                    outcome.result = .success(try await source.read(at: offset, length: want))
+                    let data: Data
+                    if probe { data = try await source.readForProbe(at: offset, length: want) }
+                    else { data = try await source.read(at: offset, length: want) }
+                    outcome.result = .success(data)
                 } catch { outcome.result = .failure(error) }
                 semaphore.signal()
             }
