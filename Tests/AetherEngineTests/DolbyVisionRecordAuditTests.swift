@@ -476,6 +476,7 @@ extension DolbyVisionRecordAuditTests {
             clones.update { $0 += 1 }
             return independent()
         }
+        func makeIndependentReader(limits: ProbeLimits) -> IOReader? { makeIndependentReader() }
     }
 
     // Existing 64x64 HDR10 fixture, with only its SPS colour description set to unspecified by
@@ -756,6 +757,27 @@ extension DolbyVisionRecordAuditTests {
         #expect(reader.playback.seeks.isEmpty)
         #expect(reader.playback.cancelCount == 0)
         #expect(reader.playback.closeCount == 0)
+    }
+
+    @Test("a custom audit's watchdog interrupts a read that never answers", .timeLimit(.minutes(1)))
+    func customAuditDeadlineUnblocksItsCursor() async throws {
+        let clone = ProbeParkedReader(operation: .read)
+        clone.mayReturn.open()
+        defer { clone.release() }
+        let reader = AuditReader(data: Data()) { clone }
+        // test-wait: this exercises the real DispatchSource watchdog waking cooperative blocked I/O.
+        let job = ProbeTestJob {
+            DolbyVisionRecordAudit.rpuProfileOfSource(reader: reader, formatHint: "mp4", timeBudget: 0.05)
+        }
+        // The deadline itself is the assertion; release even a broken arm before joining its worker.
+        let finishedByDeadline = try await waitFor(upTo: .seconds(2)) { job.isFinished }
+        #expect(finishedByDeadline)
+        clone.release()
+        let result = try await job.outcome().get()
+        #expect(result == nil)
+        #expect(clone.cancelCount == 1)
+        #expect(clone.closeCount == 1)
+        #expect(reader.playback.cancelCount == 0)
     }
 
     @Test("closing the parent demuxer cancels its independent audit", .timeLimit(.minutes(1)))

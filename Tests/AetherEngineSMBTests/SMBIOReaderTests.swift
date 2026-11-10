@@ -1,17 +1,39 @@
 import XCTest
+@testable import AetherEngine
 @testable import AetherEngineSMB
 
 private final class FakeByteRangeSource: ByteRangeSource, @unchecked Sendable {
     let data: Data
     private(set) var closeCount = 0
+    private(set) var requests: [Int] = []
     init(_ data: Data) { self.data = data }
     var byteSize: Int64 { Int64(data.count) }
     func read(at offset: Int64, length: Int) async throws -> Data {
+        requests.append(length)
         guard offset >= 0, offset < data.count, length > 0 else { return Data() }
         let end = min(Int(offset) + length, data.count)
         return data.subdata(in: Int(offset)..<end)
     }
     func close() { closeCount += 1 }
+}
+
+/// Stops after ProbeIOReader's allowance check, before the disposable reader starts I/O.
+private final class BeforeReadGate: IOReader, @unchecked Sendable {
+    let proceed = DispatchSemaphore(value: 0)
+    private let reader: IOReader
+    private let entered: @Sendable () -> Void
+    init(reader: IOReader, entered: @escaping @Sendable () -> Void) {
+        self.reader = reader
+        self.entered = entered
+    }
+    func read(_ buffer: UnsafeMutablePointer<UInt8>?, size: Int32) -> Int32 {
+        entered()
+        proceed.wait()
+        return reader.read(buffer, size: size)
+    }
+    func seek(offset: Int64, whence: Int32) -> Int64 { reader.seek(offset: offset, whence: whence) }
+    func cancel() { reader.cancel() }
+    func close() {}
 }
 
 private func readN(_ r: SMBIOReader, _ n: Int) -> Data {
@@ -91,6 +113,66 @@ final class SMBIOReaderTests: XCTestCase {
         XCTAssertFalse(ordinaryMediaReader.discImageProbeEnabled)
         let independent = try XCTUnwrap(ordinaryMediaReader.makeIndependentReader())
         XCTAssertFalse(independent.discImageProbeEnabled)
+    }
+
+    func testBoundedIndependentReaderCountsSparseRequestsAndLeavesPlaybackAlone() throws {
+        let source = FakeByteRangeSource(payload)
+        let primary = SMBIOReader(source: source, discImageProbeEnabled: false)
+        let probe = try XCTUnwrap(primary.makeIndependentReader(limits: ProbeLimits(maxInputBytes: 6)) as? SMBIOReader)
+        defer { probe.close(); primary.close() }
+        XCTAssertFalse(probe.discImageProbeEnabled)
+        XCTAssertEqual(readN(probe, 4), Data([0, 1, 2, 3]))
+        XCTAssertEqual(probe.seek(offset: 100, whence: SEEK_SET), 100)
+        XCTAssertEqual(readN(probe, 4), Data([100, 101]))
+        XCTAssertEqual(readN(probe, 1), Data())
+        XCTAssertEqual(source.requests, [4, 2])
+        probe.close()
+        XCTAssertEqual(source.closeCount, 0)
+        XCTAssertEqual(readN(primary, 2), Data([0, 1]))
+    }
+
+    func testBoundedIndependentReaderCannotReadAfterCancelOrClose() throws {
+        let source = FakeByteRangeSource(payload)
+        let primary = SMBIOReader(source: source)
+        defer { primary.close() }
+        for close in [false, true] {
+            let probe = try XCTUnwrap(primary.makeIndependentReader(limits: ProbeLimits()) as? SMBIOReader)
+            if close { probe.close() } else { probe.cancel() }
+            XCTAssertEqual(readN(probe, 1), Data())
+            probe.close()
+        }
+        XCTAssertTrue(source.requests.isEmpty)
+        XCTAssertEqual(source.closeCount, 0)
+        // Ordinary independent readers retain their reusable cancellation semantics.
+        let ordinary = try XCTUnwrap(primary.makeIndependentReader() as? SMBIOReader)
+        defer { ordinary.close() }
+        ordinary.cancel()
+        XCTAssertEqual(readN(ordinary, 1), Data([0]))
+    }
+
+    func testBoundedCancelBetweenAllowanceAndUnderlyingReadStartsNoRequest() async throws {
+        let source = FakeByteRangeSource(payload)
+        let primary = SMBIOReader(source: source)
+        let probe = try XCTUnwrap(primary.makeIndependentReader(limits: ProbeLimits()))
+        let entered = expectation(description: "allowance passed, delegate read not started")
+        let ended = expectation(description: "cancelled read returned")
+        let gate = BeforeReadGate(reader: probe, entered: { entered.fulfill() })
+        let cancellation = ProbeCancellation()
+        let control = try ProbeControl(limits: nil, cancellation: cancellation)
+        let counted = ProbeIOReader(reader: gate, control: control)
+        defer { gate.proceed.signal(); control.finish(); probe.close(); primary.close() }
+        Thread.detachNewThread {
+            var byte: UInt8 = 0
+            _ = counted.read(&byte, size: 1)
+            ended.fulfill()
+        }
+        await fulfillment(of: [entered], timeout: 5)
+        cancellation.cancel()
+        gate.proceed.signal()
+        await fulfillment(of: [ended], timeout: 5)
+        XCTAssertTrue(source.requests.isEmpty)
+        XCTAssertEqual(source.closeCount, 0)
+        XCTAssertEqual(readN(primary, 1), Data([0]))
     }
 
     func testNegativeSeekDoesNotCorruptCursor() {

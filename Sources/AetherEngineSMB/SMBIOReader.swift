@@ -18,6 +18,10 @@ public final class SMBIOReader: IOReader, @unchecked Sendable {
     // per the IOReader contract; no lock needed.
     private var position: Int64 = 0
     private var didClose = false
+    /// Only disposable bounded readers latch cancellation and reserve every requested source byte.
+    /// Protected by inFlightLock together with publishing the next read.
+    private var auditBytesRemaining: Int64?
+    private var auditStopped = false
     /// Per-read in-flight state, published so cancel() (a different thread) can both cancel the
     /// background work and, crucially, unblock read()'s semaphore wait. The underlying SMB read
     /// is an in-flight network round-trip that task.cancel() may not interrupt promptly (it can
@@ -54,16 +58,24 @@ public final class SMBIOReader: IOReader, @unchecked Sendable {
     public func read(_ buffer: UnsafeMutablePointer<UInt8>?, size: Int32) -> Int32 {
         guard let buffer, size > 0 else { return 0 }
         let offset = position
-        let want = Int(size)
-
         let semaphore = DispatchSemaphore(value: 0)
         let outcome = ReadOutcome()
-        let task = Task { [source] in
-            do { outcome.result = .success(try await source.read(at: offset, length: want)) }
-            catch { outcome.result = .failure(error) }
-            semaphore.signal()
+        let requested = inFlightLock.withLock { state -> Int in
+            guard !auditStopped else { return 0 }
+            let want = Int(min(Int64(size), auditBytesRemaining ?? Int64(size)))
+            guard want > 0 else { return 0 }
+            if let remaining = auditBytesRemaining { auditBytesRemaining = remaining - Int64(want) }
+            let task = Task { [source] in
+                do {
+                    try Task.checkCancellation()
+                    outcome.result = .success(try await source.read(at: offset, length: want))
+                } catch { outcome.result = .failure(error) }
+                semaphore.signal()
+            }
+            state = Inflight(task: task, semaphore: semaphore)
+            return want
         }
-        inFlightLock.withLock { $0 = Inflight(task: task, semaphore: semaphore) }
+        guard requested > 0 else { return -1 }
         semaphore.wait()
         // cancel() may have signalled to unblock teardown while the SMB read is still running.
         // In that case do NOT read `outcome`: the background Task may still be writing it (the
@@ -90,7 +102,7 @@ public final class SMBIOReader: IOReader, @unchecked Sendable {
             // whole session, at the source's read rate.
             return autoreleasepool { () -> Int32 in
                 if data.isEmpty { return 0 } // EOF
-                let n = min(data.count, want)
+                let n = min(data.count, requested)
                 data.copyBytes(to: buffer, count: n)
                 position += Int64(n)
                 return Int32(n)
@@ -114,6 +126,7 @@ public final class SMBIOReader: IOReader, @unchecked Sendable {
 
     public func cancel() {
         inFlightLock.withLock { state in
+            if auditBytesRemaining != nil { auditStopped = true }
             state?.cancelled = true
             state?.task.cancel()
             state?.semaphore.signal()   // wake read()'s wait; the SMB op drains in the background
@@ -130,7 +143,15 @@ public final class SMBIOReader: IOReader, @unchecked Sendable {
         )
     }
 
+    public func makeIndependentReader(limits: ProbeLimits) -> IOReader? {
+        guard limits.maxInputBytes >= 0 else { return nil }
+        let reader = SMBIOReader(source: source, ownsSource: false, discImageProbeEnabled: discImageProbeEnabled)
+        reader.auditBytesRemaining = limits.maxInputBytes
+        return reader
+    }
+
     public func close() {
+        if auditBytesRemaining != nil { cancel() }
         guard !didClose else { return }
         didClose = true
         if ownsSource { source.close() }

@@ -20,6 +20,12 @@ public protocol IOReader: AnyObject, Sendable {
     /// Return an independent reader with its own cursor over the same source for concurrent access (side demuxer, scrub previews). Return nil for one-shot streams; the engine skips that feature. The returned reader is owned and closed by the engine.
     func makeIndependentReader() -> IOReader?
 
+    /// A disposable metadata reader: no speculative reads, at most `maxInputBytes` newly requested
+    /// source bytes (including retries), and cancellation that also prevents a read about to start.
+    /// Close cancels its own requests without cancelling requests another cursor still needs.
+    /// Return nil when the source cannot provide these bounds; ordinary independent readers are unchanged.
+    func makeIndependentReader(limits: ProbeLimits) -> IOReader?
+
     /// Whether the engine should inspect this custom byte source for an ISO/UDF disc image before
     /// opening it as an ordinary media container. Keep the default for raw disc images. Remote
     /// readers that already know they represent a regular media file can return `false` to avoid
@@ -63,6 +69,7 @@ extension TimeSeekableIOReader {
 public extension IOReader {
     func cancel() {}
     func makeIndependentReader() -> IOReader? { nil }
+    func makeIndependentReader(limits: ProbeLimits) -> IOReader? { nil }
     var discImageProbeEnabled: Bool { true }
 }
 

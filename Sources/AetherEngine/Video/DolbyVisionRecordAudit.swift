@@ -207,19 +207,23 @@ public enum DolbyVisionRecordAudit {
     /// wrapper counts input from open onward and cancels only that cursor; all verdicts stay optional.
     static func rpuProfileOfSource(
         reader: IOReader, formatHint: String? = nil, packetBudget: Int = auditPacketBudget,
-        cancellation: ProbeCancellation? = nil
+        cancellation: ProbeCancellation? = nil, timeBudget: TimeInterval = 2
     ) -> Int? {
-        guard cancellation?.isCancelled != true,
-              let independent = autoreleasepool(invoking: { reader.makeIndependentReader() }),
-              independent !== reader else { return nil }
+        let started = ProcessInfo.processInfo.systemUptime
         let (packetLimit, overflow) = packetBudget.multipliedReportingOverflow(by: foreignPacketFuseMultiplier)
         let limits = ProbeLimits(
             maxInputBytes: Int64(walkByteBudget),
             maxPackets: overflow ? Int.max : packetLimit,
             maxPacketBytes: walkByteBudget,
-            timeBudget: .greatestFiniteMagnitude)
-        guard let control = try? ProbeControl(
-            limits: limits, cancellation: cancellation, scheduleDeadline: false) else {
+            timeBudget: timeBudget)
+        guard cancellation?.isCancelled != true,
+              let independent = autoreleasepool(invoking: { reader.makeIndependentReader(limits: limits) }),
+              independent !== reader else { return nil }
+        defer {
+            EngineLog.emit(String(format: "[DV audit] custom elapsed=%.3fs",
+                                  ProcessInfo.processInfo.systemUptime - started), category: .demux)
+        }
+        guard let control = try? ProbeControl(limits: limits, cancellation: cancellation) else {
             independent.close()
             return nil
         }
