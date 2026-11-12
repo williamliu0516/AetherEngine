@@ -43,6 +43,9 @@ the public-API contract.
 
 ### Fixed
 
+- **The live-header renewal test waits for the host's replacement before retrying.** Its reconnect handshake
+  keeps neighbouring tests' shortened backoff from exhausting the old token while the renewal task waits to run.
+
 - **A stop no longer waits on the audio queue.** `AudioOutput.stop()` flushed the renderer in place, under its lock,
   then rested the clock; the flush resets the audio queue with a synchronous call on the queue's server, and the
   rate change waits on the queue's lock. With the output on a device that never starts (the iOS simulator on the

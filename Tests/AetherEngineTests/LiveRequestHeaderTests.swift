@@ -16,13 +16,30 @@ struct LiveRequestHeaderTests {
     /// `lapsesAt` and refused from there on, "second" is served everywhere. Tying the lapse to the
     /// offset rather than to a moment keeps the read from racing the rotation.
     final class TokenGate: @unchecked Sendable {
-        private let lock = NSLock()
+        private let lock = NSCondition()
         private var refused = 0
+        private var waitingForRenewal = false
+        private var renewed = false
         let lapsesAt: Int64
         weak var origin: ThrottledOriginServer?
 
         init(lapsesAt: Int64) { self.lapsesAt = lapsesAt }
         var refusals: Int { lock.withLock { refused } }
+        var awaitingRenewal: Bool { lock.withLock { waitingForRenewal } }
+
+        func waitForRenewal() {
+            lock.lock()
+            waitingForRenewal = true
+            while !renewed { lock.wait() }
+            lock.unlock()
+        }
+
+        func finishRenewal() {
+            lock.lock()
+            renewed = true
+            lock.broadcast()
+            lock.unlock()
+        }
 
         func answer(_ index: Int, offset: Int64) -> ThrottledOriginServer.Directive {
             let sent = origin?.requestHeaders[index]["authorization"]
@@ -48,7 +65,13 @@ struct LiveRequestHeaderTests {
                                 extraHeaders: store.current,
                                 boundedInitialFetch: firstRange,
                                 requestHeaderStore: store)
-        defer { reader.markClosed(); reader.close() }
+        defer { reader.markClosed(); gate.finishRenewal(); reader.close() }
+        // Neighbouring suites shorten the process-wide backoff. Park this reader's detached
+        // thread at the actual reconnect until the host task has replaced the token, rather
+        // than racing that task's scheduling against the credential-refusal retry budget.
+        reader.onNetworkPhaseChanged = { phase in
+            if phase == .reconnecting && gate.refusals > 0 { gate.waitForRenewal() }
+        }
         try reader.open()
 
         let target = Int(firstRange) + 1024 * 1024
@@ -67,8 +90,10 @@ struct LiveRequestHeaderTests {
         }
 
         // The reader has met the refusal and is in its reconnect ladder before the host renews.
-        try await waitFor { gate.refusals >= 1 }
+        try await waitFor { gate.awaitingRenewal || delivered.total != nil }
+        #expect(gate.awaitingRenewal, "the reader reached the reconnect before the host renewed")
         store.replace(["Authorization": "Bearer second"])
+        gate.finishRenewal()
 
         try await waitFor { delivered.total != nil }
         #expect(delivered.total == target, "the read healed past the refusal instead of failing")
