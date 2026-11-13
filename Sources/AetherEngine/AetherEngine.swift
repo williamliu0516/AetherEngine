@@ -7639,8 +7639,10 @@ public final class AetherEngine: ObservableObject {
     /// the TimeDomain pitch algorithm (#434), whose range is 1/32 to 32 (iOS's old default,
     /// LowQualityZeroLatency, stops at 2x), and the engine serves no I-frame rendition unless asked
     /// (`serveIFramePlaylist`), so AVPlayer has no trick-play track to switch to above 2x and decodes
-    /// every frame with its audio. Measured at 2.5x and 3x on the loopback, remote-HLS and software routes
-    /// (W2424, `.agents/reports/speed-3x-engine.md` in the host app). Returns 3.0 while idle too.
+    /// every frame with its audio. WIP (W2424): measured so far only on loopback, one 4K HDR10 HEVC file on
+    /// an iPhone SE 3, where 2.5x and 3x held the rate with no dropped frames but stalled for up to 2.3 s
+    /// and a seek at speed did not resume within 20 s. Not yet justified for loopback; remote-HLS and
+    /// software are unmeasured. Returns 3.0 while idle too.
     public var maxSupportedRate: Float { Self.maxForwardRate }
 
     static let maxForwardRate: Float = 3.0

@@ -4,8 +4,8 @@ import Testing
 
 /// AetherEngine#39 capped video at 2x after 3x went abnormal on an A12 iPad running iOS 16, on the native
 /// route with the platform's old default pitch algorithm. Every route now pins TimeDomain (#434, range 1/32
-/// to 32) and measured 3x held on the native, software and audio routes (W2424), so video's ceiling is 3x
-/// like audio-only's. These pin the ceiling on a video host and that a 3x request reaches it unclamped.
+/// to 32), so video's ceiling is raised to 3x like audio-only's (WIP, W2424: the per-route measurement is
+/// not finished). These pin the ceiling on a video host and that a 3x request reaches it unclamped.
 @Suite("AetherEngine#39: video plays to 3x")
 @MainActor
 struct VideoRateCeilingTests {
