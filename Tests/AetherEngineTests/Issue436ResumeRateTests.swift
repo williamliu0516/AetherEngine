@@ -99,7 +99,7 @@ struct Issue436ResumeRateTests {
 
         engine.desiredRate = 3.0
         engine.applyDesiredRate(to: stub)
-        // 3.0 is the audio-only ceiling; an idle engine reports the video one, and the seed follows it.
+        // The seed follows the engine's ceiling (3.0 on every route since #39's measurement, W2424).
         #expect(stub.resumeRates == [engine.maxSupportedRate])
         #expect(stub.played == 0 && stub.rates.isEmpty,
                 "seeding a rebuilt host must not assert play or re-rate it")
