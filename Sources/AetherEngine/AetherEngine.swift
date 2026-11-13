@@ -7616,8 +7616,7 @@ public final class AetherEngine: ObservableObject {
         // audio AVPlayer hosts are REUSED across loads, and the rate they resume at lives on that
         // player, so a new item would otherwise inherit the previous one's speed from a host object
         // the engine's own memory no longer describes.
-        // Re-clamped per host: the cap is 3.0 for an audio-only session and 2.0 for video, so a rate
-        // carried out of one must not outrun the other.
+        // Re-clamped per host, so a rate carried across loads never outruns the cap.
         host.setResumeRate(min(desiredRate ?? 1.0, maxSupportedRate))
     }
 
@@ -7632,12 +7631,19 @@ public final class AetherEngine: ObservableObject {
         }
     }
 
-    /// Maximum reliable forward rate: 3x for audio-only sessions, 2x for video.
-    /// Above the cap AVPlayer fast-forward becomes unstable (AetherEngine#39).
-    /// Hosts should size their speed picker against this. Query after load; returns 2.0 while idle.
-    public var maxSupportedRate: Float {
-        (audioAVPlayerActive || audioHost != nil) ? 3.0 : 2.0
-    }
+    /// Maximum reliable forward rate: 3x on every route, video included. Hosts should size their speed
+    /// picker against this; `setRate(_:)` clamps to it as a backstop.
+    ///
+    /// AetherEngine#39 capped video at 2x on a report from an A12 iPad on iOS 16, where 3x on the native
+    /// route sent audio and video abnormal. Two things that report rode on are gone: every route now pins
+    /// the TimeDomain pitch algorithm (#434), whose range is 1/32 to 32 (iOS's old default,
+    /// LowQualityZeroLatency, stops at 2x), and the engine serves no I-frame rendition unless asked
+    /// (`serveIFramePlaylist`), so AVPlayer has no trick-play track to switch to above 2x and decodes
+    /// every frame with its audio. Measured at 2.5x and 3x on the loopback, remote-HLS and software routes
+    /// (W2424, `.agents/reports/speed-3x-engine.md` in the host app). Returns 3.0 while idle too.
+    public var maxSupportedRate: Float { Self.maxForwardRate }
+
+    static let maxForwardRate: Float = 3.0
 
     /// Set playback speed. Clamped to `maxSupportedRate` (AetherEngine#39). 0 pauses. While paused a
     /// non-zero rate is kept for the next `play()` instead of resuming (#730).
