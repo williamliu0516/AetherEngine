@@ -41,6 +41,13 @@ the public-API contract.
   aetherctl's `--stereo`, `--volume-boost` and `--audio-bridge` are documented** (docs/api.md, docs/cli.md), so the three
   documentation-coverage tests pass again; CONTRIBUTING names the LAN-peer HLS test a Mac's firewall times out.
 
+### Changed
+
+- **`maxSupportedRate` is per route: 3x on the software route, 2x on the AVPlayer routes** (AetherEngine#39). The
+  software host paces its own renderer and held 3.00x on a 120 Hz iPad Pro (MPEG-2 SD, 0-1 frames dropped in ~1350);
+  audio-only stays at 3.0. `.loopback` and `.remoteBypass` stay at 2.0: above it AVPlayer's HLS playback stands and
+  jumps between keyframes (2.3 s stills at 3x on an iPhone SE 3). New `maxSupportedRate(on:)` gives each route's value.
+
 ### Fixed
 
 - **A stop no longer waits on the audio queue.** `AudioOutput.stop()` flushed the renderer in place, under its lock,

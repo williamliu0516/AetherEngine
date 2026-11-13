@@ -12,7 +12,7 @@ import AVFoundation
 /// per platform below those versions), and makes it identical across all four hosts.
 ///
 /// TimeDomain is pitch-preserving over a variable rate from 1/32 to 32, comfortably past
-/// `maxSupportedRate` (2.0 video, 3.0 audio-only); a rate the algorithm does not support is
+/// `maxSupportedRate` (2.0 on the AVPlayer routes, 3.0 software and audio-only); a rate the algorithm does not support is
 /// muted rather than played. Spectral costs more and is aimed at music, Varispeed is the one
 /// that deliberately lets pitch ride the rate.
 enum AudioRatePolicy {

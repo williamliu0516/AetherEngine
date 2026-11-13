@@ -7645,7 +7645,8 @@ public final class AetherEngine: ObservableObject {
     /// stood for 2.3 s at a time with 25 times the segment requests of 2x; stock AVPlayer on a Mac, playing
     /// a plain HTTP HLS stream as the remote-HLS route does, shows 10 frames a second at 2.5x and 3x from
     /// 4K and 20 from 1080p, against every frame at 2x. 3.0 on the software route, which paces its own
-    /// renderer (unmeasured so far), and on the audio-only one, which has no frames to skip (#39's value).
+    /// renderer (W2424: MPEG-2 SD held 3.00x on a 120 Hz iPad Pro with 0-1 of ~1350 frames dropped an arm; a 60 Hz
+    /// panel drops what it cannot show, lost=0), and on the audio-only one, which has no frames to skip (#39's value).
     public static func maxSupportedRate(on route: VideoRoute) -> Float {
         switch route {
         case .software, .audio: return 3.0

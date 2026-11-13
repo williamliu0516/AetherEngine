@@ -199,7 +199,7 @@ try await player.load(url: trackURL, options: .init(audioOnly: true))   // lean 
 player.play()
 player.pause()
 player.togglePlayPause()
-player.setRate(1.5)                    // clamped to player.maxSupportedRate (2x video, 3x audio-only)
+player.setRate(1.5)                    // clamped to player.maxSupportedRate (2x on the AVPlayer routes, 3x software and audio-only)
 await player.seek(to: 120)
 player.stop()
 
