@@ -7631,21 +7631,37 @@ public final class AetherEngine: ObservableObject {
         }
     }
 
-    /// Maximum reliable forward rate: 3x on every route, video included. Hosts should size their speed
-    /// picker against this; `setRate(_:)` clamps to it as a backstop.
-    ///
-    /// AetherEngine#39 capped video at 2x on a report from an A12 iPad on iOS 16, where 3x on the native
-    /// route sent audio and video abnormal. Two things that report rode on are gone: every route now pins
-    /// the TimeDomain pitch algorithm (#434), whose range is 1/32 to 32 (iOS's old default,
-    /// LowQualityZeroLatency, stops at 2x), and the engine serves no I-frame rendition unless asked
-    /// (`serveIFramePlaylist`), so AVPlayer has no trick-play track to switch to above 2x and decodes
-    /// every frame with its audio. WIP (W2424): measured so far only on loopback, one 4K HDR10 HEVC file on
-    /// an iPhone SE 3, where 2.5x and 3x held the rate with no dropped frames but stalled for up to 2.3 s
-    /// and a seek at speed did not resume within 20 s. Not yet justified for loopback; remote-HLS and
-    /// software are unmeasured. Returns 3.0 while idle too.
-    public var maxSupportedRate: Float { Self.maxForwardRate }
+    /// Maximum reliable forward rate on the route the session plays on (`maxSupportedRate(on:)`). Hosts
+    /// should size their speed picker against this; `setRate(_:)` clamps to it as a backstop. Returns the
+    /// video ceiling, 2.0, while idle.
+    public var maxSupportedRate: Float { Self.maxSupportedRate(on: transportRoute) }
 
-    static let maxForwardRate: Float = 3.0
+    /// The fastest forward rate a route plays every frame at, with its audio (AetherEngine#39, W2424).
+    ///
+    /// 2.0 on the two AVPlayer HLS routes. Above 2x, AVPlayer stops playing an HLS stream frame by frame:
+    /// with no I-frame rendition (the engine serves none unless asked, `serveIFramePlaylist`) it re-fetches
+    /// and abandons the segment under the playhead, the clock stands and jumps between keyframes, and only
+    /// some frames are shown. Measured (W2424): on loopback, 4K HDR10 HEVC on an iPhone SE 3, 2.5x and 3x
+    /// stood for 2.3 s at a time with 25 times the segment requests of 2x; stock AVPlayer on a Mac, playing
+    /// a plain HTTP HLS stream as the remote-HLS route does, shows 10 frames a second at 2.5x and 3x from
+    /// 4K and 20 from 1080p, against every frame at 2x. 3.0 on the software route, which paces its own
+    /// renderer (unmeasured so far), and on the audio-only one, which has no frames to skip (#39's value).
+    public static func maxSupportedRate(on route: VideoRoute) -> Float {
+        switch route {
+        case .software, .audio: return 3.0
+        case .loopback, .remoteBypass, .none: return 2.0
+        }
+    }
+
+    /// The route whose host the engine drives, read from the hosts: a load seeds its host's rate before
+    /// it publishes the backend (`loadNative` sets `playbackBackend` after), so `videoRoute` can still
+    /// name the previous session when the seed is clamped.
+    private var transportRoute: VideoRoute {
+        if audioAVPlayerActive || audioHost != nil { return .audio }
+        if softwareHost != nil { return .software }
+        if nativeHost != nil { return videoRoute == .remoteBypass ? .remoteBypass : .loopback }
+        return .none
+    }
 
     /// Set playback speed. Clamped to `maxSupportedRate` (AetherEngine#39). 0 pauses. While paused a
     /// non-zero rate is kept for the next `play()` instead of resuming (#730).
