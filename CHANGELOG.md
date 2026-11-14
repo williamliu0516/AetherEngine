@@ -49,9 +49,10 @@ the public-API contract.
   jumps between keyframes (2.3 s stills at 3x on an iPhone SE 3). New `maxSupportedRate(on:)` gives each route's value.
 - **H.264 with an avcC decodes on VideoToolbox on the software host, as HEVC does** (W2425), so a host that moves a
   session there for 3x keeps hardware decode: H.264 1080p, HEVC 10-bit 1080p and HDR10 4K held 3x on a 12.9-inch
-  iPad Pro (0-4 frames dropped in 20 s). Interlaced H.264 (the deinterlacer), an MVC both-eyes track and Annex-B
-  H.264 (TS, AVCHD: no avcC) stay on libavcodec. The VideoToolbox decoder now delivers A53 captions, which
-  libavcodec delivered before.
+  iPad Pro (0-4 frames dropped in 20 s). Interlaced H.264 (the deinterlacer), an MVC both-eyes track, live H.264
+  and Annex-B H.264 (TS, AVCHD: no avcC) stay on libavcodec. The VideoToolbox decoder now delivers A53 captions,
+  in decode order with their DTS for the caption tap's reorder buffer, and an H.264 keyframe with new parameter
+  sets (an MP4's next sample entry, a recording's format switch) moves its session onto them.
 
 ### Fixed
 

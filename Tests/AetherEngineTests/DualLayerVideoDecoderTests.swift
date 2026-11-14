@@ -1032,7 +1032,7 @@ struct DualLayerVideoDecoderTests {
     private final class EpochRecordingFakeDecoder: SingleLayerVideoDecoder, @unchecked Sendable {
         var onFrame: DecodedFrameHandler?
         var onFirstHDR10PlusDetected: (@Sendable () -> Void)?
-        var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)?
+        var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double, Double?) -> Void)?
         var onDecodedFormat: (@Sendable (DecodedVideoFormat) -> Void)?
         var skipUntilPTS: CMTime?
         var epoch: UInt64 = 0
@@ -1104,7 +1104,7 @@ struct DualLayerVideoDecoderTests {
     private final class FlushEmittingFakeDecoder: SingleLayerVideoDecoder, @unchecked Sendable {
         var onFrame: DecodedFrameHandler?
         var onFirstHDR10PlusDetected: (@Sendable () -> Void)?
-        var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)?
+        var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double, Double?) -> Void)?
         var onDecodedFormat: (@Sendable (DecodedVideoFormat) -> Void)?
         var skipUntilPTS: CMTime?
         var feedEpoch: UInt64 = 0
@@ -1136,7 +1136,7 @@ struct DualLayerVideoDecoderTests {
         var closeCount: Int { lock.lock(); defer { lock.unlock() }; return _closeCount }
         var onFrame: DecodedFrameHandler?
         var onFirstHDR10PlusDetected: (@Sendable () -> Void)?
-        var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)?
+        var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double, Double?) -> Void)?
         var onDecodedFormat: (@Sendable (DecodedVideoFormat) -> Void)?
         var skipUntilPTS: CMTime?
         var feedEpoch: UInt64 = 0
@@ -1476,7 +1476,7 @@ struct DualLayerVideoDecoderTests {
         struct OpenFailed: Error {}
         var onFrame: DecodedFrameHandler?
         var onFirstHDR10PlusDetected: (@Sendable () -> Void)?
-        var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)?
+        var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double, Double?) -> Void)?
         var onDecodedFormat: (@Sendable (DecodedVideoFormat) -> Void)?
         var skipUntilPTS: CMTime?
         var feedEpoch: UInt64 = 0

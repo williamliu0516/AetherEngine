@@ -134,7 +134,7 @@ final class SoftwarePlaybackHost {
     nonisolated(unsafe) var onDecodedVideoFormat: (@Sendable (DecodedVideoFormat) -> Void)?
 
     /// #131: forwarded from the video decoder; decoded-frame A53 cc_data triplets, presentation order.
-    nonisolated(unsafe) var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)?
+    nonisolated(unsafe) var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double, Double?) -> Void)?
 
     // MARK: - Output
 
@@ -947,6 +947,19 @@ final class SoftwarePlaybackHost {
             stereo3DType: AetherEngine.stereo3DType(stream: stream))
     }
 
+    /// The load's gate onto VideoToolbox: HEVC, and W2425 H.264 whose picture may go there, each only when the
+    /// probe proves a hardware decode of this exact format. Live H.264 keeps libavcodec: a program boundary
+    /// brings new parameter sets (an interlaced one too), which libavcodec follows on its own.
+    nonisolated static func loadOpensVideoToolbox(stream: UnsafeMutablePointer<AVStream>, isLive: Bool) -> Bool {
+        guard let codecpar = stream.pointee.codecpar else { return false }
+        switch codecpar.pointee.codec_id {
+        case AV_CODEC_ID_HEVC: break
+        case AV_CODEC_ID_H264 where !isLive && h264PictureAllowsVideoToolbox(stream: stream): break
+        default: return false
+        }
+        return VTCapabilityProbe.hardwareDecodeVerdict(codecpar: codecpar).opensHardwareDecoder
+    }
+
     /// Selects and instantiates the appropriate VideoDecodingPipeline based on stream and host options.
     func selectVideoDecoder(
         codecID: AVCodecID,
@@ -1061,10 +1074,7 @@ final class SoftwarePlaybackHost {
         // parameter sets, Annex-B extradata), which the routing gate reads as "keep native" but which
         // HardwareVideoDecoder, building from the hvcC alone, can never open. W2425: H.264 likewise from its
         // avcC (an Annex-B one fails the verdict), when its picture is one the native route would play.
-        if let codecpar = vStream.pointee.codecpar,
-           codecpar.pointee.codec_id == AV_CODEC_ID_HEVC
-               || (codecpar.pointee.codec_id == AV_CODEC_ID_H264 && Self.h264PictureAllowsVideoToolbox(stream: vStream)),
-           VTCapabilityProbe.hardwareDecodeVerdict(codecpar: codecpar).opensHardwareDecoder {
+        if let codecpar = vStream.pointee.codecpar, Self.loadOpensVideoToolbox(stream: vStream, isLive: isLive) {
             videoDecoder.close()
             let dvProfile = configuredDVProfile ?? AetherEngine.dvProfile(stream: vStream)
             let chosen = selectVideoDecoder(
@@ -1177,8 +1187,8 @@ final class SoftwarePlaybackHost {
         (videoDecoder as? any VideoSessionRebuilding)?.onSessionLost = { [weak self] in
             Task { @MainActor [weak self] in self?.handleVideoSessionLost() }
         }
-        videoDecoder.onA53Captions = { [weak self] triplets, pts in
-            self?.onA53Captions?(triplets, pts)
+        videoDecoder.onA53Captions = { [weak self] triplets, pts, dts in
+            self?.onA53Captions?(triplets, pts, dts)
         }
 
         if resolvedAudioIdx >= 0, let aStream = dem.stream(at: resolvedAudioIdx),

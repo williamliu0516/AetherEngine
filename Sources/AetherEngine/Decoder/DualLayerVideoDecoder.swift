@@ -124,11 +124,11 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         set { lock.lock(); _onFirstHDR10PlusDetected = newValue; lock.unlock() }
     }
     private var _onFirstHDR10PlusDetected: (@Sendable () -> Void)?
-    var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)? {
+    var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double, Double?) -> Void)? {
         get { lock.lock(); defer { lock.unlock() }; return _onA53Captions }
         set { lock.lock(); _onA53Captions = newValue; lock.unlock() }
     }
-    private var _onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)?
+    private var _onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double, Double?) -> Void)?
     /// AE#658: the composed display buffer's format, reported on the first frame and when it changes.
     var onDecodedFormat: (@Sendable (DecodedVideoFormat) -> Void)? {
         get { lock.lock(); defer { lock.unlock() }; return _onDecodedFormat }

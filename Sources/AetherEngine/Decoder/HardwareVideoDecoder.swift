@@ -41,13 +41,13 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     }
     /// Far past any reorder depth: entries for frames VideoToolbox never output do not pile up.
     private static let hdr10PlusPendingLimit = 64
-    var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)?
+    var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double, Double?) -> Void)?
     /// W2425: A53 captions (CEA-608 in SEI), which libavcodec hands over as frame side data and VideoToolbox
-    /// drops. Each packet's triplets wait under its presentation time as HDR10+ does and leave with their frame,
-    /// in presentation order, as on the libavcodec path. Under `hdr10PlusLock`; scanned only with a consumer.
+    /// drops. Read from each packet VideoToolbox takes and handed over then, in decode order with the DTS, for
+    /// the consumer's reorder buffer (VideoToolbox's own output order is not presentation order, PERF-104).
+    /// Scanned only with a consumer.
     private var a53Codec = A53SEIParser.CodecKind.hevc
     private var a53Framing = VideoNALFraming.lengthPrefixed(size: 4)
-    private var a53ByPTS: [HDR10PlusKey: [CCDataParser.CCTriplet]] = [:]
     var onDecodedFormat: (@Sendable (DecodedVideoFormat) -> Void)?
     private var streamColor = ColorDescription.unspecified
     private var streamCodecID = AV_CODEC_ID_NONE
@@ -80,6 +80,10 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     private var timeBase: AVRational = AVRational(num: 1, den: 90000)
     private var width: Int32 = 0
     private var height: Int32 = 0
+    /// W2425: H.264 follows new parameter sets on a keyframe (`followH264ParameterSets`). Set by `open()`.
+    private var followsH264ParameterSets = false
+    private var h264NALLengthSize = 4
+    private var h264Extradata = Data()
 
     /// Color metadata from codecpar, re-applied to every CVPixelBuffer.
     /// VTDecompressionSession should propagate these from SPS+hvcC but has been observed not to;
@@ -326,6 +330,9 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         hdr10PlusFraming = .lengthPrefixed(size: NALUnitChain.lengthPrefixSize(
             codecID: streamCodecID, extradata: extradata,
             extradataSize: Int(codecpar.pointee.extradata_size)) ?? 4)
+        followsH264ParameterSets = codecType == kCMVideoCodecType_H264
+        if case .lengthPrefixed(let size) = hdr10PlusFraming { h264NALLengthSize = size }
+        h264Extradata = configRecord
         a53Codec = codecType == kCMVideoCodecType_H264 ? .h264 : .hevc
         a53Framing = A53SEIParser.nalFraming(
             codec: a53Codec, extradata: extradata, size: Int(codecpar.pointee.extradata_size))
@@ -537,17 +544,86 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         )
     }
 
+    // MARK: - H.264 parameter-set changes
+
+    /// W2425: a keyframe bringing new H.264 parameter sets (an MP4's next sample entry as NEW_EXTRADATA, a
+    /// recording's format switch in-band) moves the session onto them, as libavcodec follows them on its own;
+    /// VideoToolbox would go on decoding against the sets it opened with (black or broken pictures). The session
+    /// takes the new description in place when it can, else is rebuilt on it, and this keyframe starts it.
+    /// Returns the description the packet goes out with: `current` when nothing changed, nil when the session
+    /// could not be rebuilt (lost, reported through `onSessionLost` as AE#739's are).
+    private func followH264ParameterSets(
+        in packet: UnsafeMutablePointer<AVPacket>, current: CMVideoFormatDescription
+    ) -> CMVideoFormatDescription? {
+        var next: CMVideoFormatDescription?
+        var sps: [UInt8] = []
+        var sideDataSize = 0
+        if let sd = av_packet_get_side_data(packet, AV_PKT_DATA_NEW_EXTRADATA, &sideDataSize), sideDataSize > 0,
+           sd.pointee == 1 {   // an avcC; an Annex-B one never reaches this decoder
+            let record = Data(bytes: sd, count: sideDataSize)
+            guard record != h264Extradata, let spsNAL = H264SPS.spsNAL(fromExtradata: [UInt8](record)),
+                  let dims = H264SPS.dimensions(fromNAL: spsNAL) else { return current }
+            h264Extradata = record
+            sps = spsNAL
+            let extensions: NSDictionary = [
+                kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: ["avcC": record] as NSDictionary,
+            ]
+            _ = CMVideoFormatDescriptionCreate(
+                allocator: kCFAllocatorDefault, codecType: kCMVideoCodecType_H264, width: Int32(dims.width),
+                height: Int32(dims.height), extensions: extensions, formatDescriptionOut: &next)
+        } else if let sets = Self.inBandH264ParameterSets(packet, nalLengthSize: h264NALLengthSize) {
+            let known = Self.h264ParameterSets(of: current)
+            guard !(known.contains(sets.sps) && known.contains(sets.pps)) else { return current }
+            sps = sets.sps
+            next = Self.h264FormatDescription(sps: sets.sps, pps: sets.pps, nalLengthSize: h264NALLengthSize)
+        }
+        guard let next else { return current }
+
+        lock.lock()
+        guard let session, !sessionLost, let refConBox else { lock.unlock(); return nil }
+        var rebuilt = false
+        if !VTDecompressionSessionCanAcceptFormatDescription(session, formatDescription: next) {
+            VTDecompressionSessionWaitForAsynchronousFrames(session)
+            VTDecompressionSessionInvalidate(session)
+            let created = makeSession(formatDescription: next, refCon: refConBox)
+            self.session = created.session
+            rebuilt = true
+        }
+        formatDescription = next
+        let lost = self.session == nil
+        if lost { sessionLost = true }
+        let dims = CMVideoFormatDescriptionGetDimensions(next)
+        width = dims.width
+        height = dims.height
+        lock.unlock()
+        // Not handled: an interlaced picture from here on stays on VideoToolbox, woven (the deinterlacer runs on
+        // libavcodec's frames only); only a load can move the stream there.
+        let interlaced = H264SPS.frameMbsOnly(fromNAL: sps) == false
+        EngineLog.emit(
+            "[HardwareVideoDecoder] W2425 H.264 parameter sets changed at pts=\(packet.pointee.pts): "
+            + "\(dims.width)x\(dims.height), session \(lost ? "lost" : rebuilt ? "rebuilt" : "kept")"
+            + (interlaced ? ", interlaced (not deinterlaced on VideoToolbox)" : ""),
+            category: .swPlayback)
+        if lost { onSessionLost?() }
+        return lost ? nil : next
+    }
+
     // MARK: - Decode
 
     func decode(packet: UnsafeMutablePointer<AVPacket>, epoch: UInt64? = nil) {
         lock.lock()
         // AE#492: see `SoftwareVideoDecoder.decode`. Same rule, same lock as `flush()`.
         if let epoch, epoch != currentEpoch { lock.unlock(); return }
-        guard session != nil, !sessionLost, let formatDesc = formatDescription else {
+        guard session != nil, !sessionLost, let openedFormat = formatDescription else {
             lock.unlock()
             return
         }
         lock.unlock()
+        var formatDesc = openedFormat
+        if followsH264ParameterSets, (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0 {
+            guard let followed = followH264ParameterSets(in: packet, current: openedFormat) else { return }
+            formatDesc = followed
+        }
 
         // Wrap the packet (HEVC length-prefix framing from FFmpeg's matroska demuxer, already the VT-expected format)
         // in a CMBlockBuffer+CMSampleBuffer. Copy once: VT may retain the buffer past the call (async decode),
@@ -631,15 +707,9 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                 onFirstHDR10PlusDetected?()
             }
         }
-        if onA53Captions != nil {
-            let triplets = A53SEIParser.triplets(in: data, size: size, codec: a53Codec, framing: a53Framing)
-            if !triplets.isEmpty {
-                hdr10PlusLock.lock()
-                if a53ByPTS.count >= Self.hdr10PlusPendingLimit { a53ByPTS.removeAll() }
-                a53ByPTS[HDR10PlusKey(pts), default: []].append(contentsOf: triplets)
-                hdr10PlusLock.unlock()
-            }
-        }
+        let onA53 = onA53Captions
+        let captions = onA53 == nil || !pts.isNumeric ? []
+            : A53SEIParser.triplets(in: data, size: size, codec: a53Codec, framing: a53Framing)
 
         // Tag non-keyframes as DependsOnOthers so VT can drop pre-seek RASL frames after a flush.
         if (packet.pointee.flags & AV_PKT_FLAG_KEY) == 0 {
@@ -690,6 +760,10 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         #if DEBUG
         onSubmittedToVideoToolboxForTesting?()
         #endif
+        // Only for a packet VideoToolbox took: one the gates above dropped shows no picture, so no caption.
+        if let onA53, !captions.isEmpty, decodeStatus == noErr {
+            onA53(captions, pts.seconds, dts.isNumeric ? dts.seconds : pts.seconds)
+        }
         if let recoveredAfterDropping {
             EngineLog.emit(
                 "[HardwareVideoDecoder] AE#739 recovered at keyframe pts=\(packet.pointee.pts) "
@@ -730,7 +804,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         // Drain in-flight frames then signal a discontinuity so VT drops its reference picture state.
         VTDecompressionSessionWaitForAsynchronousFrames(session)
         VTDecompressionSessionFinishDelayedFrames(session)
-        hdr10PlusLock.lock(); hdr10PlusByPTS.removeAll(); a53ByPTS.removeAll(); hdr10PlusLock.unlock()
+        hdr10PlusLock.lock(); hdr10PlusByPTS.removeAll(); hdr10PlusLock.unlock()
     }
 
     func close() {
@@ -780,13 +854,6 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             hdr10PlusLock.lock()
             hdr10PlusData = hdr10PlusByPTS.removeValue(forKey: HDR10PlusKey(pts))
             hdr10PlusLock.unlock()
-        }
-        // Before the pre-roll skip, as libavcodec's captions are: the caption decoder keeps its own state.
-        if let onA53 = onA53Captions {
-            hdr10PlusLock.lock()
-            let triplets = a53ByPTS.removeValue(forKey: HDR10PlusKey(pts))
-            hdr10PlusLock.unlock()
-            if let triplets, pts.isNumeric { onA53(triplets, pts.seconds) }
         }
         if let threshold = skipUntilPTS {
             if CMTimeCompare(pts, threshold) < 0 {

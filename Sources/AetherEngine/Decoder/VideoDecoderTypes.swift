@@ -16,11 +16,11 @@ typealias DecodedFrameHandler = @Sendable (CVPixelBuffer, CMTime, Data?) -> Void
 protocol VideoDecodingPipeline: AnyObject, Sendable {
     var onFrame: DecodedFrameHandler? { get set }
     var onFirstHDR10PlusDetected: (@Sendable () -> Void)? { get set }
-    /// #131: fires per decoded frame carrying `AV_FRAME_DATA_A53_CC` side data, with the raw
-    /// cc_data triplets and the frame PTS in seconds. Decoder output is presentation order.
-    /// Only the software decoder produces it; VideoToolbox surfaces no A53 side data (H.264/HEVC
-    /// never route through the SW host, so nothing is missed there).
-    var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)? { get set }
+    /// #131: A53 cc_data triplets with their PTS in seconds. libavcodec hands them over per decoded frame
+    /// (`AV_FRAME_DATA_A53_CC`), in presentation order, with a nil DTS. W2425: VideoToolbox drops SEI, so
+    /// HardwareVideoDecoder hands them over per packet sent, in decode order, with the packet's DTS in
+    /// seconds; the consumer puts those in presentation order (`A53ReorderBuffer`).
+    var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double, Double?) -> Void)? { get set }
     /// AE#658: the decoded format and its display buffer, reported on the first frame and on change.
     var onDecodedFormat: (@Sendable (DecodedVideoFormat) -> Void)? { get set }
     var skipUntilPTS: CMTime? { get set }
