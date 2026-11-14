@@ -181,7 +181,7 @@ final class SoftwarePlaybackHost {
         let reason: HardwareFallbackReason
         let playhead: Double
     }
-    private(set) var hardwareFallback: HardwareFallback?
+    @Published private(set) var hardwareFallback: HardwareFallback?
     #if DEBUG
     /// Every frame handed to the renderer, with whether a VideoToolbox decoder made it. Set before `load()`.
     nonisolated(unsafe) var onVideoFrameEnqueuedForTesting: (@Sendable (CMTime, Bool) -> Void)?

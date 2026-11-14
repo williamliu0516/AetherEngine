@@ -58,6 +58,11 @@ the public-API contract.
 
 ### Fixed
 
+- **libavcodec plays to the last frame.** At the end of a file the software decoder's frame threading still held
+  up to one picture per thread less one, and the flush that followed dropped them: the last frames of every
+  libavcodec-decoded file never showed. The end-of-stream drain now hands them over first. `activeVideoDecoder`
+  follows a mid-stream move from VideoToolbox to libavcodec.
+
 - **A stop no longer waits on the audio queue.** `AudioOutput.stop()` flushed the renderer in place, under its lock,
   then rested the clock; the flush resets the audio queue with a synchronous call on the queue's server, and the
   rate change waits on the queue's lock. With the output on a device that never starts (the iOS simulator on the

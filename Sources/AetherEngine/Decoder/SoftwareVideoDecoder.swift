@@ -482,6 +482,18 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         onFrame?(pixelBuffer, cmPTS, hdr10PlusData)
     }
 
+    /// W2425: frame threading holds up to `thread_count - 1` pictures back, which only an empty packet
+    /// brings out; the `flush()` the host makes next used to drop them, the last frames of every file (all
+    /// that followed the seek on a clip that short). Until that flush the decoder takes no more packets.
+    /// Not handled: the frame a deinterlace graph still holds at the end.
+    func drainForEndOfStream() {
+        lock.lock()
+        guard let ctx = codecContext else { lock.unlock(); return }
+        _ = avcodec_send_packet(ctx, nil)
+        lock.unlock()
+        drainDecodedFrames()
+    }
+
     /// #544: `resetFilterGraph: false` keeps the deinterlace graph across the flush. The still
     /// extractor flushes before every run, and rebuilding the graph means a fresh Metal pipeline, a
     /// fresh full-resolution hwframes pool AND an unconditional `[Deinterlace] engaged` line, about

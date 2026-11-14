@@ -2101,6 +2101,15 @@ extension AetherEngine {
                 self.residentRanges = ranges
             }
             .store(in: &softwareCancellables)
+        // W2425: the Stats label follows VideoToolbox handing the stream to libavcodec mid-stream.
+        host.$hardwareFallback
+            .compactMap { $0 }
+            .sink { [weak self, weak host] _ in
+                guard let self, let host, self.softwareHost === host else { return }
+                self.activeVideoDecoder = Self.videoDecoderLabel(
+                    codecID: self.lastDetectedVideoCodec, isSoftware: true)
+            }
+            .store(in: &softwareCancellables)
         // SW-PiP: publish the bridge once the session owns its layer (the layer object is stable for
         // the session; the host attaches it to the view and, on PiP start, to the system window).
         softwarePiPSource = SoftwarePiPSource(layer: host.displayLayer, isLive: isLive, engine: self)

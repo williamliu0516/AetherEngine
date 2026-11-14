@@ -39,8 +39,9 @@ struct Issue220SoftwareDecoderDrainTests {
     // MARK: - Real decode
 
     /// Regression guard for the send/drain split: 40 IDR+P packets, no B-frames, so the decoder
-    /// owes a frame per packet minus whatever its own thread pipeline still holds at the end.
-    @Test("every packet of a progressive fixture still reaches the frame handler")
+    /// owes a frame per packet minus whatever its own thread pipeline still holds at the end, and
+    /// (W2425) that too once the host's end-of-stream drain has run.
+    @Test("every packet of a progressive fixture reaches the frame handler, the last at the end-of-stream drain")
     func decodesFixtureFrames() throws {
         let data = try #require(Data(base64Encoded: Self.fixtureBase64,
                                      options: .ignoreUnknownCharacters))
@@ -70,6 +71,8 @@ struct Issue220SoftwareDecoderDrainTests {
         // the drain runs at all and keeps up, not the exact pipeline depth.
         #expect(counter.value > 0)
         #expect(counter.value >= packets - 16)
+        decoder.drainForEndOfStream()
+        #expect(counter.value == packets, "the frames threading held back come out before the host's flush")
     }
 
     private final class FrameCounter: @unchecked Sendable {
