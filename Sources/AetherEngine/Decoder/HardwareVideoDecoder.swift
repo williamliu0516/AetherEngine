@@ -41,7 +41,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     }
     /// Far past any reorder depth: entries for frames VideoToolbox never output do not pile up.
     private static let hdr10PlusPendingLimit = 64
-    var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double, Double?) -> Void)?
+    var onA53Captions: A53CaptionHandler?
     /// W2425: A53 captions (CEA-608 in SEI), which libavcodec hands over as frame side data and VideoToolbox
     /// drops. Read from each packet VideoToolbox takes and handed over then, in decode order with the DTS, for
     /// the consumer's reorder buffer (VideoToolbox's own output order is not presentation order, PERF-104).
@@ -762,7 +762,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         #endif
         // Only for a packet VideoToolbox took: one the gates above dropped shows no picture, so no caption.
         if let onA53, !captions.isEmpty, decodeStatus == noErr {
-            onA53(captions, pts.seconds, dts.isNumeric ? dts.seconds : pts.seconds)
+            onA53(captions, pts.seconds, .decode(dts: dts.isNumeric ? dts.seconds : nil))
         }
         if let recoveredAfterDropping {
             EngineLog.emit(

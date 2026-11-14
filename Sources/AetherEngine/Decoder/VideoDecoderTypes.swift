@@ -9,6 +9,19 @@ import AetherLibavcodec
 /// (kCMSampleAttachmentKey_HDR10PlusPerFrameData format); nil for non-HDR10+ streams.
 typealias DecodedFrameHandler = @Sendable (CVPixelBuffer, CMTime, Data?) -> Void
 
+/// The order A53 captions reach `onA53Captions` in, which the consumer needs to put them in presentation order.
+enum A53CaptionOrder: Equatable, Sendable {
+    /// libavcodec: per decoded frame (`AV_FRAME_DATA_A53_CC`), already in presentation order.
+    case presentation
+    /// W2425: VideoToolbox drops SEI, so HardwareVideoDecoder hands them over per packet sent, in decode order,
+    /// with the packet's DTS in seconds for the consumer's `A53ReorderBuffer`. Nil when the container gives the
+    /// packet none (Matroska's first packets after an open or a seek): the buffer holds those without moving
+    /// its watermark, never takes the PTS for a DTS.
+    case decode(dts: Double?)
+}
+
+typealias A53CaptionHandler = @Sendable ([CCDataParser.CCTriplet], Double, A53CaptionOrder) -> Void
+
 /// Common video decoder protocol. SoftwareVideoDecoder (libavcodec, AV1/VP9) and
 /// HardwareVideoDecoder (VTDecompressionSession, HEVC) both conform; the host swaps per codec without rewiring the demux loop.
 // Sendable: both conformers (SoftwareVideoDecoder, HardwareVideoDecoder) are @unchecked Sendable
@@ -16,11 +29,8 @@ typealias DecodedFrameHandler = @Sendable (CVPixelBuffer, CMTime, Data?) -> Void
 protocol VideoDecodingPipeline: AnyObject, Sendable {
     var onFrame: DecodedFrameHandler? { get set }
     var onFirstHDR10PlusDetected: (@Sendable () -> Void)? { get set }
-    /// #131: A53 cc_data triplets with their PTS in seconds. libavcodec hands them over per decoded frame
-    /// (`AV_FRAME_DATA_A53_CC`), in presentation order, with a nil DTS. W2425: VideoToolbox drops SEI, so
-    /// HardwareVideoDecoder hands them over per packet sent, in decode order, with the packet's DTS in
-    /// seconds; the consumer puts those in presentation order (`A53ReorderBuffer`).
-    var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double, Double?) -> Void)? { get set }
+    /// #131: A53 cc_data triplets with their PTS in seconds, and the order they come in.
+    var onA53Captions: A53CaptionHandler? { get set }
     /// AE#658: the decoded format and its display buffer, reported on the first frame and on change.
     var onDecodedFormat: (@Sendable (DecodedVideoFormat) -> Void)? { get set }
     var skipUntilPTS: CMTime? { get set }

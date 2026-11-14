@@ -2129,11 +2129,10 @@ extension AetherEngine {
             let ccTap = ClosedCaptionTap(engine: self, ccStreamIndex: Int32(Self.a53ClosedCaptionTrackID))
             closedCaptionTap = ccTap
             // W2425: VideoToolbox's come in decode order with their DTS, libavcodec's in presentation order.
-            host.onA53Captions = { [weak ccTap] triplets, pts, dts in
-                if let dts {
-                    ccTap?.ingestA53(triplets, ptsSeconds: pts, dtsSeconds: dts)
-                } else {
-                    ccTap?.ingestA53Ordered(triplets, ptsSeconds: pts)
+            host.onA53Captions = { [weak ccTap] triplets, pts, order in
+                switch order {
+                case .presentation: ccTap?.ingestA53Ordered(triplets, ptsSeconds: pts)
+                case .decode(let dts): ccTap?.ingestA53(triplets, ptsSeconds: pts, dtsSeconds: dts)
                 }
             }
         }

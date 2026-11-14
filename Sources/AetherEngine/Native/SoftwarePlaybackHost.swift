@@ -134,7 +134,7 @@ final class SoftwarePlaybackHost {
     nonisolated(unsafe) var onDecodedVideoFormat: (@Sendable (DecodedVideoFormat) -> Void)?
 
     /// #131: forwarded from the video decoder; decoded-frame A53 cc_data triplets, presentation order.
-    nonisolated(unsafe) var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double, Double?) -> Void)?
+    nonisolated(unsafe) var onA53Captions: A53CaptionHandler?
 
     // MARK: - Output
 
@@ -1187,8 +1187,8 @@ final class SoftwarePlaybackHost {
         (videoDecoder as? any VideoSessionRebuilding)?.onSessionLost = { [weak self] in
             Task { @MainActor [weak self] in self?.handleVideoSessionLost() }
         }
-        videoDecoder.onA53Captions = { [weak self] triplets, pts, dts in
-            self?.onA53Captions?(triplets, pts, dts)
+        videoDecoder.onA53Captions = { [weak self] triplets, pts, order in
+            self?.onA53Captions?(triplets, pts, order)
         }
 
         if resolvedAudioIdx >= 0, let aStream = dem.stream(at: resolvedAudioIdx),

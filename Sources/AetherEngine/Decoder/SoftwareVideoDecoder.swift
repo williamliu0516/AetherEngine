@@ -20,7 +20,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// Fires once (demux thread) on first HDR10+ side data; engine flips videoFormat to .hdr10Plus.
     private var seenHDR10Plus = false
     var onFirstHDR10PlusDetected: (@Sendable () -> Void)?
-    var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double, Double?) -> Void)?
+    var onA53Captions: A53CaptionHandler?
 
     /// AE#658: fires (decode thread) on the first displayed frame and whenever the decoded format or the
     /// display buffer's format changes. Guarded by `lock`, like everything `emit` reads.
@@ -365,7 +365,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                 let extracted = CCDataParser.parseCCDataTriplets(bytes: sdData, count: Int(sd.pointee.size))
                 if !extracted.isEmpty {
                     let pts = Double(f.pointee.pts) * Double(timeBase.num) / Double(timeBase.den)
-                    onA53(extracted, pts, nil)
+                    onA53(extracted, pts, .presentation)
                 }
             }
 

@@ -109,16 +109,16 @@ struct SoftwareHostH264HardwareDecodeTests {
         #expect(packets == 24)
         #expect(run.packetPTS != run.packetPTS.sorted(), "the fixture's pictures are reordered")
         #expect(run.captions.count == packets)
-        #expect(run.captions.allSatisfy { $0.dts != nil }, "VideoToolbox's come in decode order with their DTS")
+        #expect(run.captions.allSatisfy { if case .decode(dts: _?) = $0.order { true } else { false } },
+                "VideoToolbox's come in decode order with their DTS")
 
         var reorder = A53ReorderBuffer()
         var fed: [A53ReorderBuffer.Group] = []
         for caption in run.captions {
             let pairs = caption.triplets.map { A53ReorderBuffer.Pair(d0: $0.data0, d1: $0.data1) }
-            if let dts = caption.dts {
-                fed += reorder.insert(pts: caption.pts, pairs: pairs, dts: dts)
-            } else {
-                fed.append(.init(pts: caption.pts, pairs: pairs))
+            switch caption.order {
+            case .decode(let dts): fed += reorder.insert(pts: caption.pts, pairs: pairs, dts: dts)
+            case .presentation: fed.append(.init(pts: caption.pts, pairs: pairs))
             }
         }
         let presentationOrder = run.packetPTS.indices.sorted { run.packetPTS[$0] < run.packetPTS[$1] }
@@ -146,7 +146,7 @@ struct SoftwareHostH264HardwareDecodeTests {
     private struct Caption {
         let triplets: [CCDataParser.CCTriplet]
         let pts: Double
-        let dts: Double?
+        let order: A53CaptionOrder
     }
 
     private struct Run {
@@ -166,8 +166,8 @@ struct SoftwareHostH264HardwareDecodeTests {
         let frames = Recorder<(width: Int, pts: Double)>()
         let captions = Recorder<Caption>()
         let decoder = HardwareVideoDecoder()
-        decoder.onA53Captions = { triplets, pts, dts in
-            captions.append(Caption(triplets: triplets, pts: pts, dts: dts))
+        decoder.onA53Captions = { triplets, pts, order in
+            captions.append(Caption(triplets: triplets, pts: pts, order: order))
         }
         try decoder.open(stream: stream) { pixelBuffer, pts, _ in
             frames.append((CVPixelBufferGetWidth(pixelBuffer), pts.seconds))
