@@ -150,6 +150,18 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     }
     private var _onSessionLost: (@Sendable () -> Void)?
 
+    /// W2425: see `VideoDecodingPipeline.onHardwareFallbackNeeded`; fired by `followH264ParameterSets`.
+    var onHardwareFallbackNeeded: (@Sendable (HardwareFallbackReason) -> Void)? {
+        get { skipLock.lock(); defer { skipLock.unlock() }; return _onHardwareFallbackNeeded }
+        set { skipLock.lock(); _onHardwareFallbackNeeded = newValue; skipLock.unlock() }
+    }
+    private var _onHardwareFallbackNeeded: (@Sendable (HardwareFallbackReason) -> Void)?
+    /// W2425, guarded by `lock`. `refusedParameterSets`: VideoToolbox refused the stream's new sets, so every
+    /// packet from there is dropped (the old session cannot decode them) until the owner swaps decoders.
+    /// `askedForFallback`: the callback fires once a decoder.
+    private var refusedParameterSets = false
+    private var askedForFallback = false
+
     /// AE#739, all guarded by `lock`. `sessionLost` drops every packet instead of feeding a dead
     /// session; `awaitingKeyframe` drops packets after a rebuild until one the new session can start
     /// from.
@@ -550,8 +562,10 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// recording's format switch in-band) moves the session onto them, as libavcodec follows them on its own;
     /// VideoToolbox would go on decoding against the sets it opened with (black or broken pictures). The session
     /// takes the new description in place when it can, else is rebuilt on it, and this keyframe starts it.
-    /// Returns the description the packet goes out with: `current` when nothing changed, nil when the session
-    /// could not be rebuilt (lost, reported through `onSessionLost` as AE#739's are).
+    /// Sets VideoToolbox refuses keep the old session and description (a rebuild would retry the refused ones)
+    /// and ask for libavcodec through `onHardwareFallbackNeeded`; interlaced sets ask too and decode on here
+    /// until the swap. Returns the description the packet goes out with: `current` when nothing changed, nil
+    /// when the packet is dropped (the session gone or the new sets refused).
     private func followH264ParameterSets(
         in packet: UnsafeMutablePointer<AVPacket>, current: CMVideoFormatDescription
     ) -> CMVideoFormatDescription? {
@@ -579,33 +593,42 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
         guard let next else { return current }
 
-        lock.lock()
-        guard let session, !sessionLost, let refConBox else { lock.unlock(); return nil }
-        var rebuilt = false
-        if !VTDecompressionSessionCanAcceptFormatDescription(session, formatDescription: next) {
-            VTDecompressionSessionWaitForAsynchronousFrames(session)
-            VTDecompressionSessionInvalidate(session)
-            let created = makeSession(formatDescription: next, refCon: refConBox)
-            self.session = created.session
-            rebuilt = true
-        }
-        formatDescription = next
-        let lost = self.session == nil
-        if lost { sessionLost = true }
-        let dims = CMVideoFormatDescriptionGetDimensions(next)
-        width = dims.width
-        height = dims.height
-        lock.unlock()
-        // Not handled: an interlaced picture from here on stays on VideoToolbox, woven (the deinterlacer runs on
-        // libavcodec's frames only); only a load can move the stream there.
         let interlaced = H264SPS.frameMbsOnly(fromNAL: sps) == false
+        lock.lock()
+        guard let session, !sessionLost, !refusedParameterSets, let refConBox else { lock.unlock(); return nil }
+        var outcome = "kept"
+        if !VTDecompressionSessionCanAcceptFormatDescription(session, formatDescription: next) {
+            // The pictures VideoToolbox still holds back for reordering belong to the old sets: out first.
+            VTDecompressionSessionFinishDelayedFrames(session)
+            VTDecompressionSessionWaitForAsynchronousFrames(session)
+            if let created = makeSession(formatDescription: next, refCon: refConBox).session {
+                VTDecompressionSessionInvalidate(session)
+                self.session = created
+                outcome = "rebuilt"
+            } else {
+                refusedParameterSets = true
+                outcome = "refused, kept on the old sets"
+            }
+        }
+        let refused = refusedParameterSets
+        if !refused {
+            formatDescription = next
+            let dims = CMVideoFormatDescriptionGetDimensions(next)
+            width = dims.width
+            height = dims.height
+        }
+        let reason: HardwareFallbackReason? = refused ? .refused : interlaced ? .interlaced : nil
+        let asks = reason != nil && !askedForFallback
+        if asks { askedForFallback = true }
+        let size = "\(width)x\(height)"
+        lock.unlock()
         EngineLog.emit(
             "[HardwareVideoDecoder] W2425 H.264 parameter sets changed at pts=\(packet.pointee.pts): "
-            + "\(dims.width)x\(dims.height), session \(lost ? "lost" : rebuilt ? "rebuilt" : "kept")"
-            + (interlaced ? ", interlaced (not deinterlaced on VideoToolbox)" : ""),
+            + "\(size), session \(outcome)" + (interlaced ? ", interlaced" : "")
+            + (asks ? ", asking for libavcodec" : ""),
             category: .swPlayback)
-        if lost { onSessionLost?() }
-        return lost ? nil : next
+        if asks, let reason { onHardwareFallbackNeeded?(reason) }
+        return refused ? nil : next
     }
 
     // MARK: - Decode
@@ -614,7 +637,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         lock.lock()
         // AE#492: see `SoftwareVideoDecoder.decode`. Same rule, same lock as `flush()`.
         if let epoch, epoch != currentEpoch { lock.unlock(); return }
-        guard session != nil, !sessionLost, let openedFormat = formatDescription else {
+        guard session != nil, !sessionLost, !refusedParameterSets, let openedFormat = formatDescription else {
             lock.unlock()
             return
         }

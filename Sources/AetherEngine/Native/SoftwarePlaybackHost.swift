@@ -168,7 +168,24 @@ final class SoftwarePlaybackHost {
 
     private let renderer: SampleBufferRenderer
     /// Swapped per codec at load(): SoftwareVideoDecoder for AV1/VP9, HardwareVideoDecoder for HEVC. Protocol keeps the demux loop codec-agnostic.
-    private var videoDecoder: any VideoDecodingPipeline
+    /// W2425: held in `videoSlot`, which the demux loops capture instead, so `fallBackToLibavcodec` can swap it
+    /// under a running loop. Never hand this decoder itself to a loop.
+    private var videoDecoder: any VideoDecodingPipeline {
+        get { videoSlot.decoder }
+        set { videoSlot.replace(with: newValue) }
+    }
+    private let videoSlot: VideoDecoderSlot
+    /// W2425: set once per open when VideoToolbox handed the stream to libavcodec mid-stream, with why and the
+    /// playhead it resumed at.
+    struct HardwareFallback: Equatable, Sendable {
+        let reason: HardwareFallbackReason
+        let playhead: Double
+    }
+    private(set) var hardwareFallback: HardwareFallback?
+    #if DEBUG
+    /// Every frame handed to the renderer, with whether a VideoToolbox decoder made it. Set before `load()`.
+    nonisolated(unsafe) var onVideoFrameEnqueuedForTesting: (@Sendable (CMTime, Bool) -> Void)?
+    #endif
     private var audioDecoder: AudioDecoder?
     private var audioOutput: AudioOutput?
     private var demuxer: Demuxer?
@@ -800,7 +817,7 @@ final class SoftwarePlaybackHost {
         self.renderer = SampleBufferRenderer(videoGravity: videoGravity)
         // Default to the software decoder; load() swaps it for the
         // VT-backed one when the source's video codec is HEVC.
-        self.videoDecoder = SoftwareVideoDecoder()
+        self.videoSlot = VideoDecoderSlot(SoftwareVideoDecoder())
         armDisplaySizeObserver()
     }
 
@@ -1005,6 +1022,7 @@ final class SoftwarePlaybackHost {
     ) async throws {
         self.demuxer = dem
         self.duration = dem.duration
+        self.hardwareFallback = nil
         self.isLive = isLive
 
         guard dem.videoStreamIndex >= 0,
@@ -1120,76 +1138,7 @@ final class SoftwarePlaybackHost {
             )
         }
 
-        // Audit PERF-104: only the VideoToolbox decoders emit out of presentation order. That includes the
-        // DualLayerVideoDecoder: OrderedDelivery keeps its frames in the order the base layer came out of
-        // VideoToolbox, which is decode order (measured on the real fixtures, `DoviFelRealFileTests`). It gets
-        // the same reorder depth as the single-layer hardware decoder, used only when arrival-order handover
-        // below is off (no frame rate).
-        renderer.setReorderDepth(SampleBufferRenderer.reorderDepth(
-            forHardwareDecoder: videoDecoder is HardwareVideoDecoder || videoDecoder is DualLayerVideoDecoder))
-        renderer.setFELLookahead(
-            enabled: videoDecoder is DualLayerVideoDecoder,
-            frameRate: AetherEngine.detectFrameRate(stream: vStream))
-        // The FEL look-ahead window only holds if none of it waits in the reorder buffer; see
-        // `SampleBufferRenderer.arrivalFloor`. Without a frame rate it stays on the reorder buffer.
-        renderer.setArrivalOrderHandover(
-            frameRate: videoDecoder is DualLayerVideoDecoder ? AetherEngine.detectFrameRate(stream: vStream) : nil)
-
-        // Flip display layer into HDR mode before frames arrive; without this preferredDynamicRange stays .standard and PQ/HLG renders desaturated.
-        if let codecpar = vStream.pointee.codecpar {
-            let trc = codecpar.pointee.color_trc
-            let sourceIsHDR = trc == AVCOL_TRC_SMPTE2084 || trc == AVCOL_TRC_ARIB_STD_B67
-            if sourceIsHDR {
-                renderer.setHDROutput(true)
-                EngineLog.emit(
-                    "[SWHost] HDR mode ON on display layer (transfer=\(trc.rawValue))",
-                    category: .swPlayback
-                )
-            }
-        }
-
-        // Applied here (not init) so it also covers a decoder replaced above.
-        (videoDecoder as? SoftwareVideoDecoder)?.deinterlaceConfig = deinterlaceConfig
-
-        try videoDecoder.open(stream: vStream) { [weak self] pixelBuffer, pts, hdr10PlusData in
-            guard let self else { return }
-            // AE#491: a frame decoded from a pre-seek packet is not late, it is from somewhere else.
-            guard self.decodeGeneration == self.seekGeneration else { return }
-            // Decoder callback is off-main; SampleBufferRenderer is internally locked.
-            self.renderer.enqueue(pixelBuffer: pixelBuffer, pts: pts, hdr10PlusData: hdr10PlusData)
-            // First-frame milestone: demux reached a video packet + decoder produced a pixel buffer.
-            if self.bumpFramesEnqueued() == 0 {
-                self.noteFirstFrameEnqueuedForDisplayFallback()
-                if self.takePausedBeforeFirstFrame() {
-                    // The reorder buffer holds frames before it hands one to the layer, and the
-                    // loops park again from here: without the drain the frame never leaves it.
-                    self.renderer.drainReorderBuffer()
-                    self.presentFirstFrameUnderPause(pts: pts.seconds, generation: self.decodeGeneration)
-                }
-                let pfType = CVPixelBufferGetPixelFormatType(pixelBuffer)
-                EngineLog.emit(
-                    "[SWHost] first video frame enqueued: "
-                    + "pixfmt=0x\(String(pfType, radix: 16)) "
-                    + "size=\(CVPixelBufferGetWidth(pixelBuffer))x\(CVPixelBufferGetHeight(pixelBuffer)) "
-                    + "pts=\(String(format: "%.3f", pts.seconds))s",
-                    category: .swPlayback
-                )
-            }
-        }
-
-        videoDecoder.onFirstHDR10PlusDetected = { [weak self] in
-            self?.onFirstHDR10PlusDetected?()
-        }
-        videoDecoder.onDecodedFormat = { [weak self] format in
-            self?.onDecodedVideoFormat?(format)
-        }
-        // Both VideoToolbox decoders, the dual-layer one included: its two sessions can be lost the same way.
-        (videoDecoder as? any VideoSessionRebuilding)?.onSessionLost = { [weak self] in
-            Task { @MainActor [weak self] in self?.handleVideoSessionLost() }
-        }
-        videoDecoder.onA53Captions = { [weak self] triplets, pts, order in
-            self?.onA53Captions?(triplets, pts, order)
-        }
+        try wireVideoDecoder(videoDecoder, stream: vStream)
 
         if resolvedAudioIdx >= 0, let aStream = dem.stream(at: resolvedAudioIdx),
            let acp = aStream.pointee.codecpar {
@@ -1627,6 +1576,8 @@ final class SoftwarePlaybackHost {
     }
 
     #if DEBUG
+    var videoDecoderForTesting: any VideoDecodingPipeline { videoDecoder }
+
     func invalidateVideoSessionForTesting() -> Bool {
         if let dual = videoDecoder as? DualLayerVideoDecoder {
             dual.invalidateSessionsForTesting()
@@ -1637,6 +1588,129 @@ final class SoftwarePlaybackHost {
         return true
     }
     #endif
+
+    /// The wiring every video decoder of a session gets, at load and (W2425) when `fallBackToLibavcodec`
+    /// replaces VideoToolbox mid-stream: the renderer's order and look-ahead for this decoder, HDR output, the
+    /// deinterlacer and the callbacks. Opens `decoder` on `vStream`; the caller puts it in the slot.
+    private func wireVideoDecoder(
+        _ decoder: any VideoDecodingPipeline, stream vStream: UnsafeMutablePointer<AVStream>
+    ) throws {
+        #if DEBUG
+        let isHardware = decoder is HardwareVideoDecoder || decoder is DualLayerVideoDecoder
+        #endif
+        // Audit PERF-104: only the VideoToolbox decoders emit out of presentation order. That includes the
+        // DualLayerVideoDecoder: OrderedDelivery keeps its frames in the order the base layer came out of
+        // VideoToolbox, which is decode order (measured on the real fixtures, `DoviFelRealFileTests`). It gets
+        // the same reorder depth as the single-layer hardware decoder, used only when arrival-order handover
+        // below is off (no frame rate).
+        renderer.setReorderDepth(SampleBufferRenderer.reorderDepth(
+            forHardwareDecoder: decoder is HardwareVideoDecoder || decoder is DualLayerVideoDecoder))
+        renderer.setFELLookahead(
+            enabled: decoder is DualLayerVideoDecoder,
+            frameRate: AetherEngine.detectFrameRate(stream: vStream))
+        // The FEL look-ahead window only holds if none of it waits in the reorder buffer; see
+        // `SampleBufferRenderer.arrivalFloor`. Without a frame rate it stays on the reorder buffer.
+        renderer.setArrivalOrderHandover(
+            frameRate: decoder is DualLayerVideoDecoder ? AetherEngine.detectFrameRate(stream: vStream) : nil)
+
+        // Flip display layer into HDR mode before frames arrive; without this preferredDynamicRange stays .standard and PQ/HLG renders desaturated.
+        if let codecpar = vStream.pointee.codecpar {
+            let trc = codecpar.pointee.color_trc
+            let sourceIsHDR = trc == AVCOL_TRC_SMPTE2084 || trc == AVCOL_TRC_ARIB_STD_B67
+            if sourceIsHDR {
+                renderer.setHDROutput(true)
+                EngineLog.emit(
+                    "[SWHost] HDR mode ON on display layer (transfer=\(trc.rawValue))",
+                    category: .swPlayback
+                )
+            }
+        }
+
+        // Applied here (not init) so it also covers a replaced decoder.
+        (decoder as? SoftwareVideoDecoder)?.deinterlaceConfig = deinterlaceConfig
+
+        try decoder.open(stream: vStream) { [weak self] pixelBuffer, pts, hdr10PlusData in
+            guard let self else { return }
+            // AE#491: a frame decoded from a pre-seek packet is not late, it is from somewhere else.
+            guard self.decodeGeneration == self.seekGeneration else { return }
+            // Decoder callback is off-main; SampleBufferRenderer is internally locked.
+            self.renderer.enqueue(pixelBuffer: pixelBuffer, pts: pts, hdr10PlusData: hdr10PlusData)
+            #if DEBUG
+            self.onVideoFrameEnqueuedForTesting?(pts, isHardware)
+            #endif
+            // First-frame milestone: demux reached a video packet + decoder produced a pixel buffer.
+            if self.bumpFramesEnqueued() == 0 {
+                self.noteFirstFrameEnqueuedForDisplayFallback()
+                if self.takePausedBeforeFirstFrame() {
+                    // The reorder buffer holds frames before it hands one to the layer, and the
+                    // loops park again from here: without the drain the frame never leaves it.
+                    self.renderer.drainReorderBuffer()
+                    self.presentFirstFrameUnderPause(pts: pts.seconds, generation: self.decodeGeneration)
+                }
+                let pfType = CVPixelBufferGetPixelFormatType(pixelBuffer)
+                EngineLog.emit(
+                    "[SWHost] first video frame enqueued: "
+                    + "pixfmt=0x\(String(pfType, radix: 16)) "
+                    + "size=\(CVPixelBufferGetWidth(pixelBuffer))x\(CVPixelBufferGetHeight(pixelBuffer)) "
+                    + "pts=\(String(format: "%.3f", pts.seconds))s",
+                    category: .swPlayback
+                )
+            }
+        }
+
+        decoder.onFirstHDR10PlusDetected = { [weak self] in
+            self?.onFirstHDR10PlusDetected?()
+        }
+        decoder.onDecodedFormat = { [weak self] format in
+            self?.onDecodedVideoFormat?(format)
+        }
+        // Both VideoToolbox decoders, the dual-layer one included: its two sessions can be lost the same way.
+        (decoder as? any VideoSessionRebuilding)?.onSessionLost = { [weak self] in
+            Task { @MainActor [weak self] in self?.handleVideoSessionLost() }
+        }
+        decoder.onA53Captions = { [weak self] triplets, pts, order in
+            self?.onA53Captions?(triplets, pts, order)
+        }
+        decoder.onHardwareFallbackNeeded = { [weak self] reason in
+            Task { @MainActor [weak self] in await self?.fallBackToLibavcodec(reason: reason) }
+        }
+    }
+
+    /// W2425: VideoToolbox cannot play the rest of this H.264 stream as it should: it refused the new parameter
+    /// sets (the picture froze) or they are interlaced (woven fields). Video moves to libavcodec, once an open,
+    /// and repositions to the playhead, as `recoverVideoSession` does: the demuxer lands on the keyframe before
+    /// it, which carries the new sets, and the seek's skip threshold hides the preroll. The decoder is swapped
+    /// in the slot the running loop feeds; the seek's generation and the slot's epoch retire what was read
+    /// for VideoToolbox. VOD only: live H.264 never opens VideoToolbox (`loadOpensVideoToolbox`).
+    /// Not handled: a High 10 switch on a stream opened 8-bit shows downconverted (depth fixed at open).
+    func fallBackToLibavcodec(reason: HardwareFallbackReason) async {
+        guard !stopRequested, hardwareFallback == nil, !isLive, videoDecoder is HardwareVideoDecoder,
+              let vStream = demuxer?.stream(at: videoStreamIndex), let codecpar = vStream.pointee.codecpar
+        else { return }
+        let target = currentTime
+        hardwareFallback = HardwareFallback(reason: reason, playhead: target)
+        videoSessionRecoveryOwed = false
+        // Frames VideoToolbox still delivers belong to the position the seek below leaves.
+        bumpSeekGeneration()
+        let hardware = videoDecoder
+        videoSlot.flush()
+        hardware.close()
+        let software = selectVideoDecoder(codecID: codecpar.pointee.codec_id, canHardwareDecode: false,
+                                          dvProfile: nil)
+        do {
+            try wireVideoDecoder(software, stream: vStream)
+        } catch {
+            failure = PlaybackErrorInfo(kind: .softwarePipelineFailed,
+                                        message: "Playback error: \(error.localizedDescription)")
+            return
+        }
+        videoDecoder = software
+        EngineLog.emit(
+            "[SWHost] W2425 VideoToolbox \(reason == .refused ? "refused the new H.264 parameter sets" : "got interlaced H.264"), "
+            + "video moves to libavcodec at the playhead \(String(format: "%.3f", target))s",
+            category: .swPlayback)
+        await seek(to: target)
+    }
 
     /// AE#739: the hardware decoder reported its session invalidated by the system. In audio-only mode
     /// video is not wanted yet, so the recovery is owed to the foreground return.
@@ -1656,7 +1730,9 @@ final class SoftwarePlaybackHost {
     /// at instead of freezing until the next keyframe. A live source without a rewind ring cannot go
     /// back and picks up at the next keyframe. A refused rebuild stays owed to the next foreground return.
     private func recoverVideoSession() {
-        guard !stopRequested, let hw = videoDecoder as? any VideoSessionRebuilding else {
+        // W2425: a stream handed to libavcodec has nothing to rebuild.
+        guard !stopRequested, hardwareFallback == nil,
+              let hw = videoDecoder as? any VideoSessionRebuilding else {
             videoSessionRecoveryOwed = false
             return
         }
@@ -2155,7 +2231,7 @@ final class SoftwarePlaybackHost {
     /// Capture dependencies as locals so the demux loop runs off-main without re-entering the actor.
     private func startDemuxLoop() {
         guard let dem = demuxer else { return }
-        let vDec = videoDecoder
+        let vDec: any VideoDecodingPipeline = videoSlot
         let vIdx = videoStreamIndex
         let aDec = audioDecoder
         let aOut = audioOutput
@@ -3456,7 +3532,8 @@ final class SoftwarePlaybackHost {
                 while !mayDecodeVideoPacket(packet) && !stopRequested() && !backgroundAudioOnly() {
                     // A seek can move the clock backwards while this compressed FEL packet is
                     // held. Leave the wait so the generation check below discards it immediately.
-                    if videoDecoder is DualLayerVideoDecoder, seekGeneration() != genBeforeRead { break }
+                    if ((videoDecoder as? VideoDecoderSlot)?.decoder ?? videoDecoder) is DualLayerVideoDecoder,
+                       seekGeneration() != genBeforeRead { break }
                     autoreleasepool {
                         if !isPlaying() {
                             condition.lock()

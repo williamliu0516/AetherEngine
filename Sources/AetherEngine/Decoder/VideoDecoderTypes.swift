@@ -22,6 +22,14 @@ enum A53CaptionOrder: Equatable, Sendable {
 
 typealias A53CaptionHandler = @Sendable ([CCDataParser.CCTriplet], Double, A53CaptionOrder) -> Void
 
+/// W2425: why VideoToolbox asks its owner to move the stream to libavcodec mid-stream.
+enum HardwareFallbackReason: Equatable, Sendable {
+    /// VideoToolbox refused a session for the new parameter sets (a High 10 or 4:2:2 switch).
+    case refused
+    /// The new parameter sets are interlaced: VideoToolbox weaves the fields, libavcodec's frames get deinterlaced.
+    case interlaced
+}
+
 /// Common video decoder protocol. SoftwareVideoDecoder (libavcodec, AV1/VP9) and
 /// HardwareVideoDecoder (VTDecompressionSession, HEVC) both conform; the host swaps per codec without rewiring the demux loop.
 // Sendable: both conformers (SoftwareVideoDecoder, HardwareVideoDecoder) are @unchecked Sendable
@@ -34,6 +42,9 @@ protocol VideoDecodingPipeline: AnyObject, Sendable {
     /// AE#658: the decoded format and its display buffer, reported on the first frame and on change.
     var onDecodedFormat: (@Sendable (DecodedVideoFormat) -> Void)? { get set }
     var skipUntilPTS: CMTime? { get set }
+    /// W2425: fired once, on the decode thread, when this decoder can no longer play the stream as it should and
+    /// libavcodec can. Nil by default; only the H.264 VideoToolbox decoder fires it.
+    var onHardwareFallbackNeeded: (@Sendable (HardwareFallbackReason) -> Void)? { get set }
 
     /// AE#492: the decoder's current feed epoch. A caller that decides a batch of packets is
     /// current captures this, hands it back with each one, and the decoder refuses any packet whose
@@ -56,6 +67,10 @@ protocol VideoDecodingPipeline: AnyObject, Sendable {
 
 extension VideoDecodingPipeline {
     func drainForEndOfStream() {}
+    var onHardwareFallbackNeeded: (@Sendable (HardwareFallbackReason) -> Void)? {
+        get { nil }
+        set {}
+    }
 }
 
 enum VideoDecoderError: Error, LocalizedError {

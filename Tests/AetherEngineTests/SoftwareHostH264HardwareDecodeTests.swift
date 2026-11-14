@@ -128,8 +128,9 @@ struct SoftwareHostH264HardwareDecodeTests {
     }
 
     /// Review HOLD 2: VideoToolbox keeps the format description it opened with, so a keyframe with new
-    /// parameter sets (a recording's 1080/720 or 4:3/16:9 switch) moves the session onto them.
-    @Test("a mid-stream SPS/PPS change keeps decoding, at the new size",
+    /// parameter sets (a recording's 1080/720 or 4:3/16:9 switch) moves the session onto them. A session rebuilt
+    /// for them first hands over the pictures VideoToolbox still held back for reordering (W2425 a2a).
+    @Test("a mid-stream SPS/PPS change keeps decoding, at the new size, every frame before it too",
           .enabled(if: hasHardwareH264, "needs VideoToolbox's H.264 hardware decoder"))
     func parameterSetChangeKeepsDecoding() throws {
         let demuxer = try Self.openFixture(H264HardwareDecodeFixtures.parameterSetChangeBase64, hint: "matroska")
@@ -137,8 +138,8 @@ struct SoftwareHostH264HardwareDecodeTests {
         let run = try Self.decodeOnHardware(demuxer) { _ in nil }
         #expect(run.packetPTS.count == 24)
         let widths = run.frames.map(\.width)
-        #expect(widths.filter { $0 == 64 }.count >= 8)
-        #expect(widths.filter { $0 == 96 }.count >= 8)
+        #expect(widths.filter { $0 == 64 }.count == 12)
+        #expect(widths.filter { $0 == 96 }.count == 12)
     }
 
     // MARK: - Decode harness
