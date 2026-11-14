@@ -5,13 +5,16 @@ import AetherLibavcodec
 
 /// W2425: the video decoder the software host's demux loops feed. A loop captures its decoder once, when it
 /// starts, and a seek never restarts it, so swapping VideoToolbox for libavcodec mid-stream goes through this
-/// slot. The slot keeps its own feed epoch across every decoder it holds: a packet decided on before a swap
-/// (or a flush) carries a retired epoch and is refused, whatever epoch the new decoder counts from.
+/// slot. The slot's feed epoch is the held decoder's own plus an offset that a swap moves past every epoch
+/// the decoders before it were fed under: a packet decided on before a swap, or before any flush of the held
+/// decoder (through the slot or straight on `decoder`, as the host's seeks make it), carries a retired epoch
+/// and is refused, whatever epoch the new decoder counts from.
 final class VideoDecoderSlot: VideoDecodingPipeline, @unchecked Sendable {
-    /// Guards `current` and `epoch`. Taken before a held decoder's own lock, never after it.
+    /// Guards `current` and `offset`. Taken before a held decoder's own lock, never after it.
     private let lock = NSLock()
     private var current: any VideoDecodingPipeline
-    private var epoch: UInt64 = 0
+    /// The slot's epoch less the held decoder's own `feedEpoch`.
+    private var offset: UInt64 = 0
 
     init(_ decoder: any VideoDecodingPipeline) {
         current = decoder
@@ -26,8 +29,9 @@ final class VideoDecoderSlot: VideoDecodingPipeline, @unchecked Sendable {
     /// `decoder` before and closes the old one.
     func replace(with decoder: any VideoDecodingPipeline) {
         lock.lock()
+        let retired = offset &+ current.feedEpoch
+        offset = retired &+ 1 &- decoder.feedEpoch
         current = decoder
-        epoch &+= 1
         lock.unlock()
     }
 
@@ -57,30 +61,27 @@ final class VideoDecoderSlot: VideoDecodingPipeline, @unchecked Sendable {
     }
 
     var feedEpoch: UInt64 {
-        lock.lock(); defer { lock.unlock() }; return epoch
+        lock.lock(); defer { lock.unlock() }; return offset &+ current.feedEpoch
     }
 
     func open(stream: UnsafeMutablePointer<AVStream>, onFrame: @escaping DecodedFrameHandler) throws {
         try decoder.open(stream: stream, onFrame: onFrame)
     }
 
-    /// The held decoder's epoch is read under the slot's lock, so a `flush()` or a swap either lands before
-    /// the check (the packet is refused here) or after the read (the decoder refuses it itself).
+    /// The packet goes to the held decoder with the epoch it was read under, in that decoder's count, and the
+    /// decoder checks it under its own lock: a flush landing at any point before refuses it. One read before a
+    /// swap maps below every epoch the new decoder has had, so that decoder refuses it too.
     func decode(packet: UnsafeMutablePointer<AVPacket>, epoch: UInt64?) {
         lock.lock()
-        if let epoch, epoch != self.epoch { lock.unlock(); return }
         let target = current
-        let targetEpoch = epoch == nil ? nil : target.feedEpoch
+        let targetEpoch = epoch.map { $0 &- offset }
         lock.unlock()
         target.decode(packet: packet, epoch: targetEpoch)
     }
 
+    /// The held decoder's flush moves its epoch, and with it the slot's.
     func flush() {
-        lock.lock()
-        epoch &+= 1
-        let target = current
-        lock.unlock()
-        target.flush()
+        decoder.flush()
     }
 
     func drainForEndOfStream() {

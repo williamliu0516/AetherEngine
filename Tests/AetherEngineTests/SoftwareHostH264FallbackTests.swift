@@ -52,6 +52,29 @@ struct SoftwareHostH264FallbackTests {
         #expect(software.decoded == 1)
         slot.decode(packet: packet, epoch: nil)   // the DVR ring's replay carries none
         #expect(software.decoded == 2)
+
+        // The host's seeks flush the decoder the slot holds, not the slot.
+        let readBeforeHeldFlush = slot.feedEpoch
+        software.flush()
+        slot.decode(packet: packet, epoch: readBeforeHeldFlush)
+        #expect(software.decoded == 2)
+        slot.decode(packet: packet, epoch: slot.feedEpoch)
+        #expect(software.decoded == 3)
+    }
+
+    @Test("a packet read before a seek's flush of the held libavcodec decoder is refused through the slot")
+    func slotRefusesAPreSeekPacketOnLibavcodec() throws {
+        let frames = try Self.framesThroughSlot(SoftwareVideoDecoder())
+        #expect(frames.count == 12, "only the packets read after the seek: \(frames)")
+        #expect(frames.allSatisfy { $0 < 0.49 })
+    }
+
+    @Test("a packet read before a seek's flush of the held VideoToolbox decoder is refused through the slot",
+          .enabled(if: hasHardwareH264, "needs VideoToolbox's H.264 hardware decoder"))
+    func slotRefusesAPreSeekPacketOnVideoToolbox() throws {
+        let frames = try Self.framesThroughSlot(HardwareVideoDecoder())
+        #expect(frames.count == 12, "only the packets read after the seek: \(frames)")
+        #expect(frames.allSatisfy { $0 < 0.49 })
     }
 
     // MARK: - HardwareVideoDecoder
@@ -73,12 +96,26 @@ struct SoftwareHostH264FallbackTests {
           .enabled(if: hasHardwareH264, "needs VideoToolbox's H.264 hardware decoder"))
     func refusedSwitchAsksForLibavcodec() throws {
         let run = try Self.decodeOnHardware(
-            Self.openFixture(H264HardwareDecodeFixtures.highTenSwitchBase64), refusingSwitch: true)
+            Self.openFixture(H264HardwareDecodeFixtures.highTenSwitchBase64),
+            failingSwitch: kVTCouldNotFindVideoDecoderErr)
         #expect(run.packets == 24)
         #expect(run.reasons == [.refused])
         #expect(run.sessionsLost == 0, "a refused switch is not a lost session: its rebuild retries the refused sets")
         #expect(run.frames.filter { $0 < 0.49 }.count == 12, "every frame before the switch")
         #expect(run.frames.filter { $0 > 0.49 }.isEmpty, "nothing fed to a session that cannot decode it")
+    }
+
+    @Test("a switch VideoToolbox cannot open a session for just then loses the session, with no ask for libavcodec",
+          .enabled(if: hasHardwareH264, "needs VideoToolbox's H.264 hardware decoder"))
+    func switchFailingForAnotherReasonLosesTheSession() throws {
+        let run = try Self.decodeOnHardware(
+            Self.openFixture(H264HardwareDecodeFixtures.highTenSwitchBase64),
+            failingSwitch: kVTVideoDecoderNotAvailableNowErr)
+        #expect(run.packets == 24)
+        #expect(run.reasons.isEmpty, "not a refusal of the stream")
+        #expect(run.sessionsLost == 1, "AE#739: the owner rebuilds it")
+        #expect(run.frames.filter { $0 < 0.49 }.count == 12)
+        #expect(run.frames.filter { $0 > 0.49 }.isEmpty, "nothing fed to a lost session")
     }
 
     /// Whether VideoToolbox then decodes the interlaced pictures (woven) is the platform's: the Mac's refuses them.
@@ -110,6 +147,36 @@ struct SoftwareHostH264FallbackTests {
     }
 
     @MainActor
+    @MainActor
+    @Test("a session lost at a switch is rebuilt on VideoToolbox at the playhead, and the captions start clean",
+          .enabled(if: hasHardwareH264, "needs VideoToolbox's H.264 hardware decoder"), .timeLimit(.minutes(1)))
+    func hostRebuildsASessionLostAtASwitch() async throws {
+        let host = SoftwarePlaybackHost()
+        defer { host.stop() }
+        let frames = Recorder<(pts: Double, hardware: Bool)>()
+        let repositions = Recorder<Void>()
+        host.onVideoFrameEnqueuedForTesting = { pts, hardware in frames.append((pts.seconds, hardware)) }
+        host.onVideoRepositioned = { repositions.append(()) }
+        try await host.load(demuxer: Self.openFixture(H264HardwareDecodeFixtures.highTenSwitchBase64),
+                            startPosition: nil, audioSourceStreamIndex: nil)
+        let hardware = try #require(host.videoDecoderForTesting as? HardwareVideoDecoder)
+        // The switch's two tries (in place, then a new session) fail; the host's rebuild then opens.
+        let tries = Recorder<Void>()
+        hardware.failsFormatForTesting = { _ in
+            tries.append(())
+            return tries.values.count <= 2 ? kVTVideoDecoderNotAvailableNowErr : nil
+        }
+        host.play()
+        await Self.waitUntil {
+            repositions.values.count == 1 && frames.values.contains { $0.hardware && $0.pts > 0.49 }
+        }
+
+        #expect(host.hardwareFallback == nil, "a session VideoToolbox could not open just then is not a refusal")
+        #expect(host.usesHardwareVideoDecoder)
+        #expect(repositions.values.count == 1)
+        #expect(frames.values.contains { $0.hardware && $0.pts > 0.49 }, "past the switch, on VideoToolbox")
+    }
+
     @Test("the Stats label follows the stream from VideoToolbox to libavcodec",
           .enabled(if: hasHardwareH264, "needs VideoToolbox's H.264 hardware decoder"), .timeLimit(.minutes(1)))
     func statsLabelFollowsTheFallback() async throws {
@@ -134,12 +201,14 @@ struct SoftwareHostH264FallbackTests {
         let host = SoftwarePlaybackHost()
         defer { host.stop() }
         let frames = Recorder<(pts: Double, hardware: Bool)>()
+        let repositions = Recorder<Void>()
         host.onVideoFrameEnqueuedForTesting = { pts, hardware in frames.append((pts.seconds, hardware)) }
+        host.onVideoRepositioned = { repositions.append(()) }
         try await host.load(demuxer: openFixture(fixture), startPosition: nil, audioSourceStreamIndex: nil)
         #expect(host.usesHardwareVideoDecoder)
         if refusingSwitch {
             let hardware = try #require(host.videoDecoderForTesting as? HardwareVideoDecoder)
-            hardware.refusesFormatForTesting = { _ in true }
+            hardware.failsFormatForTesting = { _ in kVTCouldNotFindVideoDecoderErr }
         }
         host.play()
         await waitUntil { frames.values.contains { !$0.hardware && $0.pts > 0.49 } }
@@ -152,15 +221,48 @@ struct SoftwareHostH264FallbackTests {
         #expect(first >= fallback.playhead - 0.001 && first < fallback.playhead + 0.1,
                 "libavcodec's first frame is the playhead's (\(first) for \(fallback.playhead))")
         #expect(software.contains { $0 > 0.49 }, "past the switch")
+        await waitUntil { repositions.values.count == 1 }
+        #expect(repositions.values.count == 1, "the captions decoded ahead of the playhead start clean")
 
         // No second fallback: another ask, the way a second keyframe's would come, changes nothing.
         let decoder = host.videoDecoderForTesting
         await host.fallBackToLibavcodec(reason: reason == .refused ? .interlaced : .refused)
         #expect(host.videoDecoderForTesting === decoder)
         #expect(host.hardwareFallback == fallback)
+        #expect(repositions.values.count == 1)
     }
 
     // MARK: - Harness
+
+    /// The first 12 video packets go in under the slot's epoch read before a seek's flush, made as the host's
+    /// `seek` makes it, on the decoder the slot holds; then the same 12 under the epoch read after. Returns the
+    /// presentation times of the frames that come out.
+    private static func framesThroughSlot(_ decoder: any VideoDecodingPipeline) throws -> [Double] {
+        let demuxer = try openFixture(H264HardwareDecodeFixtures.highTenSwitchBase64)
+        defer { demuxer.close() }
+        let videoIndex = demuxer.videoStreamIndex
+        let stream = try #require(demuxer.stream(at: videoIndex))
+        let frames = Recorder<Double>()
+        try decoder.open(stream: stream) { _, pts, _ in frames.append(pts.seconds) }
+        let slot = VideoDecoderSlot(decoder)
+        var packets: [UnsafeMutablePointer<AVPacket>?] = []
+        defer { for i in packets.indices { trackedPacketFree(&packets[i]) } }
+        while packets.count < 12, let pkt = try? demuxer.readPacket() {
+            var read: UnsafeMutablePointer<AVPacket>? = pkt
+            if pkt.pointee.stream_index == videoIndex { packets.append(pkt) } else { trackedPacketFree(&read) }
+        }
+        #expect(packets.count == 12)
+
+        let readBeforeSeek = slot.feedEpoch
+        slot.decoder.flush()
+        for case let packet? in packets { slot.decode(packet: packet, epoch: readBeforeSeek) }
+        let readAfterSeek = slot.feedEpoch
+        for case let packet? in packets { slot.decode(packet: packet, epoch: readAfterSeek) }
+        slot.drainForEndOfStream()
+        slot.flush()
+        slot.close()   // waits for VideoToolbox's asynchronous frames
+        return frames.values
+    }
 
     private struct Run {
         var packets = 0
@@ -170,8 +272,8 @@ struct SoftwareHostH264FallbackTests {
         var sessionsLost = 0
     }
 
-    /// `refusingSwitch`: VideoToolbox refuses every description after the one it opened on.
-    private static func decodeOnHardware(_ demuxer: Demuxer, refusingSwitch: Bool = false) throws -> Run {
+    /// `failingSwitch`: VideoToolbox fails every description after the one it opened on with this status.
+    private static func decodeOnHardware(_ demuxer: Demuxer, failingSwitch: OSStatus? = nil) throws -> Run {
         defer { demuxer.close() }
         let videoIndex = demuxer.videoStreamIndex
         let stream = try #require(demuxer.stream(at: videoIndex))
@@ -184,7 +286,7 @@ struct SoftwareHostH264FallbackTests {
         try decoder.open(stream: stream) { pixelBuffer, pts, _ in
             frames.append((pts.seconds, CVPixelBufferGetWidth(pixelBuffer)))
         }
-        if refusingSwitch { decoder.refusesFormatForTesting = { _ in true } }
+        if let failingSwitch { decoder.failsFormatForTesting = { _ in failingSwitch } }
         var run = Run()
         while let pkt = try? demuxer.readPacket() {
             var read: UnsafeMutablePointer<AVPacket>? = pkt

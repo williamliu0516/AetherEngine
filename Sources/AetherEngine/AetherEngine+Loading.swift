@@ -2086,6 +2086,10 @@ extension AetherEngine {
         host.onLiveEdge = { [weak self] edge in
             self?.publishLiveWindow(edgeSessionTime: edge)
         }
+        host.onVideoRepositioned = { [weak self, weak host] in
+            guard let self, let host, self.softwareHost === host else { return }
+            self.reanchorSubtitleOverlays()
+        }
         self.softwareHost = host
         armHeldPictureRelease(onSoftwareHost: host)
         // #311: a load builds a new host and a new renderer, so an observer installed once by the

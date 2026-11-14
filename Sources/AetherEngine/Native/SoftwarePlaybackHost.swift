@@ -169,7 +169,8 @@ final class SoftwarePlaybackHost {
     private let renderer: SampleBufferRenderer
     /// Swapped per codec at load(): SoftwareVideoDecoder for AV1/VP9, HardwareVideoDecoder for HEVC. Protocol keeps the demux loop codec-agnostic.
     /// W2425: held in `videoSlot`, which the demux loops capture instead, so `fallBackToLibavcodec` can swap it
-    /// under a running loop. Never hand this decoder itself to a loop.
+    /// under a running loop. Never hand this decoder itself to a loop. Flushing it here retires the loops'
+    /// packets as flushing the slot does: the slot's epoch follows the decoder's.
     private var videoDecoder: any VideoDecodingPipeline {
         get { videoSlot.decoder }
         set { videoSlot.replace(with: newValue) }
@@ -633,6 +634,11 @@ final class SoftwarePlaybackHost {
     /// session-relative live edge (seconds since first frame) while live.
     /// Wired by the engine to `publishLiveWindow(edgeSessionTime:)`.
     var onLiveEdge: (@MainActor (Double) -> Void)?
+
+    /// W2425: the host repositioned video to the playhead on its own (VideoToolbox handed the stream to
+    /// libavcodec, or a lost session was rebuilt), so the captions decoded ahead of it come again. Wired by the
+    /// engine to `reanchorSubtitleOverlays()`, as its own seeks are: the caption tap starts clean.
+    var onVideoRepositioned: (@MainActor () -> Void)?
 
     /// Session-relative live edge in seconds, or nil before the first
     /// packet. Read on the main actor by the time tick.
@@ -1710,6 +1716,7 @@ final class SoftwarePlaybackHost {
             + "video moves to libavcodec at the playhead \(String(format: "%.3f", target))s",
             category: .swPlayback)
         await seek(to: target)
+        onVideoRepositioned?()
     }
 
     /// AE#739: the hardware decoder reported its session invalidated by the system. In audio-only mode
@@ -1753,6 +1760,7 @@ final class SoftwarePlaybackHost {
             category: .swPlayback)
         Task { @MainActor [weak self] in
             await self?.seek(to: target)
+            self?.onVideoRepositioned?()
         }
     }
 
