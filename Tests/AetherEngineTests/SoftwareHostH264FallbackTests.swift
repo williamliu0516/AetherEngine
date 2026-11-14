@@ -110,6 +110,24 @@ struct SoftwareHostH264FallbackTests {
     }
 
     @MainActor
+    @Test("the Stats label follows the stream from VideoToolbox to libavcodec",
+          .enabled(if: hasHardwareH264, "needs VideoToolbox's H.264 hardware decoder"), .timeLimit(.minutes(1)))
+    func statsLabelFollowsTheFallback() async throws {
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        var options = LoadOptions()
+        options.preferredDecodePath = .software
+        options.suppressDisplayCriteria = true
+        let data = try #require(Data(base64Encoded: H264HardwareDecodeFixtures.interlacedSwitchBase64,
+                                     options: .ignoreUnknownCharacters))
+        _ = try await engine.load(source: .custom(DataIOReader(data: data)), options: options)
+        #expect(engine.activeVideoDecoder == "VideoToolbox H264 (HW)")
+        engine.play()
+        await Self.waitUntil { engine.activeVideoDecoder == "libavcodec H264 (SW)" }
+        #expect(engine.activeVideoDecoder == "libavcodec H264 (SW)")
+    }
+
+    @MainActor
     private static func playUntilFallback(
         _ fixture: String, reason: HardwareFallbackReason, refusingSwitch: Bool = false
     ) async throws {
