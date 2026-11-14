@@ -428,11 +428,12 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         #endif
     }
 
-    /// W2425: a session open failing with one of these is VideoToolbox refusing the stream itself; any other
-    /// status (the app in the background, media services resetting) passes, and the session counts as lost.
-    static func refusesFormat(_ status: OSStatus) -> Bool {
-        [kVTCouldNotFindVideoDecoderErr, kVTVideoDecoderUnsupportedDataFormatErr, kVTVideoDecoderBadDataErr,
-         kVTFormatDescriptionChangeNotSupportedErr].contains(status)
+    /// W2425: a session open failing with one of these is VideoToolbox unavailable for now (the app in the
+    /// background, media services resetting), not refusing the stream: the session counts as lost (AE#739).
+    /// Any other status is a refusal, the Mac's -12911 for interlaced sets among them: a refusal taken as a loss
+    /// would rebuild on the refused sets on every foreground return, the picture frozen for good.
+    static func isTransientOpenFailure(_ status: OSStatus) -> Bool {
+        [kVTVideoDecoderNotAvailableNowErr, kVTInvalidSessionErr].contains(status)
     }
 
     /// AE#739: replace the session with a fresh one built from the same format description and
@@ -584,8 +585,8 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// takes the new description in place when it can, else is rebuilt on it, and this keyframe starts it.
     /// Sets VideoToolbox refuses keep the old session and description (a rebuild would retry the refused ones)
     /// and ask for libavcodec through `onHardwareFallbackNeeded`; interlaced sets ask too and decode on here
-    /// until the swap. A rebuild failing for another reason loses the session (AE#739): the owner rebuilds it on
-    /// the new sets. Returns the description the packet goes out with: `current` when nothing changed, nil
+    /// until the swap. A rebuild failing only for now (`isTransientOpenFailure`) loses the session (AE#739): the
+    /// owner rebuilds it on the new sets. Returns the description the packet goes out with: `current` when nothing changed, nil
     /// when the packet is dropped (the session gone or the new sets refused).
     private func followH264ParameterSets(
         in packet: UnsafeMutablePointer<AVPacket>, current: CMVideoFormatDescription
@@ -629,16 +630,16 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                 VTDecompressionSessionInvalidate(session)
                 self.session = fresh
                 outcome = "rebuilt"
-            } else if Self.refusesFormat(created.status) {
-                refusedParameterSets = true
-                outcome = "refused (status \(created.status)), kept on the old sets"
-            } else {
+            } else if Self.isTransientOpenFailure(created.status) {
                 // AE#739: the owner rebuilds it on the new sets once VideoToolbox opens sessions again.
                 VTDecompressionSessionInvalidate(session)
                 self.session = nil
                 sessionLost = true
                 lost = true
                 outcome = "lost (status \(created.status))"
+            } else {
+                refusedParameterSets = true
+                outcome = "refused (status \(created.status)), kept on the old sets"
             }
         }
         let refused = refusedParameterSets
