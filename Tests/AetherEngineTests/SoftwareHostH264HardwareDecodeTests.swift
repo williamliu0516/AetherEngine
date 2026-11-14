@@ -111,7 +111,29 @@ struct SoftwareHostH264HardwareDecodeTests {
         #expect(run.captions.count == packets)
         #expect(run.captions.allSatisfy { if case .decode(dts: _?) = $0.order { true } else { false } },
                 "VideoToolbox's come in decode order with their DTS")
+        Self.expectPresentationOrderAtTheTap(run)
+    }
 
+    /// W2425 a2 fix 4: Matroska stores no DTS, so the first packets of a B-frame MKV reach the tap with none. Taking
+    /// their PTS for one moved the reorder buffer's watermark past the B-frames still to come, and every group of the
+    /// stretch after left misordered; held without a watermark, the whole stretch comes out in presentation order.
+    @Test("captions of a whole B-frame Matroska stretch reach the tap in presentation order",
+          .enabled(if: hasHardwareH264, "needs VideoToolbox's H.264 hardware decoder"))
+    func bFrameMatroskaCaptionsInPresentationOrder() throws {
+        let demuxer = try Self.openFixture(H264HardwareDecodeFixtures.bFramesMatroskaBase64, hint: "matroska")
+        defer { demuxer.close() }
+        let run = try Self.decodeOnHardware(demuxer) { index in (UInt8(0x40 + index), 0x01) }
+        #expect(run.packetPTS.count == 24)
+        #expect(run.packetPTS != run.packetPTS.sorted(), "the fixture's pictures are reordered")
+        #expect(run.captions.count == 24)
+        #expect(run.captions.contains { $0.order == .decode(dts: nil) }, "Matroska's first packets carry no DTS")
+        Self.expectPresentationOrderAtTheTap(run)
+    }
+
+    /// Feeds the run's captions the way `AetherEngine+Loading` routes them; packet i carries pair (0x40 + i, 0x01).
+    private static func expectPresentationOrderAtTheTap(
+        _ run: Run, sourceLocation: SourceLocation = #_sourceLocation
+    ) {
         var reorder = A53ReorderBuffer()
         var fed: [A53ReorderBuffer.Group] = []
         for caption in run.captions {
@@ -123,8 +145,10 @@ struct SoftwareHostH264HardwareDecodeTests {
         }
         let presentationOrder = run.packetPTS.indices.sorted { run.packetPTS[$0] < run.packetPTS[$1] }
             .map { UInt8(0x40 + $0) }
-        #expect(fed.count >= packets - 3, "all but the reorder depth are out")
-        #expect(fed.flatMap { $0.pairs.map(\.d0) } == Array(presentationOrder.prefix(fed.count)))
+        #expect(fed.count >= run.packetPTS.count - 3, "all but the reorder depth are out",
+                sourceLocation: sourceLocation)
+        #expect(fed.flatMap { $0.pairs.map(\.d0) } == Array(presentationOrder.prefix(fed.count)),
+                sourceLocation: sourceLocation)
     }
 
     /// Review HOLD 2: VideoToolbox keeps the format description it opened with, so a keyframe with new
