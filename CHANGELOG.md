@@ -52,7 +52,9 @@ the public-API contract.
   iPad Pro (0-4 frames dropped in 20 s). Interlaced H.264 (the deinterlacer), an MVC both-eyes track, live H.264
   and Annex-B H.264 (TS, AVCHD: no avcC) stay on libavcodec. The VideoToolbox decoder now delivers A53 captions,
   in decode order with their DTS for the caption tap's reorder buffer, and an H.264 keyframe with new parameter
-  sets (an MP4's next sample entry, a recording's format switch) moves its session onto them.
+  sets (an MP4's next sample entry, a recording's format switch) moves its session onto them. A switch to sets
+  VideoToolbox refuses (High 10, 4:2:2) or to interlaced pictures moves video to libavcodec at the playhead, once,
+  instead of freezing it (audio played on) or weaving the fields.
 
 ### Fixed
 

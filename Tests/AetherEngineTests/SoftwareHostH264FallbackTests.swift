@@ -4,6 +4,7 @@ import Foundation
 import Testing
 import VideoToolbox
 import AetherLibavcodec
+import AetherLibavformat
 import AetherLibavutil
 @testable import AetherEngine
 
