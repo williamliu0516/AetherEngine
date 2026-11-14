@@ -6,7 +6,7 @@ import AetherLibavformat
 import AetherLibavcodec
 import AetherLibavutil
 
-/// VTDecompressionSession-backed HEVC decoder for the SoftwarePlaybackHost pipeline.
+/// VTDecompressionSession-backed HEVC and H.264 decoder for the SoftwarePlaybackHost pipeline.
 /// Owns the decoded-frame pool, IOSurface lifetime, and session teardown explicitly
 /// (AVPlayer's opaque state grows unbounded on long 4K HDR sessions).
 /// Same surface as SoftwareVideoDecoder so the host can swap without rewiring the demux loop.
@@ -42,6 +42,12 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// Far past any reorder depth: entries for frames VideoToolbox never output do not pile up.
     private static let hdr10PlusPendingLimit = 64
     var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)?
+    /// W2425: A53 captions (CEA-608 in SEI), which libavcodec hands over as frame side data and VideoToolbox
+    /// drops. Each packet's triplets wait under its presentation time as HDR10+ does and leave with their frame,
+    /// in presentation order, as on the libavcodec path. Under `hdr10PlusLock`; scanned only with a consumer.
+    private var a53Codec = A53SEIParser.CodecKind.hevc
+    private var a53Framing = VideoNALFraming.lengthPrefixed(size: 4)
+    private var a53ByPTS: [HDR10PlusKey: [CCDataParser.CCTriplet]] = [:]
     var onDecodedFormat: (@Sendable (DecodedVideoFormat) -> Void)?
     private var streamColor = ColorDescription.unspecified
     private var streamCodecID = AV_CODEC_ID_NONE
@@ -268,24 +274,30 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             )
         }
 
-        guard codecpar.pointee.codec_id == AV_CODEC_ID_HEVC else {
-            throw VideoDecoderError.unsupportedCodec(id: codecpar.pointee.codec_id.rawValue)
+        // W2425: H.264 from its avcC as HEVC from its hvcC, so the software host (3x) keeps hardware decode.
+        // Annex-B H.264 (TS, AVCHD) has no avcC to build from; the host keeps it on libavcodec.
+        let codecType: CMVideoCodecType
+        let configAtom: String
+        switch codecpar.pointee.codec_id {
+        case AV_CODEC_ID_HEVC: codecType = kCMVideoCodecType_HEVC; configAtom = "hvcC"
+        case AV_CODEC_ID_H264: codecType = kCMVideoCodecType_H264; configAtom = "avcC"
+        default: throw VideoDecoderError.unsupportedCodec(id: codecpar.pointee.codec_id.rawValue)
         }
 
-        // 1. Build CMVideoFormatDescription from the hvcC extradata via
+        // 1. Build CMVideoFormatDescription from the hvcC / avcC extradata via
         //    kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms (same shape AVFoundation uses for .mp4/.mkv).
         guard let extradata = codecpar.pointee.extradata, codecpar.pointee.extradata_size > 0 else {
             throw VideoDecoderError.noExtradata
         }
-        let hvcCData = Data(bytes: extradata, count: Int(codecpar.pointee.extradata_size))
+        let configRecord = Data(bytes: extradata, count: Int(codecpar.pointee.extradata_size))
         var fd: CMVideoFormatDescription?
-        let atomsDict: NSDictionary = ["hvcC": hvcCData]
+        let atomsDict: NSDictionary = [configAtom: configRecord]
         let extensions: NSDictionary = [
             kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: atomsDict,
         ]
         let fdStatus = CMVideoFormatDescriptionCreate(
             allocator: kCFAllocatorDefault,
-            codecType: kCMVideoCodecType_HEVC,
+            codecType: codecType,
             width: width,
             height: height,
             extensions: extensions,
@@ -314,6 +326,9 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         hdr10PlusFraming = .lengthPrefixed(size: NALUnitChain.lengthPrefixSize(
             codecID: streamCodecID, extradata: extradata,
             extradataSize: Int(codecpar.pointee.extradata_size)) ?? 4)
+        a53Codec = codecType == kCMVideoCodecType_H264 ? .h264 : .hevc
+        a53Framing = A53SEIParser.nalFraming(
+            codec: a53Codec, extradata: extradata, size: Int(codecpar.pointee.extradata_size))
         self.colorPrimaries = ColorAttachments.primaries(codecpar.pointee.color_primaries)
         self.colorTransfer = ColorAttachments.transfer(codecpar.pointee.color_trc)
         self.colorMatrix = ColorAttachments.matrix(codecpar.pointee.color_space)
@@ -344,7 +359,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         session = createdSession
 
         EngineLog.emit(
-            "[HardwareVideoDecoder] opened HEVC \(width)x\(height) "
+            "[HardwareVideoDecoder] opened \(codecType == kCMVideoCodecType_H264 ? "H.264" : "HEVC") \(width)x\(height) "
             + "\(use10Bit ? "10-bit" : "8-bit") "
             + "transfer=\(codecpar.pointee.color_trc.rawValue)",
             category: .swPlayback
@@ -616,6 +631,15 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                 onFirstHDR10PlusDetected?()
             }
         }
+        if onA53Captions != nil {
+            let triplets = A53SEIParser.triplets(in: data, size: size, codec: a53Codec, framing: a53Framing)
+            if !triplets.isEmpty {
+                hdr10PlusLock.lock()
+                if a53ByPTS.count >= Self.hdr10PlusPendingLimit { a53ByPTS.removeAll() }
+                a53ByPTS[HDR10PlusKey(pts), default: []].append(contentsOf: triplets)
+                hdr10PlusLock.unlock()
+            }
+        }
 
         // Tag non-keyframes as DependsOnOthers so VT can drop pre-seek RASL frames after a flush.
         if (packet.pointee.flags & AV_PKT_FLAG_KEY) == 0 {
@@ -706,7 +730,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         // Drain in-flight frames then signal a discontinuity so VT drops its reference picture state.
         VTDecompressionSessionWaitForAsynchronousFrames(session)
         VTDecompressionSessionFinishDelayedFrames(session)
-        hdr10PlusLock.lock(); hdr10PlusByPTS.removeAll(); hdr10PlusLock.unlock()
+        hdr10PlusLock.lock(); hdr10PlusByPTS.removeAll(); a53ByPTS.removeAll(); hdr10PlusLock.unlock()
     }
 
     func close() {
@@ -756,6 +780,13 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             hdr10PlusLock.lock()
             hdr10PlusData = hdr10PlusByPTS.removeValue(forKey: HDR10PlusKey(pts))
             hdr10PlusLock.unlock()
+        }
+        // Before the pre-roll skip, as libavcodec's captions are: the caption decoder keeps its own state.
+        if let onA53 = onA53Captions {
+            hdr10PlusLock.lock()
+            let triplets = a53ByPTS.removeValue(forKey: HDR10PlusKey(pts))
+            hdr10PlusLock.unlock()
+            if let triplets, pts.isNumeric { onA53(triplets, pts.seconds) }
         }
         if let threshold = skipUntilPTS {
             if CMTimeCompare(pts, threshold) < 0 {

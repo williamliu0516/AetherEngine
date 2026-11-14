@@ -925,12 +925,36 @@ final class SoftwarePlaybackHost {
             && dolbyVisionHandling == .automatic
     }
 
+    /// W2425: whether this H.264 stream's picture may go to VideoToolbox here: exactly when the routing
+    /// policy would have played it natively, i.e. on hardware. Interlaced H.264 (#107) needs libavcodec's
+    /// frames for the deinterlacer, and an MVC both-eyes carriage (#435) renders nothing on VideoToolbox;
+    /// both keep libavcodec. A declared interlace the load's frame sample refuted (#232) keeps it too: a
+    /// software decode of progressive frames, never a wrong picture. The hardware verdict is asked apart.
+    nonisolated static func h264PictureAllowsVideoToolbox(stream: UnsafeMutablePointer<AVStream>) -> Bool {
+        guard let codecpar = stream.pointee.codecpar, codecpar.pointee.codec_id == AV_CODEC_ID_H264 else {
+            return false
+        }
+        var spsIndicatesInterlaced = false
+        if let extradata = codecpar.pointee.extradata, codecpar.pointee.extradata_size > 0 {
+            spsIndicatesInterlaced = VideoRoutingPolicy.spsIndicatesInterlaced(extradata: Array(
+                UnsafeBufferPointer(start: extradata, count: Int(codecpar.pointee.extradata_size))))
+        }
+        return !VideoRoutingPolicy.requiresSoftwarePath(
+            codecID: AV_CODEC_ID_H264,
+            fieldOrder: codecpar.pointee.field_order,
+            av1Available: false,
+            spsIndicatesInterlaced: spsIndicatesInterlaced,
+            stereo3DType: AetherEngine.stereo3DType(stream: stream))
+    }
+
     /// Selects and instantiates the appropriate VideoDecodingPipeline based on stream and host options.
     func selectVideoDecoder(
         codecID: AVCodecID,
         canHardwareDecode: Bool,
         dvProfile: Int?
     ) -> any VideoDecodingPipeline {
+        // W2425: H.264 that the open gate below let through (avcC, hardware verdict, picture rule above).
+        if codecID == AV_CODEC_ID_H264 && canHardwareDecode { return HardwareVideoDecoder() }
         if codecID == AV_CODEC_ID_HEVC && canHardwareDecode {
             if Self.shouldUseDualLayerDecoder(
                 dvProfile: dvProfile,
@@ -1035,9 +1059,11 @@ final class SoftwarePlaybackHost {
         // requires a HW decoder and has no software fallback, so an HEVC Rext stream on hardware without a
         // HW decoder must go to libavcodec. AE#461: so must every format the probe cannot classify (in-band
         // parameter sets, Annex-B extradata), which the routing gate reads as "keep native" but which
-        // HardwareVideoDecoder, building from the hvcC alone, can never open.
+        // HardwareVideoDecoder, building from the hvcC alone, can never open. W2425: H.264 likewise from its
+        // avcC (an Annex-B one fails the verdict), when its picture is one the native route would play.
         if let codecpar = vStream.pointee.codecpar,
-           codecpar.pointee.codec_id == AV_CODEC_ID_HEVC,
+           codecpar.pointee.codec_id == AV_CODEC_ID_HEVC
+               || (codecpar.pointee.codec_id == AV_CODEC_ID_H264 && Self.h264PictureAllowsVideoToolbox(stream: vStream)),
            VTCapabilityProbe.hardwareDecodeVerdict(codecpar: codecpar).opensHardwareDecoder {
             videoDecoder.close()
             let dvProfile = configuredDVProfile ?? AetherEngine.dvProfile(stream: vStream)
@@ -1070,7 +1096,7 @@ final class SoftwarePlaybackHost {
                 )
             } else {
                 EngineLog.emit(
-                    "[SWHost] selected HardwareVideoDecoder (VT HEVC) for codec_id=\(codecpar.pointee.codec_id.rawValue)",
+                    "[SWHost] selected HardwareVideoDecoder (VideoToolbox) for codec_id=\(codecpar.pointee.codec_id.rawValue)",
                     category: .swPlayback
                 )
             }

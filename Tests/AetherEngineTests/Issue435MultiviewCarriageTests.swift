@@ -101,7 +101,7 @@ struct Issue435MultiviewCarriageTests {
     /// 5 frames of 64x64 H.264 in Matroska, StereoMode 13 (`block_lr`).
     /// `ffmpeg -f lavfi -i testsrc2=size=64x64:rate=25 -frames:v 5 -c:v libx264 -preset ultrafast
     ///  -qp 40 -pix_fmt yuv420p -metadata:s:v:0 stereo_mode=block_lr -f matroska`
-    private static let blockLRBase64 = """
+    static let blockLRBase64 = """
 GkXfo6NChoEBQveBAULygQRC84EIQoKIbWF0cm9za2FCh4EEQoWBAhhTgGcBAAAAAAAJBRFNm3TAv4T3OsbYTbuLU6uEFUmp
 ZlOsgaFNu4tTq4QWVK5rU6yB8U27jFOrhBJUw2dTrIIBi027jFOrhBxTu2tTrIII6ewBAAAAAAAAUwAAAAAAAAAAAAAAAAAA
 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFUmp

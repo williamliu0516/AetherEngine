@@ -47,6 +47,11 @@ the public-API contract.
   software host paces its own renderer and held 3.00x on a 120 Hz iPad Pro (MPEG-2 SD, 0-1 frames dropped in ~1350);
   audio-only stays at 3.0. `.loopback` and `.remoteBypass` stay at 2.0: above it AVPlayer's HLS playback stands and
   jumps between keyframes (2.3 s stills at 3x on an iPhone SE 3). New `maxSupportedRate(on:)` gives each route's value.
+- **H.264 with an avcC decodes on VideoToolbox on the software host, as HEVC does** (W2425), so a host that moves a
+  session there for 3x keeps hardware decode: H.264 1080p, HEVC 10-bit 1080p and HDR10 4K held 3x on a 12.9-inch
+  iPad Pro (0-4 frames dropped in 20 s). Interlaced H.264 (the deinterlacer), an MVC both-eyes track and Annex-B
+  H.264 (TS, AVCHD: no avcC) stay on libavcodec. The VideoToolbox decoder now delivers A53 captions, which
+  libavcodec delivered before.
 
 ### Fixed
 
