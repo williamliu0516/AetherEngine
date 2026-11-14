@@ -155,9 +155,13 @@ struct SoftwareHostH264HardwareDecodeTests {
     /// parameter sets (a recording's 1080/720 or 4:3/16:9 switch) moves the session onto them. A session rebuilt
     /// for them first hands over the pictures VideoToolbox still held back for reordering (W2425 a2a).
     @Test("a mid-stream SPS/PPS change keeps decoding, at the new size, every frame before it too",
-          .enabled(if: hasHardwareH264, "needs VideoToolbox's H.264 hardware decoder"))
-    func parameterSetChangeKeepsDecoding() throws {
-        let demuxer = try Self.openFixture(H264HardwareDecodeFixtures.parameterSetChangeBase64, hint: "matroska")
+          .enabled(if: hasHardwareH264, "needs VideoToolbox's H.264 hardware decoder"),
+          arguments: [false, true])
+    func parameterSetChangeKeepsDecoding(bFrames: Bool) throws {
+        let fixture = bFrames
+            ? H264HardwareDecodeFixtures.bFramesParameterSetChangeBase64
+            : H264HardwareDecodeFixtures.parameterSetChangeBase64
+        let demuxer = try Self.openFixture(fixture, hint: "matroska")
         defer { demuxer.close() }
         let run = try Self.decodeOnHardware(demuxer) { _ in nil }
         #expect(run.packetPTS.count == 24)
