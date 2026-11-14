@@ -115,6 +115,9 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// not for one the epoch gate or a missing session refused.
     var onSubmittedToVideoToolboxForTesting: (() -> Void)?
     var onBlockBufferAllocatedForTesting: ((CMBlockBuffer) -> Void)?
+    /// W2425: VideoToolbox refusing a description, as iOS or tvOS may for a High 10 or 4:2:2 switch the Mac's
+    /// decoder takes: a description this returns true for is neither taken in place nor opened. Set after `open`.
+    var refusesFormatForTesting: ((CMVideoFormatDescription) -> Bool)?
     #endif
 
     /// AE#492: the epoch a fed packet must carry. Guarded by `epochLock`, a leaf lock held only for a
@@ -389,6 +392,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     private func makeSession(
         formatDescription: CMVideoFormatDescription, refCon: Unmanaged<RefConBox>
     ) -> (session: VTDecompressionSession?, status: OSStatus) {
+        if testRefuses(formatDescription) { return (nil, kVTCouldNotFindVideoDecoderErr) }
         var callback = VTDecompressionOutputCallbackRecord(
             decompressionOutputCallback: hwDecoderOutputCallback,
             decompressionOutputRefCon: refCon.toOpaque()
@@ -413,6 +417,14 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             )
         }
         return (created, noErr)
+    }
+
+    private func testRefuses(_ format: CMVideoFormatDescription) -> Bool {
+        #if DEBUG
+        return refusesFormatForTesting?(format) ?? false
+        #else
+        return false
+        #endif
     }
 
     /// AE#739: replace the session with a fresh one built from the same format description and
@@ -597,7 +609,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         lock.lock()
         guard let session, !sessionLost, !refusedParameterSets, let refConBox else { lock.unlock(); return nil }
         var outcome = "kept"
-        if !VTDecompressionSessionCanAcceptFormatDescription(session, formatDescription: next) {
+        if testRefuses(next) || !VTDecompressionSessionCanAcceptFormatDescription(session, formatDescription: next) {
             // The pictures VideoToolbox still holds back for reordering belong to the old sets: out first.
             VTDecompressionSessionFinishDelayedFrames(session)
             VTDecompressionSessionWaitForAsynchronousFrames(session)
@@ -617,7 +629,8 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             width = dims.width
             height = dims.height
         }
-        let reason: HardwareFallbackReason? = refused ? .refused : interlaced ? .interlaced : nil
+        // Interlaced first: VideoToolbox may refuse such sets too, and it is the interlacing libavcodec answers.
+        let reason: HardwareFallbackReason? = interlaced ? .interlaced : refused ? .refused : nil
         let asks = reason != nil && !askedForFallback
         if asks { askedForFallback = true }
         let size = "\(width)x\(height)"

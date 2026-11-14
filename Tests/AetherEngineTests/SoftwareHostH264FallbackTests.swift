@@ -56,13 +56,24 @@ struct SoftwareHostH264FallbackTests {
 
     // MARK: - HardwareVideoDecoder
 
-    @Test("VideoToolbox refusing a switch asks for libavcodec once, keeps the frames before it, drops the rest",
+    @Test("a High 10 or 4:2:2 switch VideoToolbox takes decodes on, with no ask for libavcodec",
           .enabled(if: hasHardwareH264, "needs VideoToolbox's H.264 hardware decoder"),
           arguments: ["High 10", "4:2:2"])
-    func refusedSwitchAsksForLibavcodec(_ to: String) throws {
+    func acceptedSwitchKeepsDecoding(_ to: String) throws {
         let fixture = to == "High 10"
             ? H264HardwareDecodeFixtures.highTenSwitchBase64 : H264HardwareDecodeFixtures.fourTwoTwoSwitchBase64
         let run = try Self.decodeOnHardware(Self.openFixture(fixture))
+        #expect(run.packets == 24)
+        #expect(run.reasons.isEmpty)
+        #expect(run.frames.filter { $0 < 0.49 }.count == 12)
+        #expect(run.frames.filter { $0 > 0.49 }.count == 12)
+    }
+
+    @Test("VideoToolbox refusing a switch asks for libavcodec once, keeps the frames before it, drops the rest",
+          .enabled(if: hasHardwareH264, "needs VideoToolbox's H.264 hardware decoder"))
+    func refusedSwitchAsksForLibavcodec() throws {
+        let run = try Self.decodeOnHardware(
+            Self.openFixture(H264HardwareDecodeFixtures.highTenSwitchBase64), refusingSwitch: true)
         #expect(run.packets == 24)
         #expect(run.reasons == [.refused])
         #expect(run.sessionsLost == 0, "a refused switch is not a lost session: its rebuild retries the refused sets")
@@ -70,7 +81,8 @@ struct SoftwareHostH264FallbackTests {
         #expect(run.frames.filter { $0 > 0.49 }.isEmpty, "nothing fed to a session that cannot decode it")
     }
 
-    @Test("an interlaced switch asks for libavcodec once and decodes on VideoToolbox until the swap",
+    /// Whether VideoToolbox then decodes the interlaced pictures (woven) is the platform's: the Mac's refuses them.
+    @Test("an interlaced switch asks for libavcodec once, as interlaced, keeping the frames before it",
           .enabled(if: hasHardwareH264, "needs VideoToolbox's H.264 hardware decoder"))
     func interlacedSwitchAsksForLibavcodec() throws {
         let run = try Self.decodeOnHardware(Self.openFixture(H264HardwareDecodeFixtures.interlacedSwitchBase64))
@@ -78,7 +90,6 @@ struct SoftwareHostH264FallbackTests {
         #expect(run.reasons == [.interlaced])
         #expect(run.sessionsLost == 0)
         #expect(run.frames.filter { $0 < 0.49 }.count == 12)
-        #expect(run.frames.filter { $0 > 0.49 }.count >= 8)
     }
 
     // MARK: - The host
@@ -87,7 +98,8 @@ struct SoftwareHostH264FallbackTests {
     @Test("a refused switch moves video to libavcodec once, and frames resume at the playhead",
           .enabled(if: hasHardwareH264, "needs VideoToolbox's H.264 hardware decoder"))
     func hostFallsBackOnARefusedSwitch() async throws {
-        try await Self.playUntilFallback(H264HardwareDecodeFixtures.highTenSwitchBase64, reason: .refused)
+        try await Self.playUntilFallback(H264HardwareDecodeFixtures.highTenSwitchBase64, reason: .refused,
+                                         refusingSwitch: true)
     }
 
     @MainActor
@@ -98,13 +110,19 @@ struct SoftwareHostH264FallbackTests {
     }
 
     @MainActor
-    private static func playUntilFallback(_ fixture: String, reason: HardwareFallbackReason) async throws {
+    private static func playUntilFallback(
+        _ fixture: String, reason: HardwareFallbackReason, refusingSwitch: Bool = false
+    ) async throws {
         let host = SoftwarePlaybackHost()
         defer { host.stop() }
         let frames = Recorder<(pts: Double, hardware: Bool)>()
         host.onVideoFrameEnqueuedForTesting = { pts, hardware in frames.append((pts.seconds, hardware)) }
         try await host.load(demuxer: openFixture(fixture), startPosition: nil, audioSourceStreamIndex: nil)
         #expect(host.usesHardwareVideoDecoder)
+        if refusingSwitch {
+            let hardware = try #require(host.videoDecoderForTesting as? HardwareVideoDecoder)
+            hardware.refusesFormatForTesting = { _ in true }
+        }
         host.play()
         await waitUntil { frames.values.contains { !$0.hardware && $0.pts > 0.49 } }
 
@@ -134,7 +152,8 @@ struct SoftwareHostH264FallbackTests {
         var sessionsLost = 0
     }
 
-    private static func decodeOnHardware(_ demuxer: Demuxer) throws -> Run {
+    /// `refusingSwitch`: VideoToolbox refuses every description after the one it opened on.
+    private static func decodeOnHardware(_ demuxer: Demuxer, refusingSwitch: Bool = false) throws -> Run {
         defer { demuxer.close() }
         let videoIndex = demuxer.videoStreamIndex
         let stream = try #require(demuxer.stream(at: videoIndex))
@@ -147,6 +166,7 @@ struct SoftwareHostH264FallbackTests {
         try decoder.open(stream: stream) { pixelBuffer, pts, _ in
             frames.append((pts.seconds, CVPixelBufferGetWidth(pixelBuffer)))
         }
+        if refusingSwitch { decoder.refusesFormatForTesting = { _ in true } }
         var run = Run()
         while let pkt = try? demuxer.readPacket() {
             var read: UnsafeMutablePointer<AVPacket>? = pkt
