@@ -147,7 +147,6 @@ struct SoftwareHostH264FallbackTests {
     }
 
     @MainActor
-    @MainActor
     @Test("a session lost at a switch is rebuilt on VideoToolbox at the playhead, and the captions start clean",
           .enabled(if: hasHardwareH264, "needs VideoToolbox's H.264 hardware decoder"), .timeLimit(.minutes(1)))
     func hostRebuildsASessionLostAtASwitch() async throws {
@@ -177,6 +176,7 @@ struct SoftwareHostH264FallbackTests {
         #expect(frames.values.contains { $0.hardware && $0.pts > 0.49 }, "past the switch, on VideoToolbox")
     }
 
+    @MainActor
     @Test("the Stats label follows the stream from VideoToolbox to libavcodec",
           .enabled(if: hasHardwareH264, "needs VideoToolbox's H.264 hardware decoder"), .timeLimit(.minutes(1)))
     func statsLabelFollowsTheFallback() async throws {
