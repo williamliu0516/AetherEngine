@@ -67,10 +67,9 @@ struct Issue220SoftwareDecoderDrainTests {
         }
 
         #expect(packets == 40)
-        // Frame threading holds a bounded number of frames back until flush; the guard is that
-        // the drain runs at all and keeps up, not the exact pipeline depth.
+        // Frame threading holds up to `thread_count - 1` frames back (17 on an 18-core Mac), so before
+        // the end the guard is only that the drain runs while decoding.
         #expect(counter.value > 0)
-        #expect(counter.value >= packets - 16)
         decoder.drainForEndOfStream()
         #expect(counter.value == packets, "the frames threading held back come out before the host's flush")
     }
