@@ -70,6 +70,7 @@ struct InitMapStarvedTests {
             #expect(request?.code == -12889)
             #expect(request?.domain == SoftwarePathEscalation.mediaErrorDomain)
             #expect(request?.message == "source read parked 8 s, nothing written")
+            #expect(request?.isTerminalFailure == false, "AVPlayer still waits; a refused rebuild must cost nothing")
         } else {
             #expect(request?.code != -12889, "a producer that is not starved keeps AVPlayer's own wait")
         }

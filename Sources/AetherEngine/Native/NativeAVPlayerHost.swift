@@ -1059,7 +1059,7 @@ final class NativeAVPlayerHost {
 
     /// The offer itself, for a failure that has no `item.error` yet (W3038's map timeout).
     private func offerToSoftwarePath(domain: String?, code: Int, message: String, verdict: String,
-                                     position: Double) -> Bool {
+                                     position: Double, isTerminalFailure: Bool = true) -> Bool {
         guard SoftwarePathEscalation.shouldEscalate(
             errorDomain: domain,
             availability: softwarePathAvailability?()
@@ -1075,7 +1075,8 @@ final class NativeAVPlayerHost {
             domain: domain ?? "",
             code: code,
             message: message,
-            positionSeconds: position.isFinite ? max(0, position) : 0
+            positionSeconds: position.isFinite ? max(0, position) : 0,
+            isTerminalFailure: isTerminalFailure
         )
         return true
     }
@@ -1092,7 +1093,7 @@ final class NativeAVPlayerHost {
             domain: SoftwarePathEscalation.mediaErrorDomain, code: code,
             message: "source read parked \(Int(parked)) s, nothing written",
             verdict: "AVPlayer timed out on the init segment the producer cannot make",
-            position: renderedTime)
+            position: renderedTime, isTerminalFailure: false)
     }
 
     private func handleItemFailed(_ desc: String, item: AVPlayerItem) {

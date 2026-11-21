@@ -280,6 +280,39 @@ struct SoftwarePathEscalationTests {
         await #expect(throws: CancellationError.self) { try await hostLoad.value }
     }
 
+    /// W3038: a map timeout is offered while AVPlayer still waits and may yet play. When the rebuild
+    /// would be refused before its teardown (here `customSourceNotSeekable`; a Dolby Vision Profile 5
+    /// source is the other), the offer must spend nothing and surface nothing. Before the fix it took
+    /// the budget and published `.error -12889` ~8 s in, on an item a slow read would have rescued.
+    @Test("A map timeout the software path would refuse spends nothing and surfaces nothing", .timeLimit(.minutes(2)))
+    @MainActor
+    func refusedMapTimeoutStaysSilent() async throws {
+        let engine = try AetherEngine()
+        let reader = ParkedReader()
+        var events: [SoftwarePathEscalationEvent] = []
+        let sub = engine.softwarePathEscalations.sink { events.append($0) }
+        defer { sub.cancel() }
+
+        let hostLoad = Task { @MainActor in
+            try await engine.load(source: .custom(reader, formatHint: "matroska"),
+                                  options: LoadOptions(suppressDisplayCriteria: true))
+        }
+        try await waitFor { reader.entered }
+        #expect(engine.softwarePathRebuildRefusal != nil)
+
+        var mapTimeout = SoftwarePathEscalation.Request(
+            domain: SoftwarePathEscalation.mediaErrorDomain, code: -12889,
+            message: "source read parked 8 s, nothing written", positionSeconds: 0)
+        mapTimeout.isTerminalFailure = false
+        await engine.escalateToSoftwarePath(mapTimeout, expectedGeneration: engine.loadGeneration)
+        #expect(events.isEmpty)
+        #expect(!engine.softwarePathEscalationBudget.isSpent, "a real failure later may still take the rung")
+        #expect(engine.errorInfo == nil)
+
+        engine.stop()
+        await #expect(throws: CancellationError.self) { try await hostLoad.value }
+    }
+
     /// A rebuild refused before it tore anything down, or one a host stop() beat to the teardown,
     /// never became the session's owner, so the load it would have taken over is still the host's.
     @Test("Only the rebuild's own teardown of the failed generation claims the takeover")

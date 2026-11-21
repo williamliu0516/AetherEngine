@@ -51,6 +51,9 @@ enum SoftwarePathEscalation {
         let message: String
         /// Where the session was, so the rebuild lands where the viewer was watching.
         let positionSeconds: Double
+        /// W3038: false for a map timeout, which AVPlayer keeps waiting through and may still play.
+        /// A rebuild refused before its teardown then spends nothing and surfaces nothing.
+        var isTerminalFailure = true
     }
 
     /// One session's single escalation, shared with the mount-time closure the host reads.

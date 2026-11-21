@@ -60,6 +60,15 @@ extension AetherEngine {
         ) else { return }
         // The host's probe read mount-time options and the #93 rung does not consult it at all, so
         // the decision is made again here, against what the session is actually running on.
+        // W3038: a map timeout is not a failure yet; AVPlayer keeps waiting and plays once the read
+        // answers. A rebuild the engine would refuse before its teardown must then cost nothing.
+        if !request.isTerminalFailure, let refusal = softwarePathRebuildRefusal {
+            EngineLog.emit(
+                "[AetherEngine] #561 \(request.message), but the software path would refuse this "
+                + "session (\(refusal.rawValue)); AVPlayer keeps waiting",
+                category: .engine)
+            return
+        }
         guard softwarePathEscalationBudget.take() else { return }
 
         let absorbed = Self.absorbedFailure(request)
@@ -110,6 +119,14 @@ extension AetherEngine {
                     category: .engine)
                 return
             }
+            // W3038: refused before its teardown, so the native item is still alive and still waiting.
+            guard request.isTerminalFailure else {
+                EngineLog.emit(
+                    "[AetherEngine] #561 the software path cannot serve this session (\(error)); "
+                    + "nothing failed yet, AVPlayer keeps waiting",
+                    category: .engine)
+                return
+            }
             // The rung is gone and the failure was never surfaced, so it has to be surfaced here or
             // the session would sit on a picture that stopped with nothing said.
             EngineLog.emit(
@@ -119,6 +136,15 @@ extension AetherEngine {
             )
             publishError(absorbed)
         }
+    }
+
+    /// W3038: why `reloadAtCurrentPosition { $0.preferredDecodePath = .software }` would throw before
+    /// its teardown, or nil when it would rebuild.
+    @MainActor
+    var softwarePathRebuildRefusal: SessionReloadRefusal? {
+        var proposed = loadedOptions
+        proposed.preferredDecodePath = .software
+        return sessionReloadRefusal ?? decodePathRefusal(for: proposed)
     }
 
     /// Start a rebuild of this session that the engine decided on itself (AE#561 software path, AE#641

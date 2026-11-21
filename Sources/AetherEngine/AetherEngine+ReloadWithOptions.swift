@@ -90,23 +90,7 @@ extension AetherEngine {
         // that cannot serve this source. `load` catches both such sources, but only after the
         // routing decision, which on a correction is after the teardown; decide it here instead so
         // a refused correction still costs nothing (rule 2 above).
-        if let refusal = SessionOptionCorrection.decodePathRefusal(
-            routedSoftware: playbackBackend == .software,
-            preferred: proposed.preferredDecodePath,
-            codecID: lastDetectedVideoCodec,
-            // AE#532: what the source is, not what its record claimed. A Profile 5 record the RPU
-            // corrected is representable in software, so a flip to it is not refused.
-            dvProfile: DolbyVisionRecordAudit.correctedProfile(
-                record: sourceDVProfile, rpu: sourceDolbyVisionRPUProfile) ?? sourceDVProfile,
-            dvBLCompatID: sourceDVBLCompatID,
-            // The proposal's handling against the loaded source's base layer: a correction that turns
-            // the base layer on and moves to software in one step is honoured, one that keeps the
-            // Dolby Vision on a Profile 5 record is refused as before.
-            presentsDolbyVisionBaseLayer: proposed.dolbyVisionHandling == .baseLayerOnly
-                && sourceDolbyVisionBaseLayerPresentable,
-            isLive: loadedOptions.isLive,
-            hasCompanionAudioReader: (customReader as? LiveIngestSourceInfo)?.companionAudioReader != nil
-        ) {
+        if let refusal = decodePathRefusal(for: proposed) {
             EngineLog.emit(
                 "[AetherEngine] #461: decode-path correction refused, the software path cannot serve "
                 + "this session: \(refusal.rawValue)",
@@ -215,6 +199,28 @@ extension AetherEngine {
         guard loadedURL != nil else { return .noActiveSession }
         if isCustomSource, !customSourceIsSeekable { return .customSourceNotSeekable }
         return nil
+    }
+
+    /// AE#461: why a correction to `proposed` cannot move this session to the software path, decided
+    /// off the session's load-time facts before any teardown (`SessionOptionCorrection.decodePathRefusal`).
+    func decodePathRefusal(for proposed: LoadOptions) -> SessionReloadRefusal? {
+        SessionOptionCorrection.decodePathRefusal(
+            routedSoftware: playbackBackend == .software,
+            preferred: proposed.preferredDecodePath,
+            codecID: lastDetectedVideoCodec,
+            // AE#532: what the source is, not what its record claimed. A Profile 5 record the RPU
+            // corrected is representable in software, so a flip to it is not refused.
+            dvProfile: DolbyVisionRecordAudit.correctedProfile(
+                record: sourceDVProfile, rpu: sourceDolbyVisionRPUProfile) ?? sourceDVProfile,
+            dvBLCompatID: sourceDVBLCompatID,
+            // The proposal's handling against the loaded source's base layer: a correction that turns
+            // the base layer on and moves to software in one step is honoured, one that keeps the
+            // Dolby Vision on a Profile 5 record is refused as before.
+            presentsDolbyVisionBaseLayer: proposed.dolbyVisionHandling == .baseLayerOnly
+                && sourceDolbyVisionBaseLayerPresentable,
+            isLive: loadedOptions.isLive,
+            hasCompanionAudioReader: (customReader as? LiveIngestSourceInfo)?.companionAudioReader != nil
+        )
     }
 }
 
