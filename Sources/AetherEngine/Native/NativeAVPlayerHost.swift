@@ -53,6 +53,10 @@ final class NativeAVPlayerHost {
     /// AE#561: what the session can still offer when AVPlayer refuses the media, answered by the
     /// engine because the host owns none of it. Set at mount, read only while classifying a failure.
     var softwarePathAvailability: (@Sendable () -> SoftwarePathEscalation.Availability?)?
+    /// W3038: whether the session's producer has written nothing and sits in a source read past
+    /// `SoftwarePathEscalation.initMapStarvedThresholdSeconds`: that read's age, nil when not starved.
+    /// Set at mount, read on a map timeout.
+    var initMapStarvedReadSeconds: (@Sendable () -> Double?)?
     /// #50: latched on first .playing; discriminates startup failures (never played) from mid-playback transients. .failed and timeControlStatus KVOs are unsynchronized, so instantaneous status is unreliable. Reset with the item on a reused host.
     private var hasEverPlayed = false
     @Published private(set) var didReachEnd: Bool = false
@@ -1049,24 +1053,46 @@ final class NativeAVPlayerHost {
     /// offer was made, in which case nothing is surfaced here and the engine rebuilds the session.
     private func offerToSoftwarePath(_ desc: String, item: AVPlayerItem, position: Double) -> Bool {
         let nsError = item.error as NSError?
+        return offerToSoftwarePath(domain: nsError?.domain, code: nsError?.code ?? 0, message: desc,
+                                   verdict: "AVPlayer refused the media", position: position)
+    }
+
+    /// The offer itself, for a failure that has no `item.error` yet (W3038's map timeout).
+    private func offerToSoftwarePath(domain: String?, code: Int, message: String, verdict: String,
+                                     position: Double) -> Bool {
         guard SoftwarePathEscalation.shouldEscalate(
-            errorDomain: nsError?.domain,
+            errorDomain: domain,
             availability: softwarePathAvailability?()
         ) else { return false }
         let at = position.isFinite ? String(format: "%.2f", position) + "s" : "an unreadable position"
         EngineLog.emit(
-            "[NativeAVPlayerHost] #\(sessionID) #561 AVPlayer refused the media "
-            + "(\(nsError?.domain ?? "?")/\(nsError?.code ?? 0)) at \(at); handing the session to the "
-            + "engine's own decoder instead of surfacing: \(desc)",
+            "[NativeAVPlayerHost] #\(sessionID) #561 \(verdict) "
+            + "(\(domain ?? "?")/\(code)) at \(at); handing the session to the "
+            + "engine's own decoder instead of surfacing: \(message)",
             category: .engine
         )
         pendingSoftwarePathEscalation = SoftwarePathEscalation.Request(
-            domain: nsError?.domain ?? "",
-            code: nsError?.code ?? 0,
-            message: desc,
+            domain: domain ?? "",
+            code: code,
+            message: message,
             positionSeconds: position.isFinite ? max(0, position) : 0
         )
         return true
+    }
+
+    /// W3038: a map timeout before anything played, while the producer has written nothing and its
+    /// source read has not answered, will repeat every ~4 s until AVPlayer gives up near 30 s. The
+    /// software path's rebuild releases that read and reads the source itself, so it is offered the
+    /// session at the first such timeout past the producer's threshold. One offer per item.
+    private func offerStarvedInitMap(code: Int, uri: String?, comment: String?) {
+        guard !hasEverPlayed, pendingSoftwarePathEscalation == nil,
+              SoftwarePathEscalation.isMapTimeout(code: code, uri: uri, comment: comment),
+              let parked = initMapStarvedReadSeconds?() else { return }
+        _ = offerToSoftwarePath(
+            domain: SoftwarePathEscalation.mediaErrorDomain, code: code,
+            message: "source read parked \(Int(parked)) s, nothing written",
+            verdict: "AVPlayer timed out on the init segment the producer cannot make",
+            position: renderedTime)
     }
 
     private func handleItemFailed(_ desc: String, item: AVPlayerItem) {
@@ -2264,6 +2290,8 @@ final class NativeAVPlayerHost {
                 stallCount += 1
                 guard isCurrent() else { return }
             }
+            offerStarvedInitMap(code: event.code, uri: event.uri, comment: event.comment)
+            guard isCurrent() else { return }
         }
         if request.contains(.access) {
             for event in reader.newAccessEntries(in: snapshot) {

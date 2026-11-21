@@ -1913,6 +1913,9 @@ extension AetherEngine {
                 hostAllowsEscalation: escalationAllowed
             )
         }
+        // W3038: a reopen whose producer waits on a source read that answers nothing leaves AVPlayer
+        // asking for init.mp4 until its own ~30 s give-up; the host offers the session sooner.
+        host.initMapStarvedReadSeconds = { [weak session] in session?.initMapStarvedReadSeconds }
         host.$pendingSoftwarePathEscalation
             .compactMap { $0 }
             .sink { [weak self] request in

@@ -950,6 +950,27 @@ final class HLSSegmentProducer: @unchecked Sendable {
         packetCounterLock.unlock()
     }
 
+    /// W3038: the uptime the pump entered its current source read, nil between reads. A read parked
+    /// on a network that answers nothing (a reopen after a long park) shows here as a growing age,
+    /// which `stop()` cannot end: only the demuxer's `markClosed()` releases it.
+    private var _sourceReadEnteredNanos: UInt64?
+    /// The clock the stamp and its age are read on. Set before `start()`; tests inject their own.
+    var sourceReadClock: @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
+    /// How long the pump has sat in its current source read, 0 when it is not in one.
+    var sourceReadParkedSeconds: Double {
+        packetCounterLock.lock()
+        let entered = _sourceReadEnteredNanos
+        packetCounterLock.unlock()
+        guard let entered else { return 0 }
+        let now = sourceReadClock()
+        return now > entered ? Double(now - entered) / 1_000_000_000 : 0
+    }
+    private func noteSourceRead(entered: UInt64?) {
+        packetCounterLock.lock()
+        _sourceReadEnteredNanos = entered
+        packetCounterLock.unlock()
+    }
+
     /// AE#169 round 3: pregate observability for the engine's starved-EOF re-anchor arm. A pump
     /// whose scan-forward gate never opened wrote nothing; the last keyframe it dropped BELOW the
     /// target is the true final random-access point the engine can re-anchor production on.
@@ -2881,6 +2902,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// fresh side reader overtakes it in 300 ms.
     private func readNextSourcePacket() throws -> (packet: UnsafeMutablePointer<AVPacket>, origin: PacketOrigin,
                                                    replaySample: LiveReplaySample?)? {
+        noteSourceRead(entered: sourceReadClock())
+        defer { noteSourceRead(entered: nil) }
         guard !pumpFirstReadLogged else { return try readNextSourcePacketMergedTapped() }
         pumpFirstReadLogged = true
         let t0 = DispatchTime.now()

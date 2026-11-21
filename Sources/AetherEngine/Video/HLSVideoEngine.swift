@@ -2734,6 +2734,18 @@ public final class HLSVideoEngine: @unchecked Sendable {
     var audioBridgeOutputBytesLifetime: Int64 { subsystemSnapshot().audioBridge?.outputBytesLifetime ?? 0 }
     var lastAVGapMs: Double { subsystemSnapshot().producer?.lastAVGapMs ?? 0 }
 
+    /// W3038: nothing written, nothing cached, and the producer parked in a source read past
+    /// `SoftwarePathEscalation.initMapStarvedThresholdSeconds`: the init segment AVPlayer is waiting
+    /// on cannot come until that read answers. The read's age when starved, nil otherwise.
+    var initMapStarvedReadSeconds: Double? {
+        let subs = subsystemSnapshot()
+        guard let producer = subs.producer else { return nil }
+        let parked = producer.sourceReadParkedSeconds
+        return SoftwarePathEscalation.initMapStarved(
+            packetsWritten: producer.packetsWrittenCount, cachedSegments: subs.cache?.count ?? 0,
+            readParkedSeconds: parked) ? parked : nil
+    }
+
     public func diagnosticStats() -> DiagnosticStats {
         let subs = subsystemSnapshot()
         let abLive = subs.audioBridge?.liveBytes

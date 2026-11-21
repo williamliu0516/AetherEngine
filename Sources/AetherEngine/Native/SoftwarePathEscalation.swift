@@ -124,4 +124,28 @@ enum SoftwarePathEscalation {
         return errorDomain == mediaErrorDomain || errorDomain == liveJoinErrorDomain
             || errorDomain == videoConfigurationErrorDomain
     }
+
+    /// W3038: how long the producer's source read may sit before a startup that has written nothing
+    /// counts as starved. A cold link plus its connect took ~3.9 s on the reporter's network, so a
+    /// read twice AVPlayer's 4 s map window old is not a slow start.
+    static let initMapStarvedThresholdSeconds: Double = 6
+
+    /// W3038, pure: the native session cannot serve its init segment because the producer has nothing
+    /// to make it from and is waiting on a source read that has not answered.
+    ///
+    /// The reporter's reopen after a 46-minute park read 334 kept packets, wrote none, then sat in a
+    /// host read for ~33 s; AVPlayer's own ~30 s give-up on the map was the only exit. The software
+    /// path's rebuild tears the demuxer down, which is what releases such a read.
+    static func initMapStarved(packetsWritten: Int, cachedSegments: Int, readParkedSeconds: Double,
+                               threshold: Double = initMapStarvedThresholdSeconds) -> Bool {
+        packetsWritten == 0 && cachedSegments == 0 && readParkedSeconds >= threshold
+    }
+
+    /// AVPlayer's errorLog entry for an init segment it waited ~4 s on without a byte
+    /// (`-12889 "No response for map in 4.004s"`, uri `.../init.mp4`).
+    static func isMapTimeout(code: Int, uri: String?, comment: String?) -> Bool {
+        guard code == -12889 else { return false }
+        if let uri, URL(string: uri)?.lastPathComponent == "init.mp4" { return true }
+        return comment?.contains("for map") ?? false
+    }
 }
