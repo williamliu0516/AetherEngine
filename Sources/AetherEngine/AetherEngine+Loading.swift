@@ -1492,6 +1492,10 @@ extension AetherEngine {
             self.nativeVideoSession?.armLiveItemAxisStatement()
             self.liveItemAxisArmedGeneration = attaching.itemGeneration
         }
+        // W3153: a seek AVPlayer made on its own resets the stale-request window as an engine seek does.
+        host.onTimeJump = { [weak self] seconds in
+            self?.nativeVideoSession?.noteTimeJump(playlistTime: seconds)
+        }
         applyDesiredVolume(to: host)
         applyDesiredRate(to: host)
         // Publish before wiring mirrors so subscribers see the AVPlayer before the first time update. Only emit on change: re-publishing the same instance retriggers the AVKit re-registration this reuse path avoids.

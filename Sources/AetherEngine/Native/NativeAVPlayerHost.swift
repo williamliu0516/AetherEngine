@@ -279,6 +279,8 @@ final class NativeAVPlayerHost {
     private var loadedVideoObservation: NSKeyValueObservation?
     private var videoHealthSummaryAt: Double?
     var onVideoPresentationRecovery: ((VideoPresentationProgress.Action, Double) -> Void)?
+    /// The item's time jumped to these seconds: a seek, the engine's or AVPlayer's own (W3153).
+    var onTimeJump: (@MainActor (Double) -> Void)?
     var pictureInPictureActive = false {
         didSet {
             // Detach BEFORE AVKit takes the layer, not on the first background polling tick.
@@ -902,6 +904,22 @@ final class NativeAVPlayerHost {
             }
         }
         notificationObservers.append(didEndObs)
+
+        // W3153: a seek AVPlayer makes on its own (Apple TV's and Vision Pro's system scrubs, PiP's skip
+        // buttons) never passes through the engine; its time jump is how the engine hears of it.
+        let jumpObs = NotificationCenter.default.addObserver(
+            forName: AVPlayerItem.timeJumpedNotification,
+            object: item,
+            queue: .main
+        ) { [weak self, weak item] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.sessionID == sid, let item else { return }
+                let seconds = item.currentTime().seconds
+                guard seconds.isFinite else { return }
+                self.onTimeJump?(seconds)
+            }
+        }
+        notificationObservers.append(jumpObs)
 
         // 100ms periodic observer drives scrub bar; Task wrapper satisfies Sendable check.
         timeObserver = avPlayer.addPeriodicTimeObserver(
