@@ -24,7 +24,8 @@ struct RestartInterruptKeepsReaderTests {
         }
 
         var value: Int32? { lock.withLock { result } }
-        var first: UInt8 { lock.withLock { bytes[0] } }
+        /// The byte after the TS sync byte, which the fixture sets to its segment number + 1.
+        var marker: UInt8 { lock.withLock { bytes[1] } }
     }
 
     /// Interrupts until the parked read returns, as `stopForRestart` asks again when the first ask found the read
@@ -56,7 +57,9 @@ struct RestartInterruptKeepsReaderTests {
             #EXT-X-ENDLIST
             """.utf8))
         for index in 0..<3 {
-            HeldURLProtocol.set(base + "seg\(index).ts", Data(repeating: UInt8(index + 1), count: 188 * 2))
+            var body = Data(repeating: UInt8(index + 1), count: 188 * 2)
+            body[0] = 0x47  // the ingest checks the first segment is a transport stream
+            HeldURLProtocol.set(base + "seg\(index).ts", body)
         }
         let session = HeldURLProtocol.makeSession()
         defer { session.invalidateAndCancel() }
@@ -76,7 +79,7 @@ struct RestartInterruptKeepsReaderTests {
         let next = PendingRead(bridge)
         try await waitFor { next.value != nil }
         #expect(next.value == 64, "the read after the restart got \(String(describing: next.value))")
-        #expect(next.first == 2, "12 s restarts one segment ahead, at seg1")
+        #expect(next.marker == 2, "12 s restarts one segment ahead, at seg1")
     }
 
     @Test("an interrupted HTTP disc read leaves the reader reading", .timeLimit(.minutes(1)))
