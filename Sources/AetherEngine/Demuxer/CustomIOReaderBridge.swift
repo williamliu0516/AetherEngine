@@ -169,6 +169,27 @@ final class CustomIOReaderBridge: AVIOProvider, @unchecked Sendable {
         callingHost { reader.cancel() }
     }
 
+    /// W3146: set by `interruptRead`, cleared by `endReadInterrupt`; `readInFlight` says whether a
+    /// read is inside the host's reader, so the host's `cancel()` is asked only when there is a read
+    /// for it to end (a cancel with none waiting is one a host might hold against the next read).
+    private let interruptLock = NSLock()
+    private var readInterrupted = false
+    private var readInFlight = false
+
+    func interruptRead() {
+        let cancelHost = interruptLock.withLock { () -> Bool in
+            readInterrupted = true
+            return readInFlight
+        }
+        guard cancelHost, !isClosed else { return }
+        // The host's contract for a reader the engine goes on reading through: unblock only.
+        callingHost { reader.cancel() }
+    }
+
+    func endReadInterrupt() {
+        interruptLock.withLock { readInterrupted = false }
+    }
+
     func close() {
         guard !isFullyClosed else { return }
         isFullyClosed = true
@@ -190,7 +211,19 @@ final class CustomIOReaderBridge: AVIOProvider, @unchecked Sendable {
         guard !isClosed else { return -1 }
         if isPastReadDeadline { readDeadlineFired = true; return -1 }
         guard let allowed = readByteBudget.allowance(size) else { return -1 }
+        let admitted = interruptLock.withLock { () -> Bool in
+            guard !readInterrupted else { return false }
+            readInFlight = true
+            return true
+        }
+        guard admitted else { return -1 }
         let n = callingHost { reader.read(buf, size: allowed) }
+        let interrupted = interruptLock.withLock { () -> Bool in
+            readInFlight = false
+            return readInterrupted
+        }
+        // A read the interrupt ended can come back as 0 from a host that reports a cancel as end of file.
+        if interrupted, n <= 0 { return -1 }
         if n == 0 { return FFmpegErr.eof }  // IOReader uses 0 for EOF; avio expects AVERROR_EOF.
         readByteBudget.consumed(n)
         return n

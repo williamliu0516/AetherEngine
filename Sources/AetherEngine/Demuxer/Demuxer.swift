@@ -963,6 +963,26 @@ public final class Demuxer: @unchecked Sendable {
     /// read it cannot serve from memory instead of detouring.
     func notePlaybackRepositioned() { avioProvider?.notePlaybackRepositioned() }
 
+    /// W3146: the read waiting now (and any started before `endReadInterrupt`) gives up, and the
+    /// demuxer stays usable: a producer restart stops a pump parked in a network read on a demuxer it
+    /// goes on to reuse (`AVIOProvider.interruptRead`). Lock-free like `markClosed`: the parked read
+    /// holds the access lock.
+    func interruptRead() { avioProvider?.interruptRead() }
+
+    /// W3146: reads work again. With `clearingReadError` (only once the interrupted read has
+    /// returned: it holds the access lock while it waits), the I/O context also forgets the error that
+    /// read left on it, which libavformat keeps across a seek.
+    func endReadInterrupt(clearingReadError: Bool) {
+        avioProvider?.endReadInterrupt()
+        guard clearingReadError else { return }
+        accessLock.lock()
+        defer { accessLock.unlock() }
+        if let pb = formatContext?.pointee.pb {
+            pb.pointee.eof_reached = 0
+            pb.pointee.error = 0
+        }
+    }
+
     /// Default 5 MB/5s budgets miss sparse PGS/DVB tracks on 10-20 GB Blu-ray rips.
     /// 50 MB/60 s ensures codec params are populated without noticeably slowing open.
     private func applyProbeBudget(_ ctx: UnsafeMutablePointer<AVFormatContext>) {

@@ -1548,6 +1548,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// without handleTargetChange the sendfile path would skip producer restarts on out-of-range fetches.
     func mediaSegmentURL(at index: Int) -> URL? {
         guard index >= 0, index < currentSegmentCount else { return nil }
+        // A request a seek left behind is answered from the cache or not at all here (`StaleSeekFetchGuard`); a miss
+        // falls through to `mediaSegmentSource`, which refuses it.
+        if !isLive, isStaleAfterSeek(index) { return cache.peekURL(index: index) }
         handleTargetChange(to: index)
         return cache.peekURL(index: index)
     }
@@ -1666,6 +1669,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     private func handleTargetChange(to index: Int) {
         stateLock.lock()
         _mediaFetchCount += 1
+        staleSeekFetches.noteWanted(index, now: ProcessInfo.processInfo.systemUptime)
         stateLock.unlock()
         let previousTarget = cache.targetIndex
         cache.declareTarget(index)
@@ -1812,6 +1816,21 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         }
 
         let totalStart = DispatchTime.now()
+
+        if !isLive, isStaleAfterSeek(index) {
+            if let hit = cache.peek(index: index) {
+                return logServed(index: index, source: .data(hit), totalStart: totalStart, restarted: false)
+            }
+            stateLock.lock()
+            staleSeekFetches.noteRefused(index)
+            stateLock.unlock()
+            EngineLog.emit(
+                "[HLSVideoEngine] seg\(index): asked after a seek's run began and outside it, not resident; "
+                + "refused without moving the producer",
+                category: .session
+            )
+            return nil
+        }
 
         handleTargetChange(to: index)
 
@@ -2165,9 +2184,20 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// A seek asked for segment `index`: a request for it (or the one before, where AVPlayer lands on a boundary) in
     /// the next minute is that seek's, not a prefetch.
     func noteSeekTarget(_ index: Int) {
+        let now = ProcessInfo.processInfo.systemUptime
         stateLock.lock()
-        _seekTarget = (index, ProcessInfo.processInfo.systemUptime)
+        _seekTarget = (index, now)
+        staleSeekFetches.noteSeek(index: index, now: now)
         stateLock.unlock()
+    }
+
+    /// Requests a seek left behind (`StaleSeekFetchGuard`). Guarded by `stateLock`.
+    private var staleSeekFetches = StaleSeekFetchGuard()
+
+    private func isStaleAfterSeek(_ index: Int) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return staleSeekFetches.isStale(index, now: ProcessInfo.processInfo.systemUptime)
     }
 
     private func isSeekTarget(_ index: Int) -> Bool {

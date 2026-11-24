@@ -81,6 +81,15 @@ protocol AVIOProvider: AnyObject {
     /// AE#782: the demuxer was just repositioned for playback (a producer restart), so the next read
     /// that needs the network is where playback continues, not index work that returns. Default no-op.
     func notePlaybackRepositioned()
+
+    /// W3146: make the read waiting now, and any read that starts before `endReadInterrupt`, give up
+    /// with -1, leaving the source usable: a producer restart stops a pump parked in a network read
+    /// and reuses this demuxer, so it cannot `markClosed`. Called off the demux thread. Default no-op:
+    /// such a provider's read runs to its own end, as before.
+    func interruptRead()
+
+    /// W3146: reads work again after `interruptRead`. Default no-op.
+    func endReadInterrupt()
 }
 
 extension AVIOProvider {
@@ -88,6 +97,8 @@ extension AVIOProvider {
     func beginIndexPass() {}
     func endIndexPass() {}
     func notePlaybackRepositioned() {}
+    func interruptRead() {}
+    func endReadInterrupt() {}
     var currentSourceOffset: Int64? { nil }
     var sourceSurvivesReopen: Bool { false }
 }

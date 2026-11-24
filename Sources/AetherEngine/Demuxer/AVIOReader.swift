@@ -1803,7 +1803,28 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     func endReadByteBudget() { readByteBudget.end() }
 
     /// Deadline expired; latches `readDeadlineFired` at the check sites.
-    private var readDeadlinePassedOrAborted: Bool { isPastReadDeadline }
+    private var readDeadlinePassedOrAborted: Bool { isPastReadDeadline || readInterrupted }
+
+    /// W3146: set by `interruptRead` (any thread), cleared by `endReadInterrupt`.
+    private let readInterruptedLock = OSAllocatedUnfairLock<Bool>(initialState: false)
+    private var readInterrupted: Bool { readInterruptedLock.withLock { $0 } }
+
+    /// W3146: the read waiting now gives up with -1 and the connection is kept, so the demuxer can be
+    /// sought and read again after `endReadInterrupt` (`AVIOProvider.interruptRead`). The persistent
+    /// reader's waits wake at once; the one-shot range path's semaphore waits are not signalled (a
+    /// signal nobody waits for would cut a later wait short) and end at their next check.
+    func interruptRead() {
+        readInterruptedLock.withLock { $0 = true }
+        winCond.lock()
+        winCond.broadcast()
+        winCond.unlock()
+    }
+
+    func endReadInterrupt() {
+        readInterruptedLock.withLock { $0 = false }
+        // The interrupt latched it at the read it ended; it is not a deadline's verdict.
+        readDeadlineFired = false
+    }
 
     // Streaming task/session held so teardown can cancel and unblock streamDownloadSync.
     private var streamingSession: URLSession?
@@ -2533,7 +2554,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 diag.recordStallWait(ms: msSince(waitStart), signaled: signaled)
                 // Check deadline before stall handling to avoid misrouting a
                 // deadline wake as a socket stall (which would reconnect).
-                if isPastReadDeadline { continue }
+                if readDeadlinePassedOrAborted { continue }
                 if !signaled {
                     if recordReconnectAndShouldGiveUp() {
                         EngineLog.emit("[AVIOReader] \(label) stall gave up at offset \(frontier) (\(unproductiveReconnects) unproductive)\(isLive ? " [live source lost]" : "")", category: .demux)

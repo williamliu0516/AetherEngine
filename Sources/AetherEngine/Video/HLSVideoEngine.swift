@@ -4527,8 +4527,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
         var freshDemuxer: Demuxer?
         var oldPumpExited = true
         if let old {
-            old.stop()
-            oldPumpExited = old.waitForFinish(timeout: 5.0)
+            oldPumpExited = Self.stopForRestart(
+                old, demuxers: [dem] + (sideAudioDemuxer.map { [$0] } ?? []), interrupting: !isLiveSession,
+                timeout: 5.0)
             stopWaitMs = msSince(restartStart)
         }
         if !oldPumpExited || demuxerSuspectDead {
