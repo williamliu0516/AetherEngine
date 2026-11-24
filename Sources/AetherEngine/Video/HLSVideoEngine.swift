@@ -860,6 +860,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// session builds. Set before `start()`.
     var servesSegmentsProgressively = false
 
+    /// `LoadOptions.segmentMemoryCache`: whether this VOD session's cache keeps its lead in memory
+    /// (W3167). Set before `start()`.
+    var keepsSegmentsInMemory = true
+
     /// Serializes restart requests among themselves. Held across waits (unlike `restartLock`);
     /// only other restarts contend on it.
     private let restartGate = NSLock()
@@ -1687,9 +1691,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
             forwardWindow: forwardWindowSegments,
             retentionBudgetBytes: retentionBudget,
             nativeLiveDVRPolicy: isLiveSession ? nativeLiveDVRPolicy : nil,
-            // W3167: a VOD session keeps its lead in memory up to B instead of writing it to disk;
-            // live always writes files (review H1).
-            memoryBudget: isLiveSession ? nil : .system,
+            // W3167: a VOD session keeps its lead in memory up to B instead of writing it to disk,
+            // unless the host turned it off; live always writes files (review H1).
+            memoryBudget: isLiveSession || !keepsSegmentsInMemory ? nil : .system,
             onResidentSetChanged: { [weak self] in self?.noteResidentSetChanged() }
         )
         // The claim is on the tmp volume, so it bills the segments in files, not those in memory (L6).
@@ -2815,7 +2819,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// A resident segment a scrub still can decode from. Resolving it reads nothing, so an extractor
     /// LRU hit costs no I/O; `makeReader()` maps the segment file rather than reading it into the heap
     /// (audit SEG-2). SegmentCache only ever replaces or unlinks a segment file, never rewrites it in
-    /// place, so a mapping stays valid for as long as the reader holds it.
+    /// place, so a mapping stays valid for as long as the reader holds it. A memory segment (W3169,
+    /// review M5) is read through its pinned no-copy `Data`, which keeps its bytes until the extractor
+    /// lets go of the reader; nothing is written for it.
     struct ScrubThumbnailSource: Sendable {
         let segmentIndex: Int
         let startSeconds: Double
@@ -2823,11 +2829,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let carriedOffset: Double?
         let identity: String
         let initData: Data
-        let segmentURL: URL
+        let segment: StagedSegment
 
         func makeReader() -> DataIOReader? {
-            guard let segment = try? Data(contentsOf: segmentURL, options: .alwaysMapped) else { return nil }
-            return DataIOReader(parts: [initData, segment])
+            let bytes: Data?
+            switch segment {
+            case .file(let url): bytes = try? Data(contentsOf: url, options: .alwaysMapped)
+            case .memory(let buffer): bytes = buffer.pinnedData()
+            }
+            guard let bytes, !bytes.isEmpty else { return nil }
+            return DataIOReader(parts: [initData, bytes])
         }
     }
 
@@ -2841,17 +2852,28 @@ public final class HLSVideoEngine: @unchecked Sendable {
         anchorShiftLock.lock()
         let carried = isLiveSession ? 0 : epochAxisByIndex.carried(at: seg.index)
         anchorShiftLock.unlock()
-        // The cache replaces/unlinks immutable files. An index alone cannot
-        // identify bytes after a same-session re-cut/restart rewrites that index.
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: seg.fileURL.path),
-              let volume = attributes[.systemNumber] as? NSNumber,
-              let inode = attributes[.systemFileNumber] as? NSNumber,
-              let size = attributes[.size] as? NSNumber,
-              let modified = attributes[.modificationDate] as? Date else { return nil }
-        let identity = "\(volume.uint64Value):\(inode.uint64Value):\(size.uint64Value):\(modified.timeIntervalSince1970):" + initData.base64EncodedString()
+        guard let identity = Self.scrubThumbnailIdentity(index: seg.index, stored: seg.stored, initData: initData) else { return nil }
         return ScrubThumbnailSource(segmentIndex: seg.index, startSeconds: seg.startSeconds, durationSeconds: seg.durationSeconds,
                                     carriedOffset: carried, identity: identity,
-                                    initData: initData, segmentURL: seg.fileURL)
+                                    initData: initData, segment: seg.stored)
+    }
+
+    /// The bytes a scrub extractor decodes, named without reading them. An index alone cannot identify
+    /// bytes after a same-session re-cut/restart rewrites that index: the cache replaces/unlinks
+    /// immutable files, so a file is named by volume, inode, size and mtime; a memory segment is
+    /// immutable once sealed and a re-cut makes a new buffer, so it is named by (index, buffer id).
+    static func scrubThumbnailIdentity(index: Int, stored: StagedSegment, initData: Data) -> String? {
+        switch stored {
+        case .file(let url):
+            guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+                  let volume = attributes[.systemNumber] as? NSNumber,
+                  let inode = attributes[.systemFileNumber] as? NSNumber,
+                  let size = attributes[.size] as? NSNumber,
+                  let modified = attributes[.modificationDate] as? Date else { return nil }
+            return "\(volume.uint64Value):\(inode.uint64Value):\(size.uint64Value):\(modified.timeIntervalSince1970):" + initData.base64EncodedString()
+        case .memory(let buffer):
+            return "mem:\(index):\(buffer.id):" + initData.base64EncodedString()
+        }
     }
 
     public func stop() {

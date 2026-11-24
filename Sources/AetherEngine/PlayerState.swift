@@ -937,6 +937,13 @@ public struct LoadOptions: Sendable, Equatable {
     /// `nativeRemoteHLS` and on the software path, which serve no loopback segments.
     public var progressiveSegmentDelivery: Bool = false
 
+    /// Keep a VOD loopback session's segment lead in memory, within a budget read from the
+    /// process's own memory limit, instead of writing every segment to a file (W3167). Segments past
+    /// the budget, and all of them under memory pressure, go to files as before. Default true. Meant
+    /// to be set from a host build setting, not toggled at run time. VOD only: live always writes
+    /// files. Ignored for `nativeRemoteHLS` and on the software path.
+    public var segmentMemoryCache: Bool = true
+
     /// Autostart at load completion. Default `true`: every load path ends in `host.play()` and a
     /// `.playing` state (current behavior, byte-identical). Set `false` to mount PAUSED: a host that
     /// holds a pause at mount (synchronized-start lobby that loads several devices and starts them on
@@ -1070,6 +1077,7 @@ public struct LoadOptions: Sendable, Equatable {
         externalSubtitles: [ExternalSubtitleTrack] = [],
         forwardBufferSegments: Int? = nil,
         progressiveSegmentDelivery: Bool = false,
+        segmentMemoryCache: Bool = true,
         autoplay: Bool = true,
         teletextPage: Int? = nil,
         audioDelaySeconds: Double = 0,
@@ -1125,6 +1133,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.externalSubtitles = externalSubtitles
         self.forwardBufferSegments = forwardBufferSegments
         self.progressiveSegmentDelivery = progressiveSegmentDelivery
+        self.segmentMemoryCache = segmentMemoryCache
         self.autoplay = autoplay
         self.teletextPage = teletextPage
         self.audioDelaySeconds = audioDelaySeconds

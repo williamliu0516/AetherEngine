@@ -88,6 +88,12 @@ final class SegmentCache: @unchecked Sendable {
     static let memoryKeepBehind = 10
     private var lastPressureAt: Double?
     private var lastAdoptedBytes = 0
+    /// The memory buffers handed to the producer and not adopted yet, by buffer id, held weakly. The
+    /// segment being written counts against B whether or not it is served progressively
+    /// (`inProgress` only lists the served ones); a buffer the producer drops unadopted (a restart, a
+    /// teardown) stops counting once nothing holds it.
+    private struct WritingBuffer { weak var buffer: SegmentMemoryBuffer? }
+    private var writingMemory: [UInt64: WritingBuffer] = [:]
     private var spillScheduled = false
     private var memoryPressureSource: DispatchSourceMemoryPressure?
     private let spillQueue = DispatchQueue(label: "com.aetherengine.segmentcache.spill", qos: .utility)
@@ -442,6 +448,7 @@ final class SegmentCache: @unchecked Sendable {
         condition.lock()
         // Sealed or not, these staged bytes are no longer being written.
         if inProgress[index]?.key == key { inProgress.removeValue(forKey: index) }
+        if case .memory(let buffer) = staged { writingMemory.removeValue(forKey: buffer.id) }
         if adoptOK {
             if sealedFromStaging.updateValue(byteCount, forKey: key) == nil {
                 sealedStagingOrder.append(key)
@@ -871,12 +878,27 @@ final class SegmentCache: @unchecked Sendable {
             return nil
         }
         let state = rebalanceMemoryLocked()
-        let estimate = lastAdoptedBytes > 0 ? lastAdoptedBytes : 8 << 20
-        let admits = !state.holdNew && state.counted + estimate <= state.budget
+        let estimate = lastAdoptedBytes > 0 ? lastAdoptedBytes : Self.firstSegmentEstimateBytes
+        var buffer: SegmentMemoryBuffer?
+        if !state.holdNew, state.counted + estimate <= state.budget {
+            let admitted = SegmentMemoryBuffer(expectedBytes: estimate)
+            writingMemory[admitted.id] = WritingBuffer(buffer: admitted)
+            buffer = admitted
+        }
         condition.unlock()
         finishRebalance(state)
-        return admits ? SegmentMemoryBuffer(expectedBytes: estimate) : nil
+        return buffer
     }
+
+    /// The size the first segment's admission assumes, before any segment has been adopted. Only a
+    /// guess, and safe as one: nothing else is counted yet, and outside `isCritical` B is at least
+    /// min(160 MB, 256 MB / 4) = 64 MB, so the first segment is admitted whatever it weighs, as it
+    /// would be with its true size up to 64 MB; from its first byte it counts as the segment being
+    /// written (`inProgressMemoryBytesLocked`), so a heavier one makes the next admission spill or
+    /// go to a file, the same one-segment overshoot any segment heavier than the last can make
+    /// (review L2). It also sizes the first buffer's region, which costs address space, not
+    /// footprint: pages are only made resident as they are written.
+    static let firstSegmentEstimateBytes = 8 << 20
 
     /// A memory-pressure event: nothing new to memory for `pressureHoldSeconds`, and the held memory
     /// spilled down to B / 2. Runs on `spillQueue`; tests call it directly.
@@ -966,11 +988,12 @@ final class SegmentCache: @unchecked Sendable {
         return state
     }
 
-    /// Must be called with condition held. The segment being written, when it is in memory (L2).
+    /// Must be called with condition held. The segments being written into memory (L2), served
+    /// progressively or not; a buffer the producer let go of unadopted is forgotten.
     private func inProgressMemoryBytesLocked() -> Int {
         var bytes = 0
-        for stored in inProgress.values {
-            if case .memory(let buffer) = stored { bytes += buffer.length }
+        for (id, writing) in writingMemory {
+            if let buffer = writing.buffer { bytes += buffer.length } else { writingMemory.removeValue(forKey: id) }
         }
         return bytes
     }

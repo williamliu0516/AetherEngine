@@ -60,12 +60,12 @@ struct ScrubThumbnailSegmentMappingTests {
         let initBytes: [UInt8] = [1, 2, 3, 4]
 
         let source = HLSVideoEngine.ScrubThumbnailSource(
-            segmentIndex: 3, startSeconds: 12, durationSeconds: 4, carriedOffset: 0, identity: "fixture-3", initData: Data(initBytes), segmentURL: segURL)
+            segmentIndex: 3, startSeconds: 12, durationSeconds: 4, carriedOffset: 0, identity: "fixture-3", initData: Data(initBytes), segment: .file(segURL))
         let reader = try #require(source.makeReader())
         #expect(readAll(reader, chunk: 1000) == initBytes + segBytes)
 
         let missing = HLSVideoEngine.ScrubThumbnailSource(
-            segmentIndex: 4, startSeconds: 16, durationSeconds: 4, carriedOffset: 0, identity: "fixture-4", initData: Data(initBytes), segmentURL: dir.appendingPathComponent("gone.m4s"))
+            segmentIndex: 4, startSeconds: 16, durationSeconds: 4, carriedOffset: 0, identity: "fixture-4", initData: Data(initBytes), segment: .file(dir.appendingPathComponent("gone.m4s")))
         #expect(missing.makeReader() == nil, "an evicted segment is a nil still, not a crash")
     }
 }

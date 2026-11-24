@@ -1480,13 +1480,14 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// Pure lookup for a scrub thumbnail: no side effects, no restarts; nil outside the
     /// resident window or on a cache miss. Works for live and VOD (VOD `segments` carry
     /// `startSeconds` from init); callers gate on session type one layer up.
-    func thumbnailSegment(atSeconds seconds: Double) -> (index: Int, startSeconds: Double, durationSeconds: Double, fileURL: URL)? {
+    func thumbnailSegment(atSeconds seconds: Double) -> (index: Int, startSeconds: Double, durationSeconds: Double, stored: StagedSegment)? {
         stateLock.lock()
         let segs = segments
         stateLock.unlock()
         guard let idx = Self.thumbnailSegmentIndex(atSeconds: seconds, segments: segs) else { return nil }
-        guard let url = cache.fileURLIfOnDisk(index: idx) else { return nil }
-        return (idx, segs[idx].startSeconds, segs[idx].durationSeconds, url)
+        // A file or a memory segment (W3169, review M5): a scrub over the memory lead decodes from it too.
+        guard let stored = cache.storedSegment(index: idx) else { return nil }
+        return (idx, segs[idx].startSeconds, segs[idx].durationSeconds, stored)
     }
 
     /// AE#441: the oldest position a rewind can actually land on and still play forward, in output
@@ -1550,14 +1551,20 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
 
     /// File URL for sendfile(2) fast path. Drives same side effects as mediaSegment(at:);
     /// without handleTargetChange the sendfile path would skip producer restarts on out-of-range fetches.
+    ///
+    /// Only a segment on disk is answered here, and only then are the side effects run: a nil sends
+    /// the server on to `mediaSegmentSource`, which runs them itself, so running them here as well
+    /// declared the target twice and counted the request twice in the #65 watchdog's
+    /// `mediaFetchCount` (W3169, review L1). A memory segment (W3167) is the common such nil.
     func mediaSegmentURL(at index: Int) -> URL? {
         guard index >= 0, index < currentSegmentCount else { return nil }
         // A request a seek left behind is answered from the cache or not at all here (`StaleSeekFetchGuard`); a miss
         // falls through to `mediaSegmentSource`, which refuses it.
-        // A memory segment (W3167) answers nil here and is served from `mediaSegmentSource`'s data.
         if !isLive, isStaleAfterSeek(index) { return cache.fileURLIfOnDisk(index: index) }
+        // A file that goes between here and the send answers a retriable 503 (`send200File`).
+        guard let url = cache.fileURLIfOnDisk(index: index) else { return nil }
         handleTargetChange(to: index)
-        return cache.fileURLIfOnDisk(index: index)
+        return url
     }
 
     /// Total media-segment requests seen (both serve paths). The #65 consumer re-engage watchdog
