@@ -1196,11 +1196,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Guarded by `restartLock`. The original load's reader stays engine-owned (AetherEngine closes it
     /// in stopInternal); only factory-vended replacements are owned here.
     var reopenCustomReader: IOReader?
-    /// W3147: a host-provided custom source's fresh reader (`IOReader.makeIndependentReader`) for a restart's #79 /
-    /// #169 reopen: such a source has no URL FFmpeg can open ("Protocol not found"), so without it the reopen failed
-    /// and the restart went on with the wedged demuxer. Returns nil when the reader cannot clone. nil for URL sources.
-    /// Set before `start()`; the vended reader is owned like `reopenCustomReader`.
-    var restartReopenReader: (@Sendable () -> (reader: IOReader, formatHint: String?)?)?
+    /// W3147: a host-provided custom source's fresh reader (`IOReader.makeReplacementReader`, W3154) for a restart's
+    /// #79 / #169 reopen: such a source has no URL FFmpeg can open ("Protocol not found"), so without it the reopen
+    /// failed and the restart went on with the wedged demuxer. Returns nil when the reader cannot clone. nil for URL
+    /// sources. Set before `start()`; the vended reader is owned like `reopenCustomReader`.
+    var restartReopenReader: (@Sendable () -> RestartReopenSource?)?
 
     /// Demuxed audio rendition reader for live HLS ingest. When the main demuxer finds no audio and
     /// this is non-nil, `start()` opens `sideAudioDemuxer` over it. Engine owns the side demuxer, not
@@ -4567,8 +4567,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     if let vendReader = restartReopenReader {
                         guard let vend = vendReader() else { throw DemuxerError.openFailed(code: -1) }
                         freshReader = vend.reader
-                        try fresh.open(reader: vend.reader, formatHint: vend.formatHint,
-                                       profile: restartReopenProfile, isLive: false)
+                        try vend.open(fresh, profile: restartReopenProfile)
                     } else {
                     // .restartReopen: bounded find_stream_info budget; the FULL playback budget was
                     // the bulk of a 44 s wedge-reopen over WAN (#93 residual). The pass itself must

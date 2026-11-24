@@ -20,6 +20,12 @@ public protocol IOReader: AnyObject, Sendable {
     /// Return an independent reader with its own cursor over the same source for concurrent access (side demuxer, scrub previews). Return nil for one-shot streams; the engine skips that feature. The returned reader is owned and closed by the engine.
     func makeIndependentReader() -> IOReader?
 
+    /// A fresh reader over the same source that takes over as the session's MAIN reader: a restart whose old reader
+    /// is wedged in a read reopens its demuxer on it and reads through it for the rest of the play. The default is
+    /// `makeIndependentReader()`. A host whose main reader carries more than an independent one (pacing, a read
+    /// gate, diagnostics) returns a reader that carries them too. Returned readers are owned and closed by the engine.
+    func makeReplacementReader() -> IOReader?
+
     /// A disposable metadata reader: no speculative reads, at most `maxInputBytes` newly requested
     /// source bytes (including retries), and cancellation that also prevents a read about to start.
     /// Close cancels its own requests without cancelling requests another cursor still needs.
@@ -90,6 +96,7 @@ extension IOReader {
 public extension IOReader {
     func cancel() {}
     func makeIndependentReader() -> IOReader? { nil }
+    func makeReplacementReader() -> IOReader? { makeIndependentReader() }
     func makeIndependentReader(limits: ProbeLimits) -> IOReader? { nil }
     var discImageProbeEnabled: Bool { true }
 }

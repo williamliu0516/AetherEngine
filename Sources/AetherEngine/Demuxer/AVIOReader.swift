@@ -1811,13 +1811,32 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     /// W3146: the read waiting now gives up with -1 and the connection is kept, so the demuxer can be
     /// sought and read again after `endReadInterrupt` (`AVIOProvider.interruptRead`). The persistent
-    /// reader's waits wake at once; the one-shot range path's semaphore waits are not signalled (a
-    /// signal nobody waits for would cut a later wait short) and end at their next check.
+    /// reader's waits wake at once; the one-shot range and streaming paths' semaphore waits are not
+    /// signalled (a signal nobody waits for would cut a later wait short): they wait in slices and see
+    /// the interrupt within one (W3154, `waitUnlessInterrupted`).
     func interruptRead() {
         readInterruptedLock.withLock { $0 = true }
         winCond.lock()
         winCond.broadcast()
         winCond.unlock()
+    }
+
+    enum InterruptibleWait: Equatable { case signalled, timedOut, interrupted }
+
+    /// W3154: how long a slice of `waitUnlessInterrupted` sleeps before it looks at the interrupt again.
+    static let interruptibleWaitSlice: DispatchTimeInterval = .milliseconds(25)
+
+    /// W3154: waits on `semaphore` up to `seconds`, ending within one slice once the read is interrupted, past
+    /// its deadline or the reader closed. Sliced rather than signalled by `interruptRead`, for the reason there.
+    func waitUnlessInterrupted(_ semaphore: DispatchSemaphore, seconds: Int) -> InterruptibleWait {
+        let end = DispatchTime.now() + .seconds(seconds)
+        while true {
+            if isClosed || readDeadlinePassedOrAborted { return .interrupted }
+            let now = DispatchTime.now()
+            if now >= end { return .timedOut }
+            let slice = min(now + Self.interruptibleWaitSlice, end)
+            if semaphore.wait(timeout: slice) == .success { return .signalled }
+        }
     }
 
     func endReadInterrupt() {
@@ -2009,7 +2028,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 bufferLock.unlock()
 
                 if hasPrefetchInFlight {
-                    _ = prefetchReady.wait(timeout: .now() + .seconds(15))
+                    // W3154: an interrupted wait goes back to the loop head, which ends the read.
+                    if waitUnlessInterrupted(prefetchReady, seconds: 15) == .interrupted { continue }
                     bufferLock.lock()
                     if let prefetch = prefetchBuffer, position >= prefetchOffset &&
                         position < prefetchOffset + Int64(prefetch.count) {
@@ -2066,7 +2086,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         let requestSize = Int(size)
         var totalRead = 0
 
-        while totalRead < requestSize {
+        streaming: while totalRead < requestSize {
             streamLock.lock()
             let posInBuffer = Int(position - streamBytesRead)
             let available = streamBuffer.count - posInBuffer
@@ -2109,8 +2129,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 }
                 streamLock.unlock()
                 toResume?.resume()
-                let timeout = streamDataReady.wait(timeout: .now() + .seconds(15))
-                if timeout == .timedOut { break }
+                switch waitUnlessInterrupted(streamDataReady, seconds: 15) {
+                case .signalled: break
+                case .timedOut: break streaming
+                case .interrupted:
+                    // W3154: the read ends now and the stream is kept: the next read goes on from `position`.
+                    if !isClosed, readDeadlinePassedOrAborted { readDeadlineFired = true }
+                    return totalRead > 0 ? Int32(totalRead) : -1
+                }
             }
         }
 

@@ -47,9 +47,9 @@ struct SeekRestartPhasesTests {
         private let lock = NSLock()
         private var count = 0
         init(_ data: Data) { self.data = data }
-        func vend() -> (reader: IOReader, formatHint: String?)? {
+        func vend() -> RestartReopenSource? {
             lock.withLock { count += 1 }
-            return (DataIOReader(data: data), "matroska")
+            return RestartReopenSource(reader: DataIOReader(data: data), formatHint: "matroska")
         }
         var vended: Int { lock.withLock { count } }
     }

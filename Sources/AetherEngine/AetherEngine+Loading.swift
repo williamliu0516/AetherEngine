@@ -928,11 +928,12 @@ extension AetherEngine {
         // A custom-IO source is not reopenable by URL, so the side reader gets a clone of its own;
         // a reader that cannot clone leaves the rendition absent.
         // W3147: a restart's reopen of a custom source clones the reader; a URL open cannot reach it.
+        // W3154: the host's replacement reader (its main reader's gate and diagnostics come with it), and a disc
+        // image's chosen title and recognition key, as the load and the reload open it (#67/#76).
         if isCustomSource, let source = customReader {
-            let hint = customFormatHint
-            session.restartReopenReader = { [weak source] in
-                source?.makeIndependentReader().map { (reader: $0, formatHint: hint) }
-            }
+            session.restartReopenReader = RestartReopenSource.vendor(
+                source, formatHint: customFormatHint, discTitleID: preopenedDemuxer?.selectedDiscTitleID,
+                discCacheKey: url.absoluteString)
         }
         if loadedOptions.serveIFramePlaylist {
             session.requestIFramePlaylist()
