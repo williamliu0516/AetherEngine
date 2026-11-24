@@ -19,65 +19,28 @@ import Foundation
 /// `snapshot.diskByteCount` reports only non-volatile bytes, which is what the read-ahead's byte
 /// budget bounds (the forward window). History is bounded separately by `historyCapBytes`.
 final class SoftwarePacketMemoryFIFO: @unchecked Sendable {
+    /// A record chunk: one `PurgeableRegion` and how much of it is written.
     private final class Chunk {
         let id: UInt64
-        let base: UnsafeMutableRawPointer
-        let capacity: Int
+        private let region: PurgeableRegion
         var used = 0
-        private(set) var isVolatile = false
+        var base: UnsafeMutableRawPointer { region.base }
+        var capacity: Int { region.capacity }
+        var isVolatile: Bool { region.isVolatile }
 
         init(id: UInt64, capacity: Int) throws {
-            var address: vm_address_t = 0
-            let size = vm_size_t(capacity)
-            let kr = vm_allocate(mach_task_self_, &address, size, VM_FLAGS_ANYWHERE | VM_FLAGS_PURGABLE)
-            guard kr == KERN_SUCCESS, let base = UnsafeMutableRawPointer(bitPattern: UInt(address)) else {
+            do {
+                region = try PurgeableRegion(capacity: capacity)
+            } catch {
                 throw SoftwarePacketDiskFIFO.Failure.capacityExceeded
             }
             self.id = id
-            self.base = base
-            self.capacity = capacity
         }
 
-        deinit {
-            vm_deallocate(mach_task_self_, vm_address_t(UInt(bitPattern: base)), vm_size_t(capacity))
-        }
-
-        /// `vm_purgable_control` operations; the header macros carry a cast and do not import.
-        private static let setState: vm_purgable_t = 0
-
-        /// Returns false when making the chunk non-volatile found it already emptied by the kernel.
-        /// A chunk that cannot be made volatile simply stays resident.
         @discardableResult
-        func setVolatile(_ volatile: Bool) -> Bool {
-            guard volatile != isVolatile else { return true }
-            var state: Int32 = volatile ? VM_PURGABLE_VOLATILE : VM_PURGABLE_NONVOLATILE
-            let kr = vm_purgable_control(mach_task_self_, vm_address_t(UInt(bitPattern: base)),
-                                         Self.setState, &state)
-            if volatile {
-                if kr == KERN_SUCCESS { isVolatile = true }
-                return true
-            }
-            isVolatile = false
-            // SET_STATE hands back the previous state.
-            return kr == KERN_SUCCESS && state != VM_PURGABLE_EMPTY
-        }
-
-        private static let getState: vm_purgable_t = 1
-
-        /// A query only: the chunk stays volatile either way.
-        var isEmptied: Bool {
-            guard isVolatile else { return false }
-            var state: Int32 = 0
-            let kr = vm_purgable_control(mach_task_self_, vm_address_t(UInt(bitPattern: base)),
-                                         Self.getState, &state)
-            return kr == KERN_SUCCESS && state == VM_PURGABLE_EMPTY
-        }
-
-        /// Empties the chunk now, as the kernel may once it is volatile. Tests only.
-        func purgeForTesting() {
-            var state: Int32 = VM_PURGABLE_EMPTY
-            vm_purgable_control(mach_task_self_, vm_address_t(UInt(bitPattern: base)), Self.setState, &state)
-        }
+        func setVolatile(_ volatile: Bool) -> Bool { region.setVolatile(volatile) }
+        var isEmptied: Bool { region.isEmptied }
+        func purgeForTesting() { region.purgeForTesting() }
     }
 
     private let chunkTargetBytes: Int
