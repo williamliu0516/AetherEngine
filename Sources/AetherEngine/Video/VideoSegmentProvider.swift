@@ -845,8 +845,10 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     var restartServedHandler: (@Sendable (_ start: Double, _ end: Double, _ event: RestartServedEvent) -> Void)?
     /// W3147: a segment is handed to the player (any index, VOD and live), for the session's seek steps.
     var sourceServedHandler: (@Sendable (_ index: Int) -> Void)?
-    /// The last segment `restartServedHandler` was told about, so its delivery can be reported too.
+    /// The last segment a restart served, so its delivery can be reported too.
     private var restartServedIndex: Int?
+    /// W3160: that segment is served while it is written, so `.served` waits for its last byte to be delivered.
+    private var restartServedAwaitsDelivery = false
     /// Base index of the active producer (#93 residual): a fetch for an index within the
     /// producer's forward march window waits for the march instead of tearing it down.
     private let activeProducerBase: (() -> Int?)?
@@ -1623,22 +1625,31 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         segmentServedHandler?(index, delivered)
         stateLock.lock()
         let restartServed = restartServedIndex
-        if restartServed == index { restartServedIndex = nil }
+        let awaitsDelivery = restartServedAwaitsDelivery
+        if restartServed == index { restartServedIndex = nil; restartServedAwaitsDelivery = false }
         stateLock.unlock()
-        if Self.restartServedEvent(index: index, restartServedIndex: restartServed, delivered: delivered) == .undelivered,
+        if let event = Self.restartServedEvent(index: index, restartServedIndex: restartServed, delivered: delivered,
+                                               awaitsDelivery: awaitsDelivery),
            let served = restartServedHandler, index >= 0, index < segments.count {
-            served(segments[index].startSeconds, segments[index].startSeconds + segments[index].durationSeconds,
-                   .undelivered)
+            served(segments[index].startSeconds, segments[index].startSeconds + segments[index].durationSeconds, event)
         }
     }
 
-    /// What a finished serve of `index` says about the segment a restart served last: nothing for another segment
-    /// or a delivered one; `.undelivered` when its bytes never reached AVPlayer. On the A12Z iPad (2026-10-19) AVPlayer
-    /// gave up on a restart's 17 MB segment after 4.0 s (-12889) and the bytes served at 5.3 s went into a closed
-    /// socket (errno 54), so waiting on AVPlayer to land from that request cost a second for nothing.
-    static func restartServedEvent(index: Int, restartServedIndex: Int?, delivered: Bool) -> RestartServedEvent? {
-        guard index == restartServedIndex, !delivered else { return nil }
-        return .undelivered
+    /// What a finished serve of `index` says about the segment a restart served last: nothing for another segment;
+    /// `.undelivered` when its bytes never reached AVPlayer; `.served` when a segment served while it was written has
+    /// now been delivered whole. On the A12Z iPad (2026-10-19) AVPlayer gave up on a restart's 17 MB segment after
+    /// 4.0 s (-12889) and the bytes served at 5.3 s went into a closed socket (errno 54), so waiting on AVPlayer to
+    /// land from that request cost a second for nothing.
+    ///
+    /// W3160: a segment served while it is written reported `.served` at its first byte, so the engine's 1 s grace
+    /// re-sought while the rest was still arriving at line speed: AVPlayer dropped the request, the drop re-sought
+    /// again, and every far seek on a 51 Mbps line went through three re-seeks. Its grace now starts at its last byte,
+    /// as a whole segment's does.
+    static func restartServedEvent(index: Int, restartServedIndex: Int?, delivered: Bool,
+                                   awaitsDelivery: Bool = false) -> RestartServedEvent? {
+        guard index == restartServedIndex else { return nil }
+        if !delivered { return .undelivered }
+        return awaitsDelivery ? .served : nil
     }
 
     /// AE#418 round 2: whether this request puts a segment into AVPlayer's timeline anew.
@@ -2106,9 +2117,14 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                            restarted: Bool) -> SegmentSource? {
         if source != nil { sourceServedHandler?(index) }
         // VOD only (live fires no restarts), whose plan never changes, so the window is read as it stands.
-        if restarted, source != nil, !isLive, let served = restartServedHandler, index >= 0, index < segments.count {
-            stateLock.lock(); restartServedIndex = index; stateLock.unlock()
-            served(segments[index].startSeconds, segments[index].startSeconds + segments[index].durationSeconds, .served)
+        if restarted, let source, !isLive, let served = restartServedHandler, index >= 0, index < segments.count {
+            let whole: Bool
+            if case .data = source { whole = true } else { whole = false }
+            stateLock.lock(); restartServedIndex = index; restartServedAwaitsDelivery = !whole; stateLock.unlock()
+            if whole {
+                served(segments[index].startSeconds, segments[index].startSeconds + segments[index].durationSeconds,
+                       .served)
+            }
         }
         let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - totalStart.uptimeNanoseconds) / 1_000_000
         if case .data(let bytes) = source {
