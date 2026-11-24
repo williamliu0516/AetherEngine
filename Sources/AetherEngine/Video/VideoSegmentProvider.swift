@@ -2121,10 +2121,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             let whole: Bool
             if case .data = source { whole = true } else { whole = false }
             stateLock.lock(); restartServedIndex = index; restartServedAwaitsDelivery = !whole; stateLock.unlock()
-            if whole {
-                served(segments[index].startSeconds, segments[index].startSeconds + segments[index].durationSeconds,
-                       .served)
-            }
+            served(segments[index].startSeconds, segments[index].startSeconds + segments[index].durationSeconds,
+                   whole ? .served : .streaming)
         }
         let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - totalStart.uptimeNanoseconds) / 1_000_000
         if case .data(let bytes) = source {
@@ -3450,6 +3448,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
 enum RestartServedEvent: Equatable, Sendable {
     /// Its bytes are in hand and being sent.
     case served
+    /// W3164: its first bytes are going out while the producer still writes it. The target is on its way, so the
+    /// seek deadline must not re-anchor the producer delivering it; the re-seek grace waits for `.served`.
+    case streaming
     /// The send failed: AVPlayer had given up on the request, so it cannot land from it.
     case undelivered
 }

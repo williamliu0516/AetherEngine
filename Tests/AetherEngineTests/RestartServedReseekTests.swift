@@ -39,4 +39,9 @@ struct RestartServedUndeliveredTests {
         #expect(AetherEngine.restartServedReseekDelay(.undelivered) == 0)
         #expect(AetherEngine.restartServedReseekDelay(.served) == AetherEngine.restartServedReseekGraceSeconds)
     }
+
+    @Test("a target still streaming arms no re-seek; its grace waits for the last byte")
+    func streamingArmsNoReseek() {
+        #expect(AetherEngine.restartServedReseekDelay(.streaming) == nil)
+    }
 }

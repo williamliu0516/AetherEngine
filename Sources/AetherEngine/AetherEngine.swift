@@ -2736,7 +2736,7 @@ public final class AetherEngine: ObservableObject {
         pendingSeekTargetServedAfterRestart = true
         guard let generation = host.runningSeekDeadlineGeneration else { return }
         let window = "(segment \(String(format: "%.2f", start))-\(String(format: "%.2f", end))s)"
-        let delay = Self.restartServedReseekDelay(event)
+        guard let delay = Self.restartServedReseekDelay(event) else { return }
         guard delay > 0 else {
             // AVPlayer gave up on the request (its own 4 s timeout, -12889) before the bytes came: nothing will land
             // from it, so the seek goes again now, onto the segment now in the cache.
@@ -2763,11 +2763,13 @@ public final class AetherEngine: ObservableObject {
     nonisolated static let restartServedReseekGraceSeconds: Double = 1.0
 
     /// The wait before re-seeking on a restart-served target: the grace while AVPlayer may still land from the bytes
-    /// it is being sent, none once they could not be delivered.
-    nonisolated static func restartServedReseekDelay(_ event: RestartServedEvent) -> Double {
+    /// it is being sent, none once they could not be delivered, no re-seek yet while they are still being written
+    /// (W3164: the target only counts as served, so the deadline does not tear down the producer delivering it).
+    nonisolated static func restartServedReseekDelay(_ event: RestartServedEvent) -> Double? {
         switch event {
         case .served: return restartServedReseekGraceSeconds
         case .undelivered: return 0
+        case .streaming: return nil
         }
     }
 

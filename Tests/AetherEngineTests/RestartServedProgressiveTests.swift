@@ -6,6 +6,10 @@ import Foundation
 /// its first. Its 1 s re-seek grace started at the first byte, so on a 51 Mbps line AVPlayer was re-sought while the
 /// rest was still arriving: three re-seeks per far seek before the picture. A whole segment still reports at once, an
 /// undelivered one still reports `.undelivered`.
+///
+/// W3164: its first byte reports `.streaming`, so the target counts as served at once. On a slow line the 8 s seek
+/// deadline could fire while the target still streamed, and with no served mark it re-anchored the producer that was
+/// delivering it (G2UU, a slow netdisk line).
 @Suite(.offCooperativePool, .serialized)
 struct RestartServedProgressiveTests {
 
@@ -63,7 +67,7 @@ struct RestartServedProgressiveTests {
             .appendingPathComponent("restart served \(UUID().uuidString)", isDirectory: true))
     }
 
-    @Test("a segment served while it is written reports served once its last byte is delivered")
+    @Test("a segment served while it is written is marked streaming at its first byte, served at its last")
     func progressiveReportsAtLastByte() {
         let cache = makeCache()
         let recorder = Recorder()
@@ -74,11 +78,12 @@ struct RestartServedProgressiveTests {
         guard case .progressive = provider.mediaSegmentSource(at: 90, onSlow: nil) else {
             Issue.record("the restart's segment is served while it is written"); return
         }
-        #expect(recorder.events.isEmpty, "served at its first byte: \(recorder.events)")
+        #expect(recorder.events == [.streaming],
+                "the target counts as served from its first byte, so the seek deadline does not re-anchor it")
         provider.didServeMediaSegment(index: 90, delivered: true)
-        #expect(recorder.events == [.served])
+        #expect(recorder.events == [.streaming, .served])
         provider.didServeMediaSegment(index: 90, delivered: true)
-        #expect(recorder.events == [.served], "a second serve of the segment reports nothing more")
+        #expect(recorder.events == [.streaming, .served], "a second serve of the segment reports nothing more")
     }
 
     @Test("a segment served while it is written and never delivered reports undelivered")
@@ -93,7 +98,7 @@ struct RestartServedProgressiveTests {
             Issue.record("the restart's segment is served while it is written"); return
         }
         provider.didServeMediaSegment(index: 90, delivered: false)
-        #expect(recorder.events == [.undelivered])
+        #expect(recorder.events == [.streaming, .undelivered])
     }
 
     @Test("a whole segment reports served at once, and its delivery adds nothing")
