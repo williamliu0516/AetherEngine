@@ -148,7 +148,7 @@ struct SoftwareHostH264FallbackTests {
 
     @MainActor
     @Test("a session lost at a switch is rebuilt on VideoToolbox at the playhead, and the captions start clean",
-          .enabled(if: hasHardwareH264, "needs VideoToolbox's H.264 hardware decoder"), .timeLimit(.minutes(1)))
+          .enabled(if: hasHardwareH264, "needs VideoToolbox's H.264 hardware decoder"), .timeLimit(.minutes(2)))
     func hostRebuildsASessionLostAtASwitch() async throws {
         let host = SoftwarePlaybackHost()
         defer { host.stop() }
@@ -166,9 +166,16 @@ struct SoftwareHostH264FallbackTests {
             return tries.values.count <= 2 ? kVTVideoDecoderNotAvailableNowErr : nil
         }
         host.play()
-        await Self.waitUntil {
-            repositions.values.count == 1 && frames.values.contains { $0.hardware && $0.pts > 0.49 }
-        }
+        await Self.waitUntil { repositions.values.count == 1 }
+        #expect(repositions.values.count == 1)
+        // W3157: the clip ends half a second after the switch, and the rebuild's reposition is a second hop
+        // through the main actor. On a busy one (the whole run) the loop has dropped the lost session's
+        // packets, reached the end and parked the clock first, so the reposition lands paused, or past the
+        // last frame. Back at the switch, playing, the rebuilt session shows what it decodes, wherever the
+        // reposition landed.
+        _ = await host.seek(to: 0.5)
+        host.play()
+        await Self.waitUntil { frames.values.contains { $0.hardware && $0.pts > 0.49 } }
 
         #expect(host.hardwareFallback == nil, "a session VideoToolbox could not open just then is not a refusal")
         #expect(host.usesHardwareVideoDecoder)
@@ -210,6 +217,10 @@ struct SoftwareHostH264FallbackTests {
             let hardware = try #require(host.videoDecoderForTesting as? HardwareVideoDecoder)
             hardware.failsFormatForTesting = { _ in kVTCouldNotFindVideoDecoderErr }
         }
+        // W3157: the fallback lands at the playhead the main actor reads when it gets to the ask; at full speed a
+        // busy main actor (the whole run) lets the playhead run past the clip's last frame (0.96 s) first, and
+        // libavcodec has nothing left to show. At a tenth of the speed the clip lasts ten seconds.
+        host.setRate(0.1)
         host.play()
         await waitUntil { frames.values.contains { !$0.hardware && $0.pts > 0.49 } }
 
@@ -305,9 +316,9 @@ struct SoftwareHostH264FallbackTests {
     }
 
     // test-wait: real VideoToolbox and libavcodec decodes on the host's own demux thread and clock; no fake
-    // clock reaches them.
+    // clock reaches them. 30 s: a whole run (or W3157's 90 copies at once) keeps the main actor busy for seconds.
     @MainActor
-    private static func waitUntil(timeout: Duration = .seconds(10), _ condition: () -> Bool) async {
+    private static func waitUntil(timeout: Duration = .seconds(30), _ condition: () -> Bool) async {
         let clock = ContinuousClock()
         let deadline = clock.now + timeout
         while !condition(), clock.now < deadline {

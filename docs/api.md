@@ -1264,6 +1264,7 @@ PiP/foreground eligibility and repair/resumption separately from optional decode
 | `segmentCacheDiskBytes`, `softwareHostFramesEnqueued` | Point reads for a stats overlay. |
 | `activeProducerShiftSeconds`, `frameAhead`, `clockLeadSeconds` | Divergence diagnostics for tracing a clock that disagrees with the picture. Not for production playback logic. |
 | `nativeItemReading()` -> `NativeItemReading?` | AE#509. The native item's own account of itself: `playhead` (`AVPlayerItem.currentTime()`, on the ITEM axis), `loadedRangeCount` (0 = nothing has been PLACED, which no buffer depth can say) and `status` (0 unknown, 1 ready, 2 failed). Async, read off the main actor. nil when no native item is mounted. The engine's published clock is `item + playlistShiftSeconds`, so on a live source hours into an encoder clock the two are thousands of seconds apart in a healthy session: quote both or neither. |
+| `seekRestartPhases` -> `[SeekRestartPhases]` | The native session's last few producer restarts (a seek past what was produced), oldest first, each split into its steps: `stop` (the old pump stopping), `reopen` (a fresh demuxer in place of a wedged one; nil when kept, `reopenFailed` when it failed), `seek`, `keyframe` and `served` (the first segment handed to the player). Empty with no native session or before any restart. A host times its seek from `ProcessInfo.systemUptime` and keeps the restarts whose `began` is not earlier. |
 
 ## LoadOptions
 
