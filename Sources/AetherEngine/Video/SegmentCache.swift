@@ -1,9 +1,10 @@
 import Darwin
 import Foundation
 
-/// Sliding-window disk-backed cache for HLS-fMP4 segments. Bytes go to
-/// <NSTemporaryDirectory>/aether-segments/<uuid>/seg-N-G.m4s; only URLs stay in RAM.
-/// Reads use .alwaysMapped (kernel pages in/out under memory pressure). Window:
+/// Sliding-window cache for HLS-fMP4 segments. Bytes go to
+/// <NSTemporaryDirectory>/aether-segments/<uuid>/seg-N-G.m4s, or, for a VOD session with a memory
+/// budget, into memory (W3167: `SegmentMemoryBuffer`, see "Memory segments" below).
+/// File reads use .alwaysMapped (kernel pages in/out under memory pressure). Window:
 /// [currentTargetIndex - backwardWindow, currentTargetIndex + forwardWindow].
 /// The producer pauses via awaitFetchHighWater once forwardWindow ahead of target.
 // Thread-safe: all mutable state is guarded by `condition` (NSCondition), so it is safe to share
@@ -48,7 +49,7 @@ final class SegmentCache: @unchecked Sendable {
     private lazy var nativeLiveExpiryQueue = DispatchQueue(label: "com.aetherengine.live-expiry", qos: .utility)
     private var nativeLiveExpiryTimer: DispatchSourceTimer? // condition; opt-in, cancelled by close
 
-    private var entries: [Int: URL] = [:]
+    private var entries: [Int: StagedSegment] = [:]
     /// Per-index byte ledger for _totalBytes. Stat-on-eviction was wrong when same index was
     /// overwritten (stat returned new size, old bytes stayed counted forever).
     private var entryBytes: [Int: Int] = [:]
@@ -57,14 +58,44 @@ final class SegmentCache: @unchecked Sendable {
     /// Registered when the producer opens the segment (`beginInProgress`), removed when it is
     /// adopted or abandoned. A serve that finds its index here reads the staging file as it grows
     /// (`ProgressiveSegmentReader`) instead of waiting for the cut.
-    private var inProgress: [Int: URL] = [:]
-    /// The staging file each recently adopted segment was renamed from, and its final size, so a
-    /// progressive reader can tell that the file IT holds was sealed, rather than the same index
-    /// produced again by a later epoch. Keyed by staging file (unique per segment and epoch) and
-    /// bounded to the most recent adoptions in adoption order: evicting by index dropped every
-    /// adoption below the 64 highest at once, so after a backward seek each reader read as abandoned.
-    private var sealedFromStaging: [URL: Int] = [:]
-    private var sealedStagingOrder: [URL] = []
+    private var inProgress: [Int: StagedSegment] = [:]
+    /// The staging file (or memory buffer) each recently adopted segment came from, and its final
+    /// size, so a progressive reader can tell that the bytes IT holds were sealed, rather than the
+    /// same index produced again by a later epoch. Keyed by staging file or buffer id (unique per
+    /// segment and epoch; an id, so remembering a buffer never keeps its bytes) and bounded to the
+    /// most recent adoptions in adoption order: evicting by index dropped every adoption below the
+    /// 64 highest at once, so after a backward seek each reader read as abandoned.
+    private var sealedFromStaging: [StagedSegment.Key: Int] = [:]
+    private var sealedStagingOrder: [StagedSegment.Key] = []
+
+    // MARK: Memory segments (W3167)
+    //
+    // A VOD cache with a `memoryBudget` hands the producer a `SegmentMemoryBuffer` for each segment
+    // while the counted memory plus the next segment fits B (`SegmentMemoryBudget`); past B a segment
+    // is written to a staging file as before. Live never gets one (review H1: a purged segment behind
+    // a live edge has no producer to re-make it).
+    //
+    // Counted memory is the lead: memory segments from `memoryKeepBehind` below the target up to the
+    // producer's head, plus the one being written. Everything else (behind the lead, an island a seek
+    // left above it) is volatile: the kernel may empty it, a read reclaims it or finds it emptied
+    // (dropped, the producer makes it again), and it is capped at B. When B shrinks (the process's
+    // available memory fell, a memory-pressure event), the band behind the target goes volatile
+    // first, then the farthest-ahead segments are spilled to files off the lock.
+
+    private let memoryBudget: SegmentMemoryBudget?
+    /// Segments kept counted below the target: the Continuous-Audio handover refetch reaches ~7-10
+    /// back (review M3), and a purge there is a restart that re-arms the FLAC bridge.
+    static let memoryKeepBehind = 10
+    private var lastPressureAt: Double?
+    private var lastAdoptedBytes = 0
+    private var spillScheduled = false
+    private var memoryPressureSource: DispatchSourceMemoryPressure?
+    private let spillQueue = DispatchQueue(label: "com.aetherengine.segmentcache.spill", qos: .utility)
+    /// Bytes this cache wrote to files: staging writes the muxer reports, `store`, and spills.
+    private var _bytesWrittenToDisk = 0
+    /// Memory segments spilled to files, and volatile ones found emptied. Diagnostics and tests.
+    private var _spilledSegments = 0
+    private var _purgedSegments = 0
 
     /// Pinned in RAM (~3.5 KB); AVPlayer fetches exactly once per session; never evicted.
     private var initSegment: Data?
@@ -154,11 +185,14 @@ final class SegmentCache: @unchecked Sendable {
 
     /// (10, 20)=30 entries, ~300 MB at 4K HDR HEVC ~10 MB/seg.
     init(forwardWindow: Int = 10, backwardWindow: Int = 20, retentionBudgetBytes: Int = 0,
-         baseDirectory: URL? = nil, nativeLiveDVRPolicy: LiveDVRRetentionPolicy? = nil, onResidentSetChanged: (@Sendable () -> Void)? = nil) {
+         baseDirectory: URL? = nil, nativeLiveDVRPolicy: LiveDVRRetentionPolicy? = nil,
+         memoryBudget: SegmentMemoryBudget? = nil, onResidentSetChanged: (@Sendable () -> Void)? = nil) {
         self.forwardWindow = forwardWindow
         self.backwardWindow = backwardWindow
         self.retentionBudgetBytes = retentionBudgetBytes
         self.nativeLiveDVRPolicy = nativeLiveDVRPolicy
+        // H1: a live session's segments always go to files, whatever the caller passed.
+        self.memoryBudget = nativeLiveDVRPolicy == nil ? memoryBudget : nil
         self.onResidentSetChanged = onResidentSetChanged
 
         // aether-segments/ prefix lets sweepStaleSessionDirs() find sibling dirs from crashed sessions.
@@ -181,9 +215,20 @@ final class SegmentCache: @unchecked Sendable {
         self.lockFD = Self.acquireLiveMarker(sessionDir: sessionDir)
 
         Self.sweepStaleSessionDirs(baseDir: baseDir, currentSession: sessionID)
+
+        if self.memoryBudget != nil {
+            // System pressure, not this process's own limit (review H3): the limit is tracked by
+            // re-reading the budget at each segment open and target change; this only adds the
+            // earlier warning where the system gives one.
+            let source = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: spillQueue)
+            source.setEventHandler { [weak self] in self?.noteMemoryPressure() }
+            source.resume()
+            memoryPressureSource = source
+        }
     }
 
     deinit {
+        memoryPressureSource?.cancel()
         nativeLiveExpiryTimer?.cancel()
         releaseLiveMarker()
     }
@@ -327,6 +372,7 @@ final class SegmentCache: @unchecked Sendable {
         }
 
         condition.lock()
+        if writeOK { _bytesWrittenToDisk += data.count }
         // store racing close() must not resurrect bookkeeping; entry would point into deleted sessionDir.
         guard !closed else {
             condition.unlock()
@@ -336,14 +382,13 @@ final class SegmentCache: @unchecked Sendable {
         // A re-store of a resident index changes bytes, not residency; only an insertion or an
         // eviction moves the set, and both are already known here without walking it.
         var residentSetChanged = false
-        var supersededFile: URL?
+        var superseded: StagedSegment?
         if writeOK {
             if let oldBytes = entryBytes[index] {
                 _totalBytes -= oldBytes
             }
-            let superseded = entries.updateValue(fileURL, forKey: index)
+            superseded = entries.updateValue(.file(fileURL), forKey: index)
             residentSetChanged = superseded == nil
-            if let superseded { supersededFile = superseded }
             entryBytes[index] = data.count
             _totalBytes += data.count
             if index > _highestStoredIndex { _highestStoredIndex = index }
@@ -351,41 +396,55 @@ final class SegmentCache: @unchecked Sendable {
         }
         let doomed = pruneOutsideWindow()
         if !doomed.isEmpty { residentSetChanged = true }
+        let memory = rebalanceMemoryLocked()
         condition.broadcast()
         condition.unlock()
-        if let supersededFile { try? FileManager.default.removeItem(at: supersededFile) }
-        for url in doomed { try? FileManager.default.removeItem(at: url) }
+        superseded?.discard()
+        for segment in doomed { segment.discard() }
+        finishRebalance(memory)
         if residentSetChanged { onResidentSetChanged?() }
     }
 
     /// Adopt a staging file via rename(2). Page cache pages stay warm; skips a Swift Data round trip.
+    func adopt(index: Int, stagingPath: URL, byteCount: Int, videoReach: VideoReach? = nil) {
+        adopt(index: index, staged: .file(stagingPath), byteCount: byteCount, videoReach: videoReach)
+    }
+
+    /// Adopt the segment the producer just sealed: a staging file is renamed to its final name, a
+    /// memory buffer becomes the entry as it stands.
     ///
     /// `videoReach` (AE#412) is what this segment's video offers a cold arrival; nil leaves the
     /// previous claim in place only if the index is re-adopted without one, which no caller does.
-    func adopt(index: Int, stagingPath: URL, byteCount: Int, videoReach: VideoReach? = nil) {
-        let fileURL = nextSegmentFileURL(index: index)
-        var renameOK: Bool
-        do {
-            try FileManager.default.moveItem(at: stagingPath, to: fileURL)
-            renameOK = true
-        } catch {
-            if restoreSessionDirIfMissing(),
-               (try? FileManager.default.moveItem(at: stagingPath, to: fileURL)) != nil {
-                renameOK = true
-            } else {
-                EngineLog.emit("[SegmentCache] adopt failed seg-\(index): \(error)",
-                               category: .session)
-                try? FileManager.default.removeItem(at: stagingPath)
-                renameOK = false
+    func adopt(index: Int, staged: StagedSegment, byteCount: Int, videoReach: VideoReach? = nil) {
+        let stored: StagedSegment
+        var adoptOK = true
+        switch staged {
+        case .memory:
+            stored = staged
+        case .file(let stagingPath):
+            let fileURL = nextSegmentFileURL(index: index)
+            stored = .file(fileURL)
+            do {
+                try FileManager.default.moveItem(at: stagingPath, to: fileURL)
+            } catch {
+                if restoreSessionDirIfMissing(),
+                   (try? FileManager.default.moveItem(at: stagingPath, to: fileURL)) != nil {
+                } else {
+                    EngineLog.emit("[SegmentCache] adopt failed seg-\(index): \(error)",
+                                   category: .session)
+                    try? FileManager.default.removeItem(at: stagingPath)
+                    adoptOK = false
+                }
             }
         }
 
+        let key = staged.key
         condition.lock()
-        // Sealed or not, this staging file is no longer being written.
-        if inProgress[index] == stagingPath { inProgress.removeValue(forKey: index) }
-        if renameOK {
-            if sealedFromStaging.updateValue(byteCount, forKey: stagingPath) == nil {
-                sealedStagingOrder.append(stagingPath)
+        // Sealed or not, these staged bytes are no longer being written.
+        if inProgress[index]?.key == key { inProgress.removeValue(forKey: index) }
+        if adoptOK {
+            if sealedFromStaging.updateValue(byteCount, forKey: key) == nil {
+                sealedStagingOrder.append(key)
             }
             while sealedStagingOrder.count > Self.sealedStagingMemory {
                 sealedFromStaging.removeValue(forKey: sealedStagingOrder.removeFirst())
@@ -394,20 +453,20 @@ final class SegmentCache: @unchecked Sendable {
         guard !closed else {
             condition.broadcast()
             condition.unlock()
-            try? FileManager.default.removeItem(at: fileURL)
+            if adoptOK { stored.discard() }
             return
         }
         var residentSetChanged = false
-        var supersededFile: URL?
-        if renameOK {
+        var superseded: StagedSegment?
+        if adoptOK {
             if let oldBytes = entryBytes[index] {
                 _totalBytes -= oldBytes
             }
-            let superseded = entries.updateValue(fileURL, forKey: index)
+            superseded = entries.updateValue(stored, forKey: index)
             residentSetChanged = superseded == nil
-            if let superseded { supersededFile = superseded }
             entryBytes[index] = byteCount
             _totalBytes += byteCount
+            lastAdoptedBytes = byteCount
             if index > _highestStoredIndex { _highestStoredIndex = index }
             noteStoreLocked(index)
             // A later epoch produced what an earlier one passed over: a re-anchor moved the
@@ -419,10 +478,12 @@ final class SegmentCache: @unchecked Sendable {
         }
         let doomed = pruneOutsideWindow()
         if !doomed.isEmpty { residentSetChanged = true }
+        let memory = rebalanceMemoryLocked()
         condition.broadcast()
         condition.unlock()
-        if let supersededFile { try? FileManager.default.removeItem(at: supersededFile) }
-        for url in doomed { try? FileManager.default.removeItem(at: url) }
+        superseded?.discard()
+        for segment in doomed { segment.discard() }
+        finishRebalance(memory)
         if residentSetChanged { onResidentSetChanged?() }
     }
 
@@ -453,9 +514,12 @@ final class SegmentCache: @unchecked Sendable {
         _highestStoredIndex = -1
         lastStore = nil
         paceSteps.removeAll()
+        let pressureSource = memoryPressureSource
+        memoryPressureSource = nil
         condition.broadcast()
         condition.unlock()
 
+        pressureSource?.cancel()
         expiryTimer?.cancel()
         releaseLiveMarker()
         Self.discardQueue.async { try? FileManager.default.removeItem(at: dir) }
@@ -468,16 +532,19 @@ final class SegmentCache: @unchecked Sendable {
 
     func declareTarget(_ index: Int) {
         condition.lock()
-        var doomed: [URL] = []
+        var doomed: [StagedSegment] = []
+        var memory: MemoryRebalance?
         trackFetchSequenceLocked(index)
         if index != currentTargetIndex {
             currentTargetIndex = index
             doomed = pruneOutsideWindow()
+            memory = rebalanceMemoryLocked()
             condition.broadcast()
         }
         condition.unlock()
-        for url in doomed { try? FileManager.default.removeItem(at: url) }
-        if !doomed.isEmpty { onResidentSetChanged?() }
+        for segment in doomed { segment.discard() }
+        if let memory { finishRebalance(memory) }
+        if !doomed.isEmpty || memory?.droppedEntries == true { onResidentSetChanged?() }
     }
 
     /// Must be called with condition held.
@@ -498,43 +565,69 @@ final class SegmentCache: @unchecked Sendable {
     }
 
     func peek(index: Int) -> Data? {
-        guard let url = peekURL(index: index) else { return nil }
-        return readOrDrop(index: index, url: url)
+        guard let stored = storedSegment(index: index) else { return nil }
+        return readOrDrop(index: index, stored: stored)
     }
 
-    /// AE#451: the bookkeeping is not the file, and this is where the bookkeeping is redeemed.
+    /// AE#451: the bookkeeping is not the bytes, and this is where the bookkeeping is redeemed.
     ///
-    /// Every caller reads this answer as "the segment is on disk": the server streams the URL it
-    /// gets (a file that has gone answers a 404, which the #50 rule forbids for an in-range index
-    /// and AVPlayer treats as terminal on VOD), the AE#421 wedge split asks it to tell a starved
-    /// consumer from a silent one, and the byte ledger bills for it. So an entry whose file has
-    /// gone stops answering here, and the producer is free to make it again.
-    func peekURL(index: Int) -> URL? {
+    /// The segment at `index` if it is still there: a file that exists, or a memory segment the
+    /// kernel has not emptied (review H2: a volatile one is asked, not reclaimed). Every caller reads
+    /// the answer as "the segment is stored": the server serves it (a file that has gone answers a
+    /// 404, which the #50 rule forbids for an in-range index and AVPlayer treats as terminal on VOD),
+    /// the AE#421 wedge split asks it to tell a starved consumer from a silent one, and the byte
+    /// ledger bills for it. So an entry whose bytes have gone stops answering here, and the producer
+    /// is free to make it again.
+    func storedSegment(index: Int) -> StagedSegment? {
         condition.lock()
-        let fileURL = entries[index]
+        let entry = entries[index]
         condition.unlock()
-        guard let url = fileURL else { return nil }
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            dropVanishedEntry(index: index, url: url)
-            return nil
+        guard let stored = entry else { return nil }
+        switch stored {
+        case .file(let url):
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                dropVanishedEntry(index: index, key: stored.key, purged: false)
+                return nil
+            }
+        case .memory(let buffer):
+            guard !buffer.isEmptied else {
+                dropVanishedEntry(index: index, key: stored.key, purged: true)
+                return nil
+            }
         }
-        return url
+        return stored
     }
 
-    /// Forget an entry whose file is gone. Keeps `_highestStoredIndex`: it records how far the
-    /// producer got, which an external deletion does not undo.
-    private func dropVanishedEntry(index: Int, url: URL) {
+    /// Whether the segment at `index` is stored, in a file or in memory (`storedSegment`).
+    func isStored(index: Int) -> Bool {
+        storedSegment(index: index) != nil
+    }
+
+    /// The segment's file when it is stored on disk, for the sendfile fast path and its logs; nil for
+    /// a memory segment, which is served from `fetchSource`'s data. Not a residency check: that is
+    /// `isStored` (review M4: the old `peekURL` answered both, and a memory segment must not read as
+    /// missing).
+    func fileURLIfOnDisk(index: Int) -> URL? {
+        storedSegment(index: index)?.fileURL
+    }
+
+    /// Forget an entry whose bytes are gone. Keeps `_highestStoredIndex`: it records how far the
+    /// producer got, which an external deletion or a purge does not undo.
+    private func dropVanishedEntry(index: Int, key: StagedSegment.Key, purged: Bool) {
         condition.lock()
-        guard entries[index] == url else {
+        guard entries[index]?.key == key else {
             condition.unlock()
             return
         }
         entries.removeValue(forKey: index)
         _totalBytes -= entryBytes.removeValue(forKey: index) ?? 0
         videoReaches.removeValue(forKey: index)
+        if purged { _purgedSegments += 1 }
         condition.broadcast()
         condition.unlock()
-        EngineLog.emit("[SegmentCache] seg-\(index) vanished from disk; entry dropped (AE#451)",
+        EngineLog.emit(purged
+                       ? "[SegmentCache] seg-\(index) was purged from memory; entry dropped"
+                       : "[SegmentCache] seg-\(index) vanished from disk; entry dropped (AE#451)",
                        category: .session)
     }
 
@@ -546,9 +639,9 @@ final class SegmentCache: @unchecked Sendable {
 
     func fetch(index: Int, timeout: TimeInterval = 15.0) -> Data? {
         condition.lock()
-        if let url = entries[index] {
+        if let stored = entries[index] {
             condition.unlock()
-            return readOrDrop(index: index, url: url)
+            return readOrDrop(index: index, stored: stored)
         }
         if closed {
             condition.unlock()
@@ -558,10 +651,10 @@ final class SegmentCache: @unchecked Sendable {
         while !closed, entries[index] == nil {
             if !condition.wait(until: deadline) { break }
         }
-        let fileURL = entries[index]
+        let entry = entries[index]
         condition.unlock()
-        guard let url = fileURL else { return nil }
-        return readOrDrop(index: index, url: url)
+        guard let stored = entry else { return nil }
+        return readOrDrop(index: index, stored: stored)
     }
 
     // MARK: - Progressive delivery
@@ -572,16 +665,23 @@ final class SegmentCache: @unchecked Sendable {
     /// The producer opened segment `index` in `stagingPath`, which from here on is only appended to
     /// until it is adopted under its final name.
     func beginInProgress(index: Int, stagingPath: URL) {
+        beginInProgress(index: index, staged: .file(stagingPath))
+    }
+
+    /// The producer opened segment `index` in `staged`, which from here on is only appended to until
+    /// it is adopted.
+    func beginInProgress(index: Int, staged: StagedSegment) {
         condition.lock()
         if !closed {
-            inProgress[index] = stagingPath
+            inProgress[index] = staged
             condition.broadcast()
         }
         condition.unlock()
     }
 
     /// The producer gave up the segment it was writing (restart, failed cut, teardown), so its
-    /// partial bytes are never adopted. A reader draining it learns that on its next poll.
+    /// partial bytes are never adopted. A reader draining it learns that on its next poll; a memory
+    /// buffer is freed once its last reader lets go.
     func abandonInProgress(index: Int) {
         condition.lock()
         if inProgress.removeValue(forKey: index) != nil { condition.broadcast() }
@@ -594,25 +694,29 @@ final class SegmentCache: @unchecked Sendable {
         case abandoned
     }
 
-    /// What became of the staging file a progressive reader holds.
-    func inProgressState(index: Int, stagingPath: URL) -> InProgressState {
+    /// What became of the staged bytes a progressive reader holds.
+    func inProgressState(index: Int, key: StagedSegment.Key) -> InProgressState {
         condition.lock()
         defer { condition.unlock() }
-        if inProgress[index] == stagingPath { return .writing }
-        if let bytes = sealedFromStaging[stagingPath] { return .sealed(bytes: bytes) }
+        if inProgress[index]?.key == key { return .writing }
+        if let bytes = sealedFromStaging[key] { return .sealed(bytes: bytes) }
         return .abandoned
     }
 
+    func inProgressState(index: Int, stagingPath: URL) -> InProgressState {
+        inProgressState(index: index, key: .file(stagingPath))
+    }
+
     /// `fetch` for the loopback server. With `progressive`, a segment that is being written is
-    /// answered at once with a reader over its staging file, so AVPlayer receives each fragment as
+    /// answered at once with a reader over its staged bytes, so AVPlayer receives each fragment as
     /// the muxer flushes it instead of the whole segment after its cut.
     func fetchSource(index: Int, timeout: TimeInterval, progressive: Bool) -> SegmentSource? {
         let deadline = Date().addingTimeInterval(timeout)
         condition.lock()
         while true {
-            if let url = entries[index] {
+            if let stored = entries[index] {
                 condition.unlock()
-                return readOrDrop(index: index, url: url).map { .data($0) }
+                return readOrDrop(index: index, stored: stored).map { .data($0) }
             }
             if closed {
                 condition.unlock()
@@ -620,12 +724,12 @@ final class SegmentCache: @unchecked Sendable {
             }
             if progressive, let staging = inProgress[index] {
                 condition.unlock()
-                if let reader = ProgressiveSegmentReader(cache: self, index: index, stagingPath: staging) {
+                if let reader = ProgressiveSegmentReader(cache: self, index: index, staged: staging) {
                     return .progressive(reader)
                 }
                 // The staging file was renamed or removed between the lookup and the open: look again.
                 condition.lock()
-                if inProgress[index] == staging { inProgress.removeValue(forKey: index) }
+                if inProgress[index]?.key == staging.key { inProgress.removeValue(forKey: index) }
                 continue
             }
             if !condition.wait(until: deadline) {
@@ -635,13 +739,19 @@ final class SegmentCache: @unchecked Sendable {
         }
     }
 
-    /// AE#451: a read that comes back empty for a file the bookkeeping still lists is the same lie
-    /// `peekURL` guards against, and here it is load-bearing: this serve answers a retriable 503,
-    /// and an entry left standing means every retry takes this branch again while the producer,
-    /// which asks whether the segment is stored, is never told to make it.
-    private func readOrDrop(index: Int, url: URL) -> Data? {
-        guard let data = readMapped(url) else {
-            dropVanishedEntry(index: index, url: url)
+    /// AE#451: a read that comes back empty for bytes the bookkeeping still lists is the same lie
+    /// `storedSegment` guards against, and here it is load-bearing: this serve answers a retriable
+    /// 503, and an entry left standing means every retry takes this branch again while the producer,
+    /// which asks whether the segment is stored, is never told to make it. A memory segment's read
+    /// reclaims it first and answers a pinned no-copy `Data` (review H2), or nil when it was purged.
+    private func readOrDrop(index: Int, stored: StagedSegment) -> Data? {
+        let data: Data?
+        switch stored {
+        case .file(let url): data = readMapped(url)
+        case .memory(let buffer): data = buffer.pinnedData()
+        }
+        guard let data else {
+            dropVanishedEntry(index: index, key: stored.key, purged: stored.fileURL == nil)
             return nil
         }
         return data
@@ -675,30 +785,255 @@ final class SegmentCache: @unchecked Sendable {
     /// about to stat; pruneOutsideWindow handles the forward bound.
     func evictBelow(_ cutoff: Int) {
         condition.lock()
-        var doomed: [URL] = []
-        for (k, url) in entries where k < cutoff {
-            _totalBytes -= entryBytes[k] ?? byteSize(of: url)
+        var doomed: [StagedSegment] = []
+        for (k, stored) in entries where k < cutoff {
+            _totalBytes -= entryBytes[k] ?? byteSize(of: stored)
             entryBytes.removeValue(forKey: k)
             entries.removeValue(forKey: k)
-            doomed.append(url)
+            doomed.append(stored)
         }
         condition.unlock()
-        for url in doomed {
-            try? FileManager.default.removeItem(at: url)
-        }
+        for segment in doomed { segment.discard() }
         if !doomed.isEmpty { onResidentSetChanged?() }
     }
 
     /// Authoritative disk footprint via fresh stat (not _totalBytes accumulator); diagnostics path.
+    /// Memory segments are not on disk and are not counted (`memoryBytes`).
     func diskBytes() -> Int64 {
         condition.lock()
-        let urls = Array(entries.values)
+        let urls = entries.values.compactMap(\.fileURL)
         condition.unlock()
         var total: Int64 = 0
         for url in urls {
             total += Int64(byteSize(of: url))
         }
         return total
+    }
+
+    /// Bytes of the segments stored in files, from the ledger: what the retention claim on the tmp
+    /// volume bills (review L6), where `totalBytes` also counts memory segments.
+    var storedDiskBytes: Int {
+        condition.lock()
+        defer { condition.unlock() }
+        var bytes = 0
+        for (k, stored) in entries where stored.fileURL != nil { bytes += entryBytes[k] ?? 0 }
+        return bytes
+    }
+
+    // MARK: - Memory segments (W3167)
+
+    /// Counted memory (the lead and the segment being written) and the volatile memory behind it.
+    func memoryBytes() -> (counted: Int, volatile: Int) {
+        condition.lock()
+        defer { condition.unlock() }
+        var counted = inProgressMemoryBytesLocked()
+        var volatile = 0
+        for (k, stored) in entries {
+            guard case .memory(let buffer) = stored else { continue }
+            if buffer.isVolatile { volatile += entryBytes[k] ?? 0 } else { counted += entryBytes[k] ?? 0 }
+        }
+        return (counted, volatile)
+    }
+
+    /// Bytes this cache wrote to files since it opened: staging writes, `store`, spills.
+    var bytesWrittenToDisk: Int {
+        condition.lock()
+        defer { condition.unlock() }
+        return _bytesWrittenToDisk
+    }
+
+    /// The muxer wrote `bytes` to a staging file of this session.
+    func noteBytesWrittenToDisk(_ bytes: Int) {
+        condition.lock()
+        _bytesWrittenToDisk += bytes
+        condition.unlock()
+    }
+
+    var spilledSegments: Int {
+        condition.lock()
+        defer { condition.unlock() }
+        return _spilledSegments
+    }
+
+    var purgedSegments: Int {
+        condition.lock()
+        defer { condition.unlock() }
+        return _purgedSegments
+    }
+
+    /// Where the producer writes segment `index`: a memory buffer while the counted memory plus the
+    /// next segment fits B, or nil for a staging file as before. Also where a shrunken B is noticed
+    /// while the producer runs (review H3).
+    func memorySegment(forIndex index: Int) -> SegmentMemoryBuffer? {
+        condition.lock()
+        guard memoryBudget != nil, !closed else {
+            condition.unlock()
+            return nil
+        }
+        let state = rebalanceMemoryLocked()
+        let estimate = lastAdoptedBytes > 0 ? lastAdoptedBytes : 8 << 20
+        let admits = !state.holdNew && state.counted + estimate <= state.budget
+        condition.unlock()
+        finishRebalance(state)
+        return admits ? SegmentMemoryBuffer(expectedBytes: estimate) : nil
+    }
+
+    /// A memory-pressure event: nothing new to memory for `pressureHoldSeconds`, and the held memory
+    /// spilled down to B / 2. Runs on `spillQueue`; tests call it directly.
+    func noteMemoryPressure() {
+        condition.lock()
+        guard let budget = memoryBudget, !closed else {
+            condition.unlock()
+            return
+        }
+        lastPressureAt = budget.now()
+        let state = rebalanceMemoryLocked()
+        condition.unlock()
+        EngineLog.emit("[SegmentCache] memory pressure: \(state.counted >> 20) MiB counted, "
+                       + "budget \(state.budget >> 20) MiB, shrinking to \(state.goal >> 20) MiB",
+                       category: .session)
+        finishRebalance(state)
+    }
+
+    /// What one rebalance found: the counted memory after it, B, the goal a shrink aims for, whether
+    /// new segments are held back from memory, and whether entries were dropped or a spill is needed.
+    struct MemoryRebalance {
+        var counted = 0
+        var budget = 0
+        var goal = 0
+        var holdNew = false
+        var droppedEntries = false
+        var needsSpill = false
+    }
+
+    /// Must be called with condition held. Sets each memory segment's volatility from its place
+    /// relative to the target, drops the ones the kernel emptied, caps the volatile history at B, and
+    /// when the counted memory exceeds the goal makes the band behind the target volatile too.
+    /// Spilling is left to `finishRebalance`, off the lock.
+    private func rebalanceMemoryLocked() -> MemoryRebalance {
+        var state = MemoryRebalance()
+        guard let budget = memoryBudget else { return state }
+        let target = currentTargetIndex
+        let lo = target - Self.memoryKeepBehind
+        let hi = max(target + forwardWindow, _highestStoredIndex)
+        var counted = inProgressMemoryBytesLocked()
+        var behindBand: [(index: Int, buffer: SegmentMemoryBuffer, bytes: Int)] = []
+        var history: [(index: Int, bytes: Int)] = []
+        var purged: [Int] = []
+        for (k, stored) in entries {
+            guard case .memory(let buffer) = stored else { continue }
+            let bytes = entryBytes[k] ?? 0
+            // Before the consumer's first fetch everything stored is the lead it will ask for.
+            let inLead = target < 0 || (k >= lo && k <= hi)
+            if inLead {
+                if buffer.setWantsVolatile(false) {
+                    counted += bytes
+                    if target >= 0, k < target { behindBand.append((k, buffer, bytes)) }
+                } else {
+                    purged.append(k)
+                }
+            } else {
+                buffer.setWantsVolatile(true)
+                if buffer.isEmptied { purged.append(k) } else { history.append((k, bytes)) }
+            }
+        }
+        state.budget = budget.bytes(heldBytes: counted)
+        let recentPressure = lastPressureAt.map { budget.now() - $0 < budget.pressureHoldSeconds } ?? false
+        state.holdNew = recentPressure || budget.isCritical
+        state.goal = state.holdNew ? state.budget / 2 : state.budget
+        if counted > state.goal {
+            // Free without a write first: the handover cushion behind the target.
+            for item in behindBand.sorted(by: { $0.index < $1.index }) where counted > state.goal {
+                item.buffer.setWantsVolatile(true)
+                counted -= item.bytes
+                history.append((item.index, item.bytes))
+            }
+        }
+        state.counted = counted
+        state.needsSpill = counted > state.goal
+        // Volatile memory costs no footprint but address space: keep the nearest B of it.
+        var kept = 0
+        for item in history.sorted(by: { abs($0.index - target) < abs($1.index - target) }) {
+            if kept + item.bytes <= state.budget { kept += item.bytes } else { purged.append(item.index) }
+        }
+        for k in purged {
+            guard entries.removeValue(forKey: k) != nil else { continue }
+            _totalBytes -= entryBytes.removeValue(forKey: k) ?? 0
+            videoReaches.removeValue(forKey: k)
+            _purgedSegments += 1
+            state.droppedEntries = true
+        }
+        return state
+    }
+
+    /// Must be called with condition held. The segment being written, when it is in memory (L2).
+    private func inProgressMemoryBytesLocked() -> Int {
+        var bytes = 0
+        for stored in inProgress.values {
+            if case .memory(let buffer) = stored { bytes += buffer.length }
+        }
+        return bytes
+    }
+
+    /// Off the lock: schedules a spill when the rebalance asked for one.
+    private func finishRebalance(_ state: MemoryRebalance) {
+        guard state.needsSpill else { return }
+        condition.lock()
+        let schedule = !spillScheduled && !closed
+        if schedule { spillScheduled = true }
+        condition.unlock()
+        guard schedule else { return }
+        spillQueue.async { [weak self] in self?.spillOverBudget() }
+    }
+
+    /// Writes the farthest-ahead counted memory segments to files until the counted memory is within
+    /// the goal. Never the segment being written (it is not an entry yet, review M7). The entry swaps
+    /// to the file only once it is written, and only if it is still the same buffer; a reader holding
+    /// the buffer's pinned bytes keeps them until it lets go.
+    private func spillOverBudget() {
+        condition.lock()
+        let state = rebalanceMemoryLocked()
+        var over = state.counted - state.goal
+        var victims: [(index: Int, buffer: SegmentMemoryBuffer)] = []
+        if over > 0 {
+            for k in entries.keys.sorted(by: >) where over > 0 {
+                guard case .memory(let buffer) = entries[k], !buffer.isVolatile else { continue }
+                victims.append((k, buffer))
+                over -= entryBytes[k] ?? 0
+            }
+        }
+        spillScheduled = false
+        condition.unlock()
+
+        var spilled = 0
+        for victim in victims {
+            guard let data = victim.buffer.pinnedData() else { continue }
+            let url = nextSegmentFileURL(index: victim.index)
+            do {
+                try data.write(to: url)
+            } catch {
+                EngineLog.emit("[SegmentCache] spill of seg-\(victim.index) failed: \(error)", category: .session)
+                if Self.isOutOfSpace(error) { noteStorageExhausted() }
+                try? FileManager.default.removeItem(at: url)
+                break
+            }
+            condition.lock()
+            _bytesWrittenToDisk += data.count
+            let current = entries[victim.index]
+            let swapped = !closed && current?.key == StagedSegment.memory(victim.buffer).key
+            if swapped {
+                entries[victim.index] = .file(url)
+                _spilledSegments += 1
+                spilled += 1
+            }
+            condition.unlock()
+            if !swapped { try? FileManager.default.removeItem(at: url) }
+        }
+        if spilled > 0 {
+            EngineLog.emit("[SegmentCache] spilled \(spilled) memory segment(s) to disk: "
+                           + "\(state.counted >> 20) MiB counted over a \(state.goal >> 20) MiB goal",
+                           category: .session)
+        }
     }
 
     func wakeWaiters() {
