@@ -25,10 +25,11 @@ struct SegmentMemoryCacheTests {
 
     private static let mib = 1 << 20
 
+    /// `refreshSeconds`: the slow re-read of B (W3171 L2), off unless a test asks for it.
     private func makeCache(capBytes: Int, inputs: Inputs = Inputs(), retentionBytes: Int = 0,
-                           live: LiveDVRRetentionPolicy? = nil) -> SegmentCache {
+                           live: LiveDVRRetentionPolicy? = nil, refreshSeconds: Double = 3600) -> SegmentCache {
         let budget = SegmentMemoryBudget(availableMemory: { inputs.available }, capBytes: capBytes,
-                                         hardFloorBytes: 0, now: { inputs.now })
+                                         hardFloorBytes: 0, refreshSeconds: refreshSeconds, now: { inputs.now })
         return SegmentCache(forwardWindow: 10, retentionBudgetBytes: retentionBytes,
                             baseDirectory: FileManager.default.temporaryDirectory
                                 .appendingPathComponent("segmem tests 片-\(UUID().uuidString)", isDirectory: true),
@@ -363,5 +364,101 @@ struct SegmentMemoryCacheTests {
         #expect(try produce(cache, 2, bytes: 64 << 10))
         let remade = try #require(thumbnailSource(provider, atSeconds: 9, initData: initData))
         #expect(remade.identity != source.identity)
+    }
+
+    // MARK: - W3171 review fixes
+
+    @Test("a back-seek into memory history reclaims nearest-first within B: nothing written (W3171 M1)")
+    func backSeekReclaimsWithinBudget() throws {
+        let cache = makeCache(capBytes: 30 * Self.mib, retentionBytes: 1 << 30)
+        defer { cache.close() }
+        for i in 0..<20 { #expect(try produce(cache, i, bytes: Self.mib)) }
+        cache.declareTarget(20)
+        for i in 20..<30 { #expect(try produce(cache, i, bytes: Self.mib)) }
+        cache.declareTarget(30)
+        for i in 30..<40 { #expect(try produce(cache, i, bytes: Self.mib)) }
+        // A 20 MiB lead (20...39) counted, 20 MiB of history (0...19) volatile.
+        #expect(cache.memoryBytes().counted == 20 * Self.mib)
+        #expect(cache.memoryBytes().volatile == 20 * Self.mib)
+
+        // The producer is kept (the target is resident), so the lead still reaches the old head.
+        cache.declareTarget(5)
+        cache.drainSpillsForTesting()
+        #expect(cache.memoryBytes().counted <= 30 * Self.mib)
+        #expect(cache.bytesWrittenToDisk == 0)
+        #expect(cache.spilledSegments == 0)
+        #expect(segmentFiles(cache).isEmpty)
+        // B - 20 MiB = 10 MiB reclaimed nearest-first, ahead of the target first: 5...14.
+        for i in 5...14 { #expect(buffer(cache, i)?.isVolatile == false, "seg \(i) reclaimed") }
+        for i in [0, 4, 15, 19] { #expect(buffer(cache, i)?.isVolatile == true, "seg \(i) left volatile") }
+        for i in 0..<40 { #expect(cache.peek(index: i) == payload(i, Self.mib)) }
+    }
+
+    @Test("a scrub extractor's pinned memory segment counts against B once its entry is not counted (W3171 M2)")
+    func scrubPinsCountAgainstBudget() throws {
+        let cache = makeCache(capBytes: 10 * Self.mib, retentionBytes: 1 << 30)
+        defer { cache.close() }
+        let provider = makeProvider(cache)
+        for i in 0..<4 { #expect(try produce(cache, i, bytes: Self.mib)) }
+        var readers: [DataIOReader] = []
+        for i in 0..<4 {
+            let source = try #require(thumbnailSource(provider, atSeconds: Double(i) * 4 + 1, initData: Data([1])))
+            readers.append(try #require(source.makeReader()))
+        }
+        // Pinned while counted as the lead: not counted twice.
+        for i in 4..<10 { #expect(try produce(cache, i, bytes: Self.mib), "seg \(i) to memory") }
+
+        // The pinned segments fall behind: their 4 MiB stay in the footprint, so 6 MiB are left.
+        cache.declareTarget(20)
+        var inMemory = 0
+        for i in 20..<30 {
+            if try produce(cache, i, bytes: Self.mib) { inMemory += 1 }
+        }
+        #expect(inMemory == 6)
+
+        readers.removeAll()
+        #expect(try produce(cache, 30, bytes: Self.mib), "the extractors let go: their bytes stop counting")
+    }
+
+    @Test("os_proc_available_memory answering 0 is no per-process limit: B is the cap (W3171 L1)")
+    func zeroAvailableIsNoLimit() throws {
+        let budget = SegmentMemoryBudget(availableMemory: { 0 }, capBytes: 64 * Self.mib)
+        #expect(budget.bytes(heldBytes: 0) == 64 * Self.mib)
+        #expect(!budget.isCritical)
+        let inputs = Inputs()
+        inputs.available = 0
+        let cache = makeCache(capBytes: 16 * Self.mib, inputs: inputs)
+        defer { cache.close() }
+        #expect(try produce(cache, 0, bytes: Self.mib))
+    }
+
+    @Test("with nothing opened and the target still, B follows available memory on the slow timer (W3171 L2)")
+    func pausedCacheFollowsAvailableMemory() throws {
+        let inputs = Inputs()
+        inputs.available = 60 * Self.mib
+        let cache = makeCache(capBytes: 64 * Self.mib, inputs: inputs, refreshSeconds: 0.02)
+        defer { cache.close() }
+        for i in 0..<6 { #expect(try produce(cache, i, bytes: Self.mib)) }
+
+        inputs.available = 3 * Self.mib
+        // test-wait: the re-read is a real DispatchSource timer on the cache's own queue.
+        let deadline = Date().addingTimeInterval(5)
+        while cache.spilledSegments < 3, Date() < deadline { Thread.sleep(forTimeInterval: 0.01) }
+        cache.drainSpillsForTesting()
+        #expect(cache.spilledSegments >= 3)
+        #expect(cache.memoryBytes().counted <= 3 * Self.mib)
+        for i in 0..<6 { #expect(cache.peek(index: i) == payload(i, Self.mib)) }
+    }
+
+    @Test("the disk retention prune neither bills nor prunes memory history (W3171 L3)")
+    func retentionPruneSkipsMemory() throws {
+        let cache = makeCache(capBytes: 64 * Self.mib, retentionBytes: 30 * Self.mib)
+        defer { cache.close() }
+        for i in 0..<10 { cache.store(index: i, data: payload(i, Self.mib)) }
+        for i in 10..<40 { #expect(try produce(cache, i, bytes: Self.mib)) }
+        // Window 15...45: 25 MiB of memory inside, files 0...9 and memory 10...14 outside it.
+        cache.declareTarget(35)
+        for i in 0..<10 { #expect(cache.fileURLIfOnDisk(index: i) != nil, "file history seg \(i) kept") }
+        for i in 10..<40 { #expect(cache.isStored(index: i)) }
     }
 }
