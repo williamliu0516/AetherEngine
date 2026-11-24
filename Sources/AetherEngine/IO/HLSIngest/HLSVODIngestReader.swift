@@ -8,7 +8,7 @@ import Foundation
 ///
 /// Its seek axis is ELAPSED MEDIA TIME (the EXTINF sum), not the container's PTS: an MPEG-TS VOD
 /// carries an arbitrary PTS origin, so `Demuxer` strips that origin before positioning the reader.
-final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
+final class HLSVODIngestReader: TimeSeekableIOReader, ReadInterruptibleIOReader, @unchecked Sendable {
     private struct ResolvedMedia {
         let url: URL
         let segments: [HLSMediaSegment]
@@ -49,6 +49,8 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
     private var finished = false
     private var failed = false
     private var closed = false
+    /// W3153: bumped by `interruptRead`; a read parked when it moves returns -1, nothing else changes.
+    private var readInterrupts: UInt64 = 0
     private var producer: Task<Void, Never>?
     /// Playlist index the running producer opened at; lets a reposition onto that same segment, before
     /// any byte was consumed, resolve without refetching it.
@@ -144,11 +146,13 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         startIfNeeded()
         condition.lock()
         defer { condition.unlock() }
-        while queue.isEmpty, !finished, !failed, !closed {
+        let interrupts = readInterrupts
+        while queue.isEmpty, !finished, !failed, !closed, readInterrupts == interrupts {
             condition.wait()
         }
         guard !failed, !closed else { return -1 }
-        guard !queue.isEmpty else { return 0 }
+        // Empty and not finished: an interrupt ended this read, not the stream.
+        guard !queue.isEmpty else { return finished ? 0 : -1 }
 
         let available = queue[0].count - headOffset
         let count = min(available, Int(size))
@@ -256,6 +260,16 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         let tolerance = shortest.isFinite ? min(0.5, shortest / 2) : 0
         let containing = starts.lastIndex(where: { $0 <= elapsed + tolerance }) ?? 0
         return max(0, containing - 1)
+    }
+
+    /// W3153: a restart's interrupt ends the parked read only. The producer, the queue and the
+    /// position stay, so the restart's `seek(to:)` (or a plain next read) carries on; `cancel()` is
+    /// the teardown that stops the reader for good.
+    func interruptRead() {
+        condition.withLock {
+            readInterrupts &+= 1
+            condition.broadcast()
+        }
     }
 
     func cancel() {

@@ -2194,6 +2194,17 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         stateLock.unlock()
     }
 
+    /// AVPlayer's time jumped to segment `index` (W3153). A jump onto the last seek's own segment (or the one
+    /// before, where AVPlayer lands on a boundary) is that seek's echo and changes nothing; any other is a seek the
+    /// engine was not told about (Apple TV's and Vision Pro's system scrubs, PiP's skip buttons) and counts as one.
+    func noteTimeJump(_ index: Int) {
+        stateLock.lock()
+        let echo = _seekTarget.map { index == $0.index || index == $0.index - 1 } ?? false
+        stateLock.unlock()
+        guard !echo else { return }
+        noteSeekTarget(index)
+    }
+
     /// Requests a seek left behind (`StaleSeekFetchGuard`). Guarded by `stateLock`.
     private var staleSeekFetches = StaleSeekFetchGuard()
 

@@ -115,6 +115,28 @@ struct StaleSeekFetchTests {
         #expect(producer.restarts == [90, 71, 40])
     }
 
+    /// W3153: Apple TV's Siri Remote scrub seeks AVPlayer directly; the engine hears of it only by the time jump.
+    @Test("a seek AVPlayer makes on its own is served and gets its own window; an engine seek's own jump changes nothing")
+    func systemSeekCountsAsASeek() {
+        let cache = SegmentCache(forwardWindow: 40, backwardWindow: 40)
+        defer { cache.close() }
+        let producer = Producer(base: 68)
+        let provider = makeProvider(cache: cache, producer: producer)
+
+        provider.noteSeekTarget(90)
+        #expect(provider.mediaSegment(at: 90) != nil)
+        provider.noteTimeJump(90)
+        #expect(provider.mediaSegment(at: 72) == nil, "the engine seek's own jump left its window open")
+
+        // The user clicks back on the remote, to 50, within the window: served, not refused.
+        provider.noteTimeJump(50)
+        #expect(provider.mediaSegment(at: 50) != nil, "a real seek by the user was refused")
+        #expect(producer.restarts == [90, 50])
+        // ... and a late request for where it left is that seek's stale one.
+        #expect(provider.mediaSegment(at: 93) == nil)
+        #expect(producer.restarts == [90, 50])
+    }
+
     @Test("a seek AVPlayer serves from its own buffer opens no window")
     func inBufferSeekKeepsTheUsualPath() {
         let cache = SegmentCache(forwardWindow: 40, backwardWindow: 40)

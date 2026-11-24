@@ -4460,6 +4460,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
         provider?.noteSeekTarget(segmentIndexForPlaylistTime(seconds))
     }
 
+    /// AVPlayer's time jumped to playlist time `seconds` (`VideoSegmentProvider.noteTimeJump`).
+    func noteTimeJump(playlistTime seconds: Double) {
+        provider?.noteTimeJump(segmentIndexForPlaylistTime(seconds))
+    }
+
     func producerCoversPlaylistTime(_ seconds: Double) -> Bool {
         guard let prov = provider else { return true }
         return prov.activeMarchCovers(segmentIndexForPlaylistTime(seconds))
