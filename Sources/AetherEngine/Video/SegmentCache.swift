@@ -984,6 +984,8 @@ final class SegmentCache: @unchecked Sendable {
     /// A volatile segment the lead now spans (a back-seek into history, a band a shrink let go) is
     /// reclaimed nearest-first, ahead of the target before behind it, only while the counted memory
     /// stays within the goal (W3171 M1): the rest stays volatile, where a purge is the remake path.
+    /// The segments the player reads next are reclaimed first by making the counted far lead, then
+    /// the behind band, volatile (W3173 D-M1), so a purge never leaves a hole the player reaches soon.
     /// So a reclaim never asks for a spill; only counted segments are spilled, by `finishRebalance`,
     /// off the lock. Scrub-pinned bytes outside the counted lead count too (W3171 M2).
     private func rebalanceMemoryLocked() -> MemoryRebalance {
@@ -995,6 +997,7 @@ final class SegmentCache: @unchecked Sendable {
         var counted = inProgressMemoryBytesLocked()
         var countedIDs = Set<UInt64>()
         var behindBand: [(index: Int, buffer: SegmentMemoryBuffer, bytes: Int)] = []
+        var farLead: [(index: Int, buffer: SegmentMemoryBuffer, bytes: Int)] = []
         var reclaimable: [(index: Int, buffer: SegmentMemoryBuffer, bytes: Int)] = []
         var history: [(index: Int, bytes: Int)] = []
         var purged: [Int] = []
@@ -1008,6 +1011,7 @@ final class SegmentCache: @unchecked Sendable {
                     counted += bytes
                     countedIDs.insert(buffer.id)
                     if target >= 0, k < target { behindBand.append((k, buffer, bytes)) }
+                    if target >= 0, k > target + forwardWindow { farLead.append((k, buffer, bytes)) }
                 } else {
                     purged.append(k)
                 }
@@ -1036,11 +1040,27 @@ final class SegmentCache: @unchecked Sendable {
                 history.append((item.index, item.bytes))
             }
         }
+        // What the player reads next (target ... target + forwardWindow) displaces, without a write,
+        // the counted entries it reads last: the far lead farthest-first, then the behind band
+        // farthest-first (W3173 D-M1). A scrub-pinned one frees nothing, so it stays.
+        var displaceable = (farLead.sorted { $0.index > $1.index } + behindBand.sorted { $0.index < $1.index })
+            .filter { !$0.buffer.isWantedVolatile && !$0.buffer.hasLastingPin }
+        var displaceableBytes = displaceable.reduce(0) { $0 + $1.bytes }
         var full = false
         for item in reclaimable.sorted(by: { ($0.index < target ? 1 : 0, abs($0.index - target))
                                              < ($1.index < target ? 1 : 0, abs($1.index - target)) }) {
             // A scrub-pinned segment's bytes are counted already.
             let cost = item.buffer.hasLastingPin ? 0 : item.bytes
+            let readsNext = item.index >= target && item.index <= target + forwardWindow
+            if !full, readsNext, counted + cost > state.goal, counted + cost - displaceableBytes <= state.goal {
+                while counted + cost > state.goal, !displaceable.isEmpty {
+                    let victim = displaceable.removeFirst()
+                    victim.buffer.setWantsVolatile(true)
+                    counted -= victim.bytes
+                    displaceableBytes -= victim.bytes
+                    history.append((victim.index, victim.bytes))
+                }
+            }
             if !full, counted + cost <= state.goal {
                 if item.buffer.setWantsVolatile(false) { counted += cost } else { purged.append(item.index) }
             } else {
