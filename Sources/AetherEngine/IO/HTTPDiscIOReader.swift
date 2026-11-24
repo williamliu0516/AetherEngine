@@ -19,7 +19,7 @@ import Foundation
 /// A source the host warmed with `AetherEngine.prewarm` (#551) is read out of those bytes first
 /// (#647): the warm has already stated the size and proven range support, so the reader neither
 /// probes nor refetches the head, and its first request starts at the warm frontier.
-final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Sendable {
+final class HTTPDiscIOReader: IOReader, ReadInterruptibleIOReader, SourceTransferCounting, @unchecked Sendable {
 
     private let url: URL
     private let extraHeaders: [String: String]
@@ -45,6 +45,8 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
     /// must be able to set it from another thread while a read is in flight.
     private let cancelLock = NSLock()
     private var cancelled = false
+    /// W3153: bumped by `interruptRead`; a fetch started before the bump gives up, later ones run.
+    private var readInterrupts: UInt64 = 0
     /// This reader's own share of `lifetimeFetchedBytes`: every response body `fetchWithRetry`
     /// received, a rejected or retried one included, since it crossed the link either way.
     private let transferLock = NSLock()
@@ -210,6 +212,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
 
     func read(_ outBuffer: UnsafeMutablePointer<UInt8>?, size n: Int32) -> Int32 {
         guard let out = outBuffer, n > 0 else { return -1 }
+        cancelLock.lock(); let interrupts = readInterrupts; cancelLock.unlock()
         lock.lock(); defer { lock.unlock() }
         if position >= totalSize { return 0 }
 
@@ -233,7 +236,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
             // Stop at the next warmed span: its bytes are already here.
             let limit = residentSpans.lazy.map(\.start).filter { $0 > self.position }.min() ?? totalSize
             let want = Int(min(Int64(currentChunkSize), limit - position))
-            guard want > 0, let data = fetchWithRetry(offset: position, length: want), !data.isEmpty else {
+            guard want > 0, let data = fetchWithRetry(offset: position, length: want, interrupts: interrupts), !data.isEmpty else {
                 return -1
             }
             bufferStart = position
@@ -269,6 +272,13 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
 
     func close() { session.invalidateAndCancel() }
 
+    /// W3153: ends the fetch in flight (its read returns -1) without the latch `cancel` sets, so the
+    /// engine reads on through this reader after a restart.
+    func interruptRead() {
+        cancelLock.lock(); readInterrupts &+= 1; cancelLock.unlock()
+        session.getAllTasks { $0.forEach { $0.cancel() } }
+    }
+
     func cancel() {
         cancelLock.lock(); cancelled = true; cancelLock.unlock()
         session.getAllTasks { $0.forEach { $0.cancel() } }
@@ -291,10 +301,10 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
     /// 206 that starts somewhere else places its body at `position` regardless, corrupting the disc
     /// structure or media stream read through it (audit NET-9). The body is also trimmed to `length`
     /// in case the server sent more than asked.
-    private func fetchWithRetry(offset: Int64, length: Int) -> Data? {
+    private func fetchWithRetry(offset: Int64, length: Int, interrupts: UInt64) -> Data? {
         var attempt = 0
         while true {
-            cancelLock.lock(); let stop = cancelled; cancelLock.unlock()
+            cancelLock.lock(); let stop = cancelled || readInterrupts != interrupts; cancelLock.unlock()
             if stop { return nil }
             let response = Self.rangeGet(url: url, extraHeaders: extraHeaders, session: session,
                                          timeout: requestTimeout, offset: offset, length: length)

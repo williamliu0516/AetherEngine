@@ -4,7 +4,7 @@ import Foundation
 /// base reader as a single continuous, seekable stream. Used to concatenate a
 /// DVD title set's VOBs (their absolute offsets inside the ISO) into the
 /// contiguous MPEG-PS stream the demuxer expects.
-final class ConcatIOReader: IOReader, @unchecked Sendable {
+final class ConcatIOReader: IOReader, ReadInterruptibleIOReader, @unchecked Sendable {
     /// An extent in the base reader: absolute byte `offset` and `length`.
     struct Extent { let offset: Int64; let length: Int64 }
 
@@ -80,6 +80,9 @@ final class ConcatIOReader: IOReader, @unchecked Sendable {
     // Forward cancel to the base (mirrors makeIndependentReader) so teardown unblocks a
     // read parked inside base.read() on a network source; close() being a no-op does not.
     func cancel() { base.cancel() }
+
+    /// W3153: a restart's interrupt reaches the base the same way, without its teardown cancel.
+    func interruptRead() { base.interruptReadInFlight() }
 
     /// Vend a second concat reader over an independent cursor of the base, so
     /// the engine's side demuxer (embedded subtitles) and scrub preview can read

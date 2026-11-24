@@ -182,8 +182,9 @@ final class CustomIOReaderBridge: AVIOProvider, @unchecked Sendable {
             return readInFlight
         }
         guard cancelHost, !isClosed else { return }
-        // The host's contract for a reader the engine goes on reading through: unblock only.
-        callingHost { reader.cancel() }
+        // The host's contract for a reader the engine goes on reading through: unblock only. The
+        // engine's own readers, whose cancel is terminal, end just this read (W3153).
+        callingHost { reader.interruptReadInFlight() }
     }
 
     func endReadInterrupt() {

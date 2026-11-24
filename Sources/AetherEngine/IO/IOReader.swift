@@ -66,6 +66,27 @@ extension TimeSeekableIOReader {
     var segmentStartTimesSeconds: [Double] { [] }
 }
 
+/// W3153: an engine reader whose `cancel()` is terminal (teardown stops its work for good) but which
+/// the engine goes on reading through after a restart. `interruptRead` ends the read in flight only
+/// (it returns -1); the reader stays usable, and the next read or seek works as if nothing happened.
+/// Host readers without it get `cancel()`, which the `IOReader` contract already asks to be
+/// unblock-only.
+protocol ReadInterruptibleIOReader: IOReader {
+    func interruptRead()
+}
+
+extension IOReader {
+    /// Ends the read in flight without invalidating the reader: `interruptRead` where the reader has
+    /// one, else the host's unblock-only `cancel()`.
+    func interruptReadInFlight() {
+        if let interruptible = self as? ReadInterruptibleIOReader {
+            interruptible.interruptRead()
+        } else {
+            cancel()
+        }
+    }
+}
+
 public extension IOReader {
     func cancel() {}
     func makeIndependentReader() -> IOReader? { nil }

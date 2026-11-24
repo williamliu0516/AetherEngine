@@ -78,7 +78,7 @@ public final class HTTPDiscDirectoryReader: DiscDirectoryReader {
 /// Independent files presented as one contiguous, seekable byte stream: the clips of a title in a disc
 /// folder. Files open on demand and only the most recently used few stay open, because a multi-clip
 /// title can run to dozens of clips and needs no more than one connection at a time to play.
-final class MultiFileConcatIOReader: IOReader, SourceTransferCounting, @unchecked Sendable {
+final class MultiFileConcatIOReader: IOReader, ReadInterruptibleIOReader, SourceTransferCounting, @unchecked Sendable {
     struct Segment {
         let path: String
         let size: Int64
@@ -229,6 +229,16 @@ final class MultiFileConcatIOReader: IOReader, SourceTransferCounting, @unchecke
         let readers = Array(open.values)
         stateLock.unlock()
         readers.forEach { $0.cancel() }
+    }
+
+    /// W3153: a restart's interrupt ends the read parked in an open file reader and keeps every
+    /// reader usable (a file reader's teardown cancel may be terminal). A file still opening when it
+    /// arrives is not reached: that read finishes its open and is asked again.
+    func interruptRead() {
+        stateLock.lock()
+        let readers = Array(open.values)
+        stateLock.unlock()
+        readers.forEach { $0.interruptReadInFlight() }
     }
 
     func makeIndependentReader() -> IOReader? {
