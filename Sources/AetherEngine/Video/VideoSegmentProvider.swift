@@ -1366,7 +1366,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
 
     /// The lowest index a window slide may unlink, which is not always the playlist's new first visible.
     ///
-    /// A serve holds a URL, not a file handle: `mediaSegmentURL` hands `peekURL`'s result to a response
+    /// A serve holds a URL, not a file handle: `mediaSegmentURL` hands `fileURLIfOnDisk`'s result to a response
     /// that stats and opens the file afterwards, so unlinking the segment currently being served turns
     /// into a 404 for an index the playlist offered when it was asked for. And a viewer riding the floor
     /// puts the slide exactly one segment above the fetch point routinely, not rarely (measured: every
@@ -1485,7 +1485,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         let segs = segments
         stateLock.unlock()
         guard let idx = Self.thumbnailSegmentIndex(atSeconds: seconds, segments: segs) else { return nil }
-        guard let url = cache.peekURL(index: idx) else { return nil }
+        guard let url = cache.fileURLIfOnDisk(index: idx) else { return nil }
         return (idx, segs[idx].startSeconds, segs[idx].durationSeconds, url)
     }
 
@@ -1554,9 +1554,10 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         guard index >= 0, index < currentSegmentCount else { return nil }
         // A request a seek left behind is answered from the cache or not at all here (`StaleSeekFetchGuard`); a miss
         // falls through to `mediaSegmentSource`, which refuses it.
-        if !isLive, isStaleAfterSeek(index) { return cache.peekURL(index: index) }
+        // A memory segment (W3167) answers nil here and is served from `mediaSegmentSource`'s data.
+        if !isLive, isStaleAfterSeek(index) { return cache.fileURLIfOnDisk(index: index) }
         handleTargetChange(to: index)
-        return cache.peekURL(index: index)
+        return cache.fileURLIfOnDisk(index: index)
     }
 
     /// Total media-segment requests seen (both serve paths). The #65 consumer re-engage watchdog
@@ -1603,7 +1604,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// already stored is not starved, and re-anchoring throws away the pump's forward work to
     /// rebuild what it already has.
     func hasStoredSegment(at index: Int) -> Bool {
-        return cache.peekURL(index: index) != nil
+        return cache.isStored(index: index)
     }
 
     /// What to do with a request for a non-resident index, given how often pumps have folded it (#358).
@@ -1702,7 +1703,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         // open the index, because the boundaries move with the producer's base, so the first fold
         // asks for exactly that. A second fold is that repair reproducing its own trigger, and then
         // the source has no way past this point.
-        if !isLive, cache.peekURL(index: index) == nil {
+        if !isLive, !cache.isStored(index: index) {
             let folds = cache.foldCount(index)
             switch VideoSegmentProvider.foldedTargetDecision(
                 folds: folds, alreadyReanchoredHere: lastRestartIndex == index
@@ -1734,7 +1735,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         if previousTarget >= 0, index < previousTarget - 2, let restart = restartHandler {
             // Cache gate: backwardWindow=20 covers Continuous-Audio handover refetches (~7-10 segments
             // backward); unconditional proactive restart re-armed the FLAC bridge and caused audible glitches.
-            if cache.peekURL(index: index) != nil {
+            if cache.isStored(index: index) {
                 // A sequential origin has no restart to offer (its pump can only read from byte 0)
                 // and keeps every segment it cut, so a resident target is served from the cache.
                 // The contiguity scan below would read the plan indices its cutter left as holes

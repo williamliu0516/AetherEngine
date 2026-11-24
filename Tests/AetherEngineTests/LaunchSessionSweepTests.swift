@@ -62,7 +62,7 @@ struct LaunchSessionSweepTests {
 
         #expect(FileManager.default.fileExists(atPath: young.sessionDir.path))
         #expect(FileManager.default.fileExists(atPath: old.sessionDir.path))
-        #expect(old.peekURL(index: 0) != nil)
+        #expect(old.fileURLIfOnDisk(index: 0) != nil)
     }
 
     @Test("The host's launch call sweeps the engine's own folder")

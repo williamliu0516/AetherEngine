@@ -98,7 +98,7 @@ struct Issue412VideoReachTests {
         try adopt(cache, index: 10, reach: SegmentCache.VideoReach.none)
         #expect(cache.videoReach(10) == SegmentCache.VideoReach.none)
         cache.declareTarget(50)
-        #expect(cache.peekURL(index: 10) == nil)
+        #expect(cache.fileURLIfOnDisk(index: 10) == nil)
         #expect(cache.videoReach(10) == nil)
     }
 }

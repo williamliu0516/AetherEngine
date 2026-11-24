@@ -1091,17 +1091,19 @@ final class SegmentCache: @unchecked Sendable {
     func indexRange() -> (Int, Int)? {
         condition.lock()
         defer { condition.unlock() }
+        dropEmptiedMemoryLocked()
         guard !entries.isEmpty else { return nil }
         let keys = entries.keys
         return (keys.min()!, keys.max()!)
     }
 
-    /// Contiguous runs of segment indexes that are resident on disk. A 2026-09-02 field session
+    /// Contiguous runs of segment indexes that are resident, in files or in memory. A 2026-09-02 field session
     /// retained 64 segments across several islands, so min/max alone cannot describe the picture
     /// a host can truthfully mark as loaded.
     func residentIndexRanges() -> [ClosedRange<Int>] {
         condition.lock()
         defer { condition.unlock() }
+        dropEmptiedMemoryLocked()
         let indexes = entries.keys.sorted()
         guard let first = indexes.first else { return [] }
         var ranges: [ClosedRange<Int>] = []
@@ -1250,6 +1252,7 @@ final class SegmentCache: @unchecked Sendable {
 
     /// Must be called with condition held.
     private func frontierLocked(from startIdx: Int) -> Int {
+        dropEmptiedMemoryLocked()
         var k = startIdx
         while entries[k] != nil { k += 1 }
         return k - 1
@@ -1265,6 +1268,7 @@ final class SegmentCache: @unchecked Sendable {
     func contiguousBackwardFloor(from topIdx: Int) -> Int {
         condition.lock()
         defer { condition.unlock() }
+        dropEmptiedMemoryLocked()
         var k = topIdx
         while entries[k] != nil { k -= 1 }
         return k + 1
@@ -1275,6 +1279,7 @@ final class SegmentCache: @unchecked Sendable {
     var highestResidentIndex: Int? {
         condition.lock()
         defer { condition.unlock() }
+        dropEmptiedMemoryLocked()
         return entries.keys.max()
     }
 
@@ -1292,7 +1297,7 @@ final class SegmentCache: @unchecked Sendable {
         return entries.count
     }
 
-    /// On-disk bytes (not RAM); useful for memprobe alongside RSS.
+    /// Bytes of every stored segment, in files and in memory (`storedDiskBytes`, `memoryBytes`).
     var totalBytes: Int {
         condition.lock()
         defer { condition.unlock() }
@@ -1338,8 +1343,10 @@ final class SegmentCache: @unchecked Sendable {
     }
 
     /// Must be called with condition held.
+    /// The segment being written counts when it is in memory (review L2: a burst segment larger than
+    /// the last one must not pass unseen).
     private func currentForwardBytes() -> Int {
-        var bytes = 0
+        var bytes = inProgressMemoryBytesLocked()
         for (k, b) in entryBytes where k >= currentTargetIndex { bytes += b }
         return bytes
     }
@@ -1372,7 +1379,7 @@ final class SegmentCache: @unchecked Sendable {
         let hasHeadroom = headroomCap.map { entries.count < $0 } ?? true
         if !doomed.isEmpty { condition.broadcast() }
         condition.unlock()
-        for url in doomed { try? FileManager.default.removeItem(at: url) }
+        for segment in doomed { segment.discard() }
         if !doomed.isEmpty { onResidentSetChanged?() }
         return hasHeadroom
     }
@@ -1384,7 +1391,7 @@ final class SegmentCache: @unchecked Sendable {
         let doomed = pruneOutsideWindow()
         condition.broadcast()
         condition.unlock()
-        for url in doomed { try? FileManager.default.removeItem(at: url) }
+        for segment in doomed { segment.discard() }
         if !doomed.isEmpty { onResidentSetChanged?() }
     }
 
@@ -1413,28 +1420,28 @@ final class SegmentCache: @unchecked Sendable {
     /// is never evicted even when it alone exceeds the budget. Nearest-first eviction from the far
     /// ends keeps each side of the resident span contiguous, so the provider's residency gate
     /// (a resident backward target = no producer restart) holds across the whole retained span.
-    private func pruneOutsideWindow() -> [URL] {
+    private func pruneOutsideWindow() -> [StagedSegment] {
         if let limits = nativeLiveDVRPolicy?.snapshot {
             var keptBytes = entryBytes.reduce(0) { $0 + (isNativeLiveMandatory($1.key) ? $1.value : 0) }
-            var doomed: [URL] = []
+            var doomed: [StagedSegment] = []
             // Newest-first produces a contiguous playable suffix, even when an older consumer
             // band must remain pinned. The published DVR range already walks this suffix.
             for index in entries.keys.sorted(by: >) where !isNativeLiveMandatory(index) {
                 let bytes = entryBytes[index] ?? 0
                 if index >= nativeLiveRetentionFloor && bytes <= max(0, limits.retentionBytes - keptBytes) {
                     keptBytes += bytes
-                } else if let url = entries.removeValue(forKey: index) {
+                } else if let stored = entries.removeValue(forKey: index) {
                     _totalBytes -= bytes
                     entryBytes.removeValue(forKey: index)
                     videoReaches.removeValue(forKey: index)
-                    doomed.append(url)
+                    doomed.append(stored)
                 }
             }
             return doomed
         }
         let lo = currentTargetIndex - backwardWindow
         let hi = max(currentTargetIndex + forwardWindow, _highestStoredIndex)
-        var doomed: [URL] = []
+        var doomed: [StagedSegment] = []
         if retentionBudgetBytes > 0 {
             var extras: [(index: Int, bytes: Int)] = []
             var keptBytes = 0
@@ -1451,23 +1458,23 @@ final class SegmentCache: @unchecked Sendable {
             for (k, bytes) in extras {
                 if keptBytes + bytes <= retentionBudgetBytes {
                     keptBytes += bytes
-                } else if let url = entries[k] {
+                } else if let stored = entries[k] {
                     _totalBytes -= bytes
                     entryBytes.removeValue(forKey: k)
                     entries.removeValue(forKey: k)
                     videoReaches.removeValue(forKey: k)
-                    doomed.append(url)
+                    doomed.append(stored)
                 }
             }
             return doomed
         }
-        for (k, url) in entries {
+        for (k, stored) in entries {
             if k < lo || k > hi {
-                _totalBytes -= entryBytes[k] ?? byteSize(of: url)
+                _totalBytes -= entryBytes[k] ?? byteSize(of: stored)
                 entryBytes.removeValue(forKey: k)
                 entries.removeValue(forKey: k)
                 videoReaches.removeValue(forKey: k)
-                doomed.append(url)
+                doomed.append(stored)
             }
         }
         // Collected under the lock, deleted by the caller AFTER
@@ -1501,6 +1508,30 @@ final class SegmentCache: @unchecked Sendable {
         let values = try? url.resourceValues(forKeys: [.fileSizeKey])
         return values?.fileSize ?? 0
     }
+
+    private func byteSize(of stored: StagedSegment) -> Int {
+        switch stored {
+        case .file(let url): return byteSize(of: url)
+        case .memory(let buffer): return buffer.length
+        }
+    }
+
+    /// Must be called with condition held. Forgets the memory segments the kernel emptied (review
+    /// M2), so the residency walks never count purged content as resident: a frontier that walked
+    /// over one kept the producer for a back-seek whose consumer then met a 503 and restarted with an
+    /// empty buffer (AE#408). One `vm_purgable_control` query per volatile segment. The resident-set
+    /// callback is not called from here: these walks run inside the callback's own readers; the next
+    /// store, target change or prune reports the set.
+    private func dropEmptiedMemoryLocked() {
+        guard memoryBudget != nil else { return }
+        for (k, stored) in entries {
+            guard case .memory(let buffer) = stored, buffer.isVolatile, buffer.isEmptied else { continue }
+            entries.removeValue(forKey: k)
+            _totalBytes -= entryBytes.removeValue(forKey: k) ?? 0
+            videoReaches.removeValue(forKey: k)
+            _purgedSegments += 1
+        }
+    }
 }
 
 /// A segment as the loopback server gets it: complete bytes, or a reader over one being written.
@@ -1511,14 +1542,22 @@ enum SegmentSource {
 
 /// Reads a segment while its producer is still writing it.
 ///
-/// The muxer appends each flushed fragment (moof+mdat) to the staging file and never rewrites what
-/// it wrote, and adoption renames the file as it stands. So a descriptor opened on the staging file
-/// reads a growing prefix of the final segment, the rename does not disturb it, and the read is
-/// complete at the byte count the cache records for the adoption. A segment the producer abandons
-/// reads as `.abandoned`, and the server closes the connection so AVPlayer asks for it again.
+/// The muxer appends each flushed fragment (moof+mdat) to the staged bytes and never rewrites what
+/// it wrote, and adoption takes them as they stand. So a reader reads a growing prefix of the final
+/// segment, adoption does not disturb it, and the read is complete at the byte count the cache
+/// records for the adoption. A segment the producer abandons reads as `.abandoned`, and the server
+/// closes the connection so AVPlayer asks for it again.
+///
+/// Concurrency (review M7): a staging file is ordered by the kernel (`fstat` then `pread` on its own
+/// descriptor, which a rename does not disturb). A memory buffer is appended to on the producer's
+/// thread while this reads on a server thread; both go through the buffer's lock, its length grows
+/// only after the bytes are in place, and a read copies under that lock, so a reader never sees a
+/// length ahead of its bytes nor holds a region a growing append replaced. The reader keeps the
+/// buffer alive, so an abandoned segment's bytes are freed when its last reader lets go. A spill
+/// never picks the segment being written (it is not an entry until adopted).
 final class ProgressiveSegmentReader: @unchecked Sendable {
     let index: Int
-    let stagingPath: URL
+    let staged: StagedSegment
     private let fd: Int32
     private weak var cache: SegmentCache?
     private(set) var offset: Int64 = 0
@@ -1529,45 +1568,75 @@ final class ProgressiveSegmentReader: @unchecked Sendable {
         case abandoned
     }
 
-    init?(cache: SegmentCache, index: Int, stagingPath: URL) {
-        let fd = open(stagingPath.path, O_RDONLY)
-        guard fd >= 0 else { return nil }
-        self.fd = fd
-        self.cache = cache
-        self.index = index
-        self.stagingPath = stagingPath
+    convenience init?(cache: SegmentCache, index: Int, stagingPath: URL) {
+        self.init(cache: cache, index: index, staged: .file(stagingPath))
     }
 
-    deinit { close(fd) }
+    init?(cache: SegmentCache, index: Int, staged: StagedSegment) {
+        switch staged {
+        case .file(let url):
+            let fd = open(url.path, O_RDONLY)
+            guard fd >= 0 else { return nil }
+            self.fd = fd
+        case .memory:
+            self.fd = -1
+        }
+        self.cache = cache
+        self.index = index
+        self.staged = staged
+    }
+
+    deinit { if fd >= 0 { close(fd) } }
+
+    /// Bytes written so far; nil when a memory segment was emptied.
+    private func writtenLength() -> Int64? {
+        switch staged {
+        case .file:
+            var st = stat()
+            return fstat(fd, &st) == 0 ? Int64(st.st_size) : 0
+        case .memory(let buffer):
+            return buffer.isEmptied ? nil : Int64(buffer.length)
+        }
+    }
+
+    /// Up to `maxBytes` past `offset`: empty when nothing new is written, nil when the bytes are gone.
+    private func readAvailable(maxBytes: Int) -> Data? {
+        switch staged {
+        case .file:
+            var st = stat()
+            guard fstat(fd, &st) == 0, st.st_size > offset else { return Data() }
+            let count = Int(min(Int64(maxBytes), st.st_size - offset))
+            var data = Data(count: count)
+            let read = data.withUnsafeMutableBytes { pread(fd, $0.baseAddress, count, off_t(offset)) }
+            guard read > 0 else { return Data() }
+            if read < count { data.removeSubrange(read ..< count) }
+            return data
+        case .memory(let buffer):
+            return buffer.copyBytes(from: Int(offset), maxBytes: maxBytes)
+        }
+    }
 
     /// The next bytes past `offset`, waiting for the producer to write them. `.finished` once the
-    /// sealed segment is read to its end; `.abandoned` when the producer gave it up, or wrote nothing
-    /// for `idleTimeout` (a wedged producer must not hold a connection forever).
+    /// sealed segment is read to its end; `.abandoned` when the producer gave it up, its memory was
+    /// emptied, or it wrote nothing for `idleTimeout` (a wedged producer must not hold a connection
+    /// forever).
     func next(maxBytes: Int = 256 * 1024, pollInterval: TimeInterval = 0.02,
               idleTimeout: TimeInterval = 60) -> Next {
         let deadline = Date().addingTimeInterval(idleTimeout)
         while true {
-            var st = stat()
-            let statOK = fstat(fd, &st) == 0
-            if statOK, st.st_size > offset {
-                let count = Int(min(Int64(maxBytes), st.st_size - offset))
-                var data = Data(count: count)
-                let read = data.withUnsafeMutableBytes { pread(fd, $0.baseAddress, count, off_t(offset)) }
-                if read > 0 {
-                    if read < count { data.removeSubrange(read ..< count) }
-                    offset += Int64(read)
-                    return .bytes(data)
-                }
+            guard let data = readAvailable(maxBytes: maxBytes) else { return .abandoned }
+            if !data.isEmpty {
+                offset += Int64(data.count)
+                return .bytes(data)
             }
-            switch cache?.inProgressState(index: index, stagingPath: stagingPath) ?? .abandoned {
+            switch cache?.inProgressState(index: index, key: staged.key) ?? .abandoned {
             case .writing:
                 break
             case .sealed(let bytes):
                 if offset >= Int64(bytes) { return .finished }
-                // The last fragment can land with the seal, after the stat above, so stat again and
-                // read on. A file shorter than its recorded size is not a state to spin in.
-                var sealedStat = stat()
-                if fstat(fd, &sealedStat) == 0, sealedStat.st_size > offset { continue }
+                // The last fragment can land with the seal, after the read above, so look again and
+                // read on. Staged bytes shorter than their recorded size are not a state to spin in.
+                if let length = writtenLength(), length > offset { continue }
                 return .abandoned
             case .abandoned:
                 return .abandoned

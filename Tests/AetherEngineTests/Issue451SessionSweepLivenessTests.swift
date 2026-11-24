@@ -63,7 +63,7 @@ struct Issue451SessionSweepLivenessTests {
         let live = SegmentCache(baseDirectory: base)
         defer { live.close() }
         live.store(index: 0, data: Data(repeating: 0xAA, count: 128))
-        #expect(live.peekURL(index: 0) != nil)
+        #expect(live.fileURLIfOnDisk(index: 0) != nil)
 
         // An hour into a film: the directory's creation date is the session's start.
         #expect(backdate(live.sessionDir), "the fixture must actually be older than the cutoff")
@@ -73,7 +73,7 @@ struct Issue451SessionSweepLivenessTests {
 
         #expect(FileManager.default.fileExists(atPath: live.sessionDir.path),
                 "the running session's directory must survive a sibling's construction")
-        #expect(live.peekURL(index: 0) != nil,
+        #expect(live.fileURLIfOnDisk(index: 0) != nil,
                 "and its stored segments with it")
     }
 
@@ -107,13 +107,13 @@ struct Issue451SessionSweepLivenessTests {
         let c = SegmentCache(baseDirectory: base)
         defer { c.close() }
         c.store(index: 4, data: Data(repeating: 0xBB, count: 512))
-        #expect(c.peekURL(index: 4) != nil)
+        #expect(c.fileURLIfOnDisk(index: 4) != nil)
         #expect(c.totalBytes == 512)
 
         // Whatever removed it (a sibling's sweep, the OS reclaiming tmp) is outside this class.
-        if let url = c.peekURL(index: 4) { try? FileManager.default.removeItem(at: url) }
+        if let url = c.fileURLIfOnDisk(index: 4) { try? FileManager.default.removeItem(at: url) }
 
-        #expect(c.peekURL(index: 4) == nil,
+        #expect(c.fileURLIfOnDisk(index: 4) == nil,
                 "a URL handed to a response must name a file that exists")
         #expect(c.peek(index: 4) == nil)
         #expect(c.totalBytes == 0, "the byte ledger must drop what the disk no longer holds")
@@ -127,12 +127,12 @@ struct Issue451SessionSweepLivenessTests {
         let c = SegmentCache(baseDirectory: base)
         defer { c.close() }
         c.store(index: 2, data: Data(repeating: 0xDD, count: 64))
-        if let url = c.peekURL(index: 2) { try? FileManager.default.removeItem(at: url) }
+        if let url = c.fileURLIfOnDisk(index: 2) { try? FileManager.default.removeItem(at: url) }
 
         // The serve that finds nothing answers a retriable 503; without dropping the entry, the
         // next fetch takes the same branch and the producer is never asked to make it again.
         #expect(c.fetch(index: 2, timeout: 0.05) == nil)
-        #expect(c.peekURL(index: 2) == nil)
+        #expect(c.fileURLIfOnDisk(index: 2) == nil)
         #expect(c.count == 0)
 
         c.store(index: 2, data: Data(repeating: 0xEE, count: 96))
@@ -151,7 +151,7 @@ struct Issue451SessionSweepLivenessTests {
         try? FileManager.default.removeItem(at: c.sessionDir)
 
         c.store(index: 7, data: Data(repeating: 0xCC, count: 256))
-        #expect(c.peekURL(index: 7) != nil,
+        #expect(c.fileURLIfOnDisk(index: 7) != nil,
                 "a session must stay writable after something else deleted its directory")
         #expect(c.peek(index: 7)?.count == 256)
     }

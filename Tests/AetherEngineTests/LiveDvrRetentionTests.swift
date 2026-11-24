@@ -39,13 +39,13 @@ final class LiveDvrRetentionTests: XCTestCase {
             cache.declareTarget(i)
         }
 
-        let resident = (0..<total).filter { cache.peekURL(index: $0) != nil }
+        let resident = (0..<total).filter { cache.fileURLIfOnDisk(index: $0) != nil }
         XCTAssertEqual(resident.count, total,
                        "the budget covers this run, so nothing should have been evicted")
 
         // The specific rewind the old behaviour could not serve: 100 segments back, i.e. 200 s
         // inside a 600 s advertised window.
-        XCTAssertNotNil(cache.peekURL(index: total - 1 - 100))
+        XCTAssertNotNil(cache.fileURLIfOnDisk(index: total - 1 - 100))
     }
 
     /// The budget, not backwardWindow, is what bounds the depth. Past it, eviction resumes
@@ -63,7 +63,7 @@ final class LiveDvrRetentionTests: XCTestCase {
             cache.declareTarget(i)
         }
 
-        let resident = (0..<total).filter { cache.peekURL(index: $0) != nil }
+        let resident = (0..<total).filter { cache.fileURLIfOnDisk(index: $0) != nil }
         let head = total - 1
 
         // Bounded: nowhere near the full run.
@@ -72,7 +72,7 @@ final class LiveDvrRetentionTests: XCTestCase {
         XCTAssertGreaterThan(resident.count, 21)
         // The hard window around the consumer is never traded away for history.
         for i in (head - 20)...head {
-            XCTAssertNotNil(cache.peekURL(index: i), "hard-window segment \(i) must stay resident")
+            XCTAssertNotNil(cache.fileURLIfOnDisk(index: i), "hard-window segment \(i) must stay resident")
         }
     }
 

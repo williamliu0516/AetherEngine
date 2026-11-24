@@ -41,9 +41,9 @@ struct SegmentCacheTests {
             return url
         }
         c.adopt(index: 3, stagingPath: try staged(100, fill: 0x01), byteCount: 100)
-        let first = try #require(c.peekURL(index: 3))
+        let first = try #require(c.fileURLIfOnDisk(index: 3))
         c.adopt(index: 3, stagingPath: try staged(250, fill: 0x02), byteCount: 250)
-        let second = try #require(c.peekURL(index: 3))
+        let second = try #require(c.fileURLIfOnDisk(index: 3))
 
         // A reader that resolved the first URL and finds it gone must not be able to drop the
         // second adoption, which it could while both generations shared one path.

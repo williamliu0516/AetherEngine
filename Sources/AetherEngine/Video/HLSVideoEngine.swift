@@ -1687,9 +1687,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
             forwardWindow: forwardWindowSegments,
             retentionBudgetBytes: retentionBudget,
             nativeLiveDVRPolicy: isLiveSession ? nativeLiveDVRPolicy : nil,
+            // W3167: a VOD session keeps its lead in memory up to B instead of writing it to disk;
+            // live always writes files (review H1).
+            memoryBudget: isLiveSession ? nil : .system,
             onResidentSetChanged: { [weak self] in self?.noteResidentSetChanged() }
         )
-        claim.track { [weak segmentCache] in segmentCache?.totalBytes ?? 0 }
+        // The claim is on the tmp volume, so it bills the segments in files, not those in memory (L6).
+        claim.track { [weak segmentCache] in segmentCache?.storedDiskBytes ?? 0 }
         self.retentionClaim = claim
         self.cache = segmentCache
         EngineLog.emit(

@@ -2009,7 +2009,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     // report can show the wedge and the recovery but not whether re-anchoring the
                     // producer could have helped at all, which is exactly what had to be inferred
                     // from two field logs.
-                    + "consumerTargetStored=\(cache.peekURL(index: cacheTarget) != nil ? "y" : "n") "
+                    + "consumerTargetStored=\(cache.isStored(index: cacheTarget) ? "y" : "n") "
                     + "highStored=\(cache.highestStoredIndex) cached=\(cache.count)"
                     + (wedgeDetector.lastTripFast ? " (fast path: fetch target + rendered clock both frozen)" : "")
                     + "; exiting pump for host re-anchor on AVPlayer position",
@@ -2270,6 +2270,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 audioMoovPrimeFrame: audioMoovPrimeFrame,
                 audioDelaySeconds: audioDelaySeconds,
                 onStorageExhausted: { [cache] in cache.noteStorageExhausted() },
+                // W3167: a VOD segment goes to memory while the cache's budget has room; live always
+                // writes files (review H1: nothing re-makes a purged segment behind a live edge).
+                memorySink: isLive ? nil : { [cache] index in cache.memorySegment(forIndex: index) },
+                onDiskBytesWritten: { [cache] bytes in cache.noteBytesWrittenToDisk(bytes) },
                 onInitCaptured: { [weak self] initBytes in
                     guard let self = self else { return }
                     if versionedInit {
@@ -2496,13 +2500,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
         // its full index; the teardown rule decides what happens to the in-flight segment instead.
         if checkShouldStop() { return nil }
         switch muxer.cutFragmentForNextSegment(newIdx) {
-        case .completed(let path, let bytesWritten):
+        case .completed(let segment, let bytesWritten):
             EngineLog.emit(
                 "[HLSSegmentProducer] seg-\(currentMuxerSegmentIndex).m4s captured (\(bytesWritten) B)",
                 category: .session, level: .verbose
             )
             cache.adopt(index: currentMuxerSegmentIndex,
-                        stagingPath: path,
+                        staged: segment,
                         byteCount: bytesWritten,
                         videoReach: takeVideoReach(forSegmentIndex: currentMuxerSegmentIndex))
             // AE#286: per-epoch head. cache.highestStoredIndex is monotonic across restarts and would
@@ -2734,7 +2738,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     private func noteSegmentInProgress(_ index: Int, muxer: MP4SegmentMuxer) {
         guard servesProgressively else { return }
-        cache.beginInProgress(index: index, stagingPath: muxer.stagingURL)
+        cache.beginInProgress(index: index, staged: muxer.staged)
     }
 
     private func abandonSegmentInProgress(_ index: Int) {
@@ -2750,7 +2754,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 "[HLSSegmentProducer] seg-\(idx).m4s captured (\(result.bytesWritten) B)",
                 category: .session, level: .verbose
             )
-            cache.adopt(index: idx, stagingPath: result.path,
+            cache.adopt(index: idx, staged: result.segment,
                         byteCount: result.bytesWritten,
                         videoReach: takeVideoReach(forSegmentIndex: idx))
             if isLive {
@@ -2777,7 +2781,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         // The partial segment is not adopted; a reader draining it is told before the file goes.
         abandonSegmentInProgress(idx)
         if let result = muxer.finalize() {
-            try? FileManager.default.removeItem(at: result.path)
+            result.segment.discard()
             EngineLog.emit(
                 "[HLSSegmentProducer] seg-\(idx).m4s partial at teardown (\(result.bytesWritten) B) discarded, not adopted",
                 category: .session

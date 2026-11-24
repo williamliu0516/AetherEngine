@@ -40,3 +40,8 @@ enum StagedSegment: @unchecked Sendable {
         if case .file(let url) = self { try? FileManager.default.removeItem(at: url) }
     }
 }
+
+extension StagedSegment: Equatable {
+    /// The same bytes: the same file, or the same buffer.
+    static func == (lhs: StagedSegment, rhs: StagedSegment) -> Bool { lhs.key == rhs.key }
+}
