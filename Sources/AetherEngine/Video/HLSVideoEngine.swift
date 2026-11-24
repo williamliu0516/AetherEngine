@@ -751,6 +751,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// The #79 / #169 restart's replacement demuxer, from before its open until the restart installs
     /// or drops it, so `stop()` can abort that open and the seek after it (audit SEG-3 follow-up).
     private var restartReopenDemuxer: Demuxer?
+    /// W3147: each restart's steps, for the host's seek report (`AetherEngine.seekRestartPhases`).
+    let seekPhaseLog = SeekRestartPhaseLog()
     /// Fires on live program-boundary rebase: `(newShiftSeconds, seamOutputSeconds)`. AetherEngine
     /// defers applying the shift until playback crosses `seamOutputSeconds` so the clock doesn't jump.
     var onPlaylistShiftRebased: (@Sendable (Double, Double) -> Void)?
@@ -1194,6 +1196,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Guarded by `restartLock`. The original load's reader stays engine-owned (AetherEngine closes it
     /// in stopInternal); only factory-vended replacements are owned here.
     var reopenCustomReader: IOReader?
+    /// W3147: a host-provided custom source's fresh reader (`IOReader.makeIndependentReader`) for a restart's #79 /
+    /// #169 reopen: such a source has no URL FFmpeg can open ("Protocol not found"), so without it the reopen failed
+    /// and the restart went on with the wedged demuxer. Returns nil when the reader cannot clone. nil for URL sources.
+    /// Set before `start()`; the vended reader is owned like `reopenCustomReader`.
+    var restartReopenReader: (@Sendable () -> (reader: IOReader, formatHint: String?)?)?
 
     /// Demuxed audio rendition reader for live HLS ingest. When the main demuxer finds no audio and
     /// this is non-nil, `start()` opens `sideAudioDemuxer` over it. Engine owns the side demuxer, not
@@ -2270,6 +2277,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         )
         self.provider = prov
         prov.restartServedHandler = { [weak self] start, end, event in self?.onRestartServedSegment?(start, end, event) }
+        prov.sourceServedHandler = { [weak self] idx in self?.seekPhaseLog.noteServed(index: idx) }
         // AE#520 round 2: the close reads it on the playlist-build thread, so it is a closure over a
         // mirror rather than a read of the item.
         prov.consumerBufferedSecondsProvider = consumerBufferedSecondsProvider
@@ -4514,6 +4522,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         retireProducer(old)
 
         let restartStart = DispatchTime.now()
+        let phaseID = seekPhaseLog.begin(segment: idx)
+        var reopenFailed = false
         func msSince(_ t: DispatchTime) -> Double {
             Double(DispatchTime.now().uptimeNanoseconds - t.uptimeNanoseconds) / 1_000_000
         }
@@ -4525,6 +4535,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // suspect-dead (#169) one, below.
         var activeDem = dem
         var freshDemuxer: Demuxer?
+        var freshReader: IOReader?
         var oldPumpExited = true
         if let old {
             oldPumpExited = Self.stopForRestart(
@@ -4548,6 +4559,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
             if !isLiveSession, sideAudioDemuxer == nil, let fresh = registerRestartReopenDemuxer(epoch: epoch) {
                 let reopenStart = DispatchTime.now()
                 do {
+                    if let vendReader = restartReopenReader {
+                        guard let vend = vendReader() else { throw DemuxerError.openFailed(code: -1) }
+                        freshReader = vend.reader
+                        try fresh.open(reader: vend.reader, formatHint: vend.formatHint,
+                                       profile: restartReopenProfile, isLive: false)
+                    } else {
                     // .restartReopen: bounded find_stream_info budget; the FULL playback budget was
                     // the bulk of a 44 s wedge-reopen over WAN (#93 residual). The pass itself must
                     // run so video_delay resolves, else B-frame dts arrive broken (#93 judder).
@@ -4557,6 +4574,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                         url: sourceURL, extraHeaders: sourceHTTPHeaders,
                         profile: restartReopenProfile,
                         isLive: false)
+                    }
                     dem.markClosed() // abort any wedged read now that the replacement is ready
                     freshDemuxer = fresh
                     activeDem = fresh
@@ -4571,6 +4589,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 } catch {
                     unregisterRestartReopenDemuxer(fresh)
                     fresh.close()
+                    freshReader?.close()
+                    freshReader = nil
+                    reopenFailed = true
                     EngineLog.emit(
                         "[HLSVideoEngine] restart at idx=\(idx): "
                         + (oldPumpExited ? "#169 suspect-dead demuxer" : "old producer wedged")
@@ -4604,6 +4625,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // Re-arm bridge PTS rebase so the encoder timeline starts from the new demuxer cursor.
         ab?.startSegment()
         seekMs = msSince(seekStart)
+        seekPhaseLog.noteSteps(phaseID, stop: stopWaitMs / 1000, reopen: reopenMs.map { $0 / 1000 },
+                               reopenFailed: reopenFailed, seek: seekMs / 1000)
 
         // Re-validate: a stop() landing during waits bumped sessionEpoch; don't resurrect into a torn-down session.
         restartLock.lock()
@@ -4612,6 +4635,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             restartLock.unlock()
             // #79: a reopened demuxer (replacing a wedged one) must not leak when stop() superseded us.
             freshDemuxer?.close()
+            freshReader?.close()
             EngineLog.emit(
                 "[HLSVideoEngine] restart at idx=\(idx): superseded by stop(), unwinding",
                 category: .session
@@ -4620,8 +4644,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
         }
         // #79: install the reopened demuxer only inside the validated section so makeProducer reads it and a
         // concurrent teardown can't race a resurrected demuxer into a torn-down session.
+        var replacedReader: IOReader?
         if let freshDemuxer {
             demuxer = freshDemuxer
+            if let freshReader { replacedReader = reopenCustomReader; reopenCustomReader = freshReader }
             retireDemuxer(dem)   // AE#443: nothing puts this one back, so the swap is already final
             // #433: the network axis belongs to the reader that is SERVING. The aborted one owned the
             // `.reconnecting` the host is still reading, and its pump can outlive this swap, so it is
@@ -4639,9 +4665,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
             recutMark = recutMark?.installing(producerEpoch: newProd.epoch, at: idx)
             anchorShiftLock.unlock()
             restartLock.unlock()
+            replacedReader?.close()   // a reader an earlier restart vended; its demuxer was retired above
+            newProd.onVideoGateOpened = { [weak self] in self?.seekPhaseLog.noteKeyframe(phaseID) }
             newProd.start()
         } catch {
             restartLock.unlock()
+            replacedReader?.close()
             EngineLog.emit(
                 "[HLSVideoEngine] restart at idx=\(idx) failed: \(error)",
                 category: .session

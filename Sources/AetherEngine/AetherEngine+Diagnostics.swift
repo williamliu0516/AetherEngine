@@ -543,6 +543,13 @@ extension AetherEngine {
         nativeVideoSession?.segmentCacheDiskBytes
     }
 
+    /// W3147: the native session's last few producer restarts (a seek past what was produced), each split into its
+    /// steps, oldest first. Empty with no native session or before any restart; a new session starts empty. A host
+    /// times its seek from `ProcessInfo.systemUptime` and keeps the restarts whose `began` is not earlier.
+    public var seekRestartPhases: [SeekRestartPhases] {
+        nativeVideoSession?.seekPhaseLog.snapshot ?? []
+    }
+
     /// Frames the SW host enqueued into AVSampleBufferDisplayLayer. Zero on native path or pre-start.
     ///
     /// #288: the software-path answer to "is there a picture, or is this audio into a black view".

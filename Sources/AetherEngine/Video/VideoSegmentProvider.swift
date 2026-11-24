@@ -843,6 +843,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// bytes never reached AVPlayer, that it went undelivered: the engine re-seeks on it instead of waiting out its
     /// seek deadline (`AetherEngine.restartServedSegment`). Set once by the session.
     var restartServedHandler: (@Sendable (_ start: Double, _ end: Double, _ event: RestartServedEvent) -> Void)?
+    /// W3147: a segment is handed to the player (any index, VOD and live), for the session's seek steps.
+    var sourceServedHandler: (@Sendable (_ index: Int) -> Void)?
     /// The last segment `restartServedHandler` was told about, so its delivery can be reported too.
     private var restartServedIndex: Int?
     /// Base index of the active producer (#93 residual): a fetch for an index within the
@@ -2102,6 +2104,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
 
     private func logServed(index: Int, source: SegmentSource?, totalStart: DispatchTime,
                            restarted: Bool) -> SegmentSource? {
+        if source != nil { sourceServedHandler?(index) }
         // VOD only (live fires no restarts), whose plan never changes, so the window is read as it stands.
         if restarted, source != nil, !isLive, let served = restartServedHandler, index >= 0, index < segments.count {
             stateLock.lock(); restartServedIndex = index; stateLock.unlock()

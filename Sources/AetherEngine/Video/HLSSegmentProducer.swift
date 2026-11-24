@@ -999,6 +999,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         packetCounterLock.lock()
         _videoGateOpened = true
         packetCounterLock.unlock()
+        onVideoGateOpened?()
     }
     private func notePregateDroppedKeyframe(pts: Int64) {
         packetCounterLock.lock()
@@ -1286,6 +1287,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     /// Fires once per producer when HDR10+ T.35 SEI prefix (B5 00 3C 00 01 04) first appears in a video packet.
     var onFirstHDR10PlusDetected: (@Sendable () -> Void)?
+    /// W3147: the scan-forward gate took its first video keyframe (pump thread); set before `start()`.
+    var onVideoGateOpened: (@Sendable () -> Void)?
 
     /// #260: resolves the host's per-frame time observer at emission rather than holding it, so a host that
     /// installs one mid-session reaches the running producer without a data race on a stored closure. Set
