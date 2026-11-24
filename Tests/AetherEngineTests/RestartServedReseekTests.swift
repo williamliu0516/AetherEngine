@@ -25,7 +25,9 @@ struct RestartServedUndeliveredTests {
 
     @Test("only a failed send of the segment the restart served counts")
     func event() {
-        let event = VideoSegmentProvider.restartServedEvent
+        let event = { (index: Int, restartServed: Int?, delivered: Bool) in
+            VideoSegmentProvider.restartServedEvent(index: index, restartServedIndex: restartServed, delivered: delivered)
+        }
         #expect(event(1921, 1921, false) == .undelivered)
         #expect(event(1921, 1921, true) == nil, "delivered: AVPlayer may still land from it")
         #expect(event(1922, 1921, false) == nil, "another segment says nothing about the target")
