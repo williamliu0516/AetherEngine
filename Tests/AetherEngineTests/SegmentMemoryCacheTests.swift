@@ -264,4 +264,104 @@ struct SegmentMemoryCacheTests {
         cache.abandonInProgress(index: 2)
         #expect(reader.next() == .abandoned)
     }
+
+    // MARK: - In-progress memory (W3169)
+
+    @Test("a segment being written into memory counts against B though nobody serves it progressively")
+    func unservedSegmentBeingWrittenCounts() throws {
+        let cache = makeCache(capBytes: 16 * Self.mib)
+        defer { cache.close() }
+        #expect(try produce(cache, 0, bytes: Self.mib))
+        do {
+            // The producer writes segment 1 with progressive serving off: no `beginInProgress`.
+            let writing = try #require(cache.memorySegment(forIndex: 1))
+            let part = Data(repeating: 1, count: 15 * Self.mib)
+            #expect(part.withUnsafeBytes { writing.append($0.baseAddress!, count: $0.count) })
+            #expect(cache.memoryBytes().counted == 16 * Self.mib)
+            #expect(cache.memorySegment(forIndex: 2) == nil,
+                    "16 MiB counted plus the last segment's 1 MiB does not fit a 16 MiB B")
+            withExtendedLifetime(writing) {}
+        }
+        // A restart dropped the unadopted buffer: it no longer counts.
+        #expect(cache.memoryBytes().counted == Self.mib)
+    }
+
+    // MARK: - Serving (review L1)
+
+    private func makeProvider(_ cache: SegmentCache) -> VideoSegmentProvider {
+        let segments = (0..<6).map { i in
+            HLSVideoEngine.Segment(startPts: Int64(i) * 4000, endPts: Int64(i + 1) * 4000,
+                                   startSeconds: Double(i) * 4.0, durationSeconds: 4.0)
+        }
+        return VideoSegmentProvider(
+            cache: cache, segments: segments, codecsString: "hvc1", supplementalCodecs: nil,
+            resolution: (1920, 1080), videoRange: .sdr, frameRate: 24.0, hdcpLevel: nil,
+            sourceBitrate: 8_000_000, isLive: false)
+    }
+
+    @Test("a memory segment served the way the server asks counts one request and declares one target")
+    func memoryServeCountsOnce() throws {
+        let cache = makeCache(capBytes: 64 * Self.mib)
+        defer { cache.close() }
+        let provider = makeProvider(cache)
+        for i in 0..<3 { #expect(try produce(cache, i, bytes: 64 << 10)) }
+        // HLSLocalServer: the sendfile fast path first, then the data path on its nil.
+        #expect(provider.mediaSegmentURL(at: 2) == nil)
+        guard case .data(let served)? = provider.mediaSegmentSource(at: 2, onSlow: nil) else {
+            Issue.record("a memory segment is served as data"); return
+        }
+        #expect(served == payload(2, 64 << 10))
+        #expect(provider.mediaFetchCount == 1)
+        #expect(cache.targetIndex == 2)
+
+        // A file segment is answered by the fast path alone, and counted there once.
+        cache.store(index: 3, data: payload(3, 1000))
+        #expect(provider.mediaSegmentURL(at: 3) != nil)
+        #expect(provider.mediaFetchCount == 2)
+    }
+
+    // MARK: - Scrub thumbnails (review M5)
+
+    private func thumbnailSource(_ provider: VideoSegmentProvider, atSeconds seconds: Double,
+                                 initData: Data) -> HLSVideoEngine.ScrubThumbnailSource? {
+        guard let seg = provider.thumbnailSegment(atSeconds: seconds),
+              let identity = HLSVideoEngine.scrubThumbnailIdentity(index: seg.index, stored: seg.stored,
+                                                                   initData: initData) else { return nil }
+        return HLSVideoEngine.ScrubThumbnailSource(
+            segmentIndex: seg.index, startSeconds: seg.startSeconds, durationSeconds: seg.durationSeconds,
+            carriedOffset: 0, identity: identity, initData: initData, segment: seg.stored)
+    }
+
+    @Test("a scrub over a memory segment decodes from its bytes: no file written, one identity until it is made again")
+    func scrubThumbnailFromMemory() throws {
+        let cache = makeCache(capBytes: 64 * Self.mib)
+        defer { cache.close() }
+        let provider = makeProvider(cache)
+        for i in 0..<4 { #expect(try produce(cache, i, bytes: 64 << 10)) }
+        let written = cache.bytesWrittenToDisk
+        let filesBefore = try FileManager.default.contentsOfDirectory(atPath: cache.sessionDir.path).sorted()
+        let initData = Data([1, 2, 3, 4])
+
+        let source = try #require(thumbnailSource(provider, atSeconds: 9, initData: initData),
+                                  "a scrub over the memory lead finds its segment")
+        #expect(source.segmentIndex == 2)
+        let reader = try #require(source.makeReader())
+        var read = Data()
+        var chunk = [UInt8](repeating: 0, count: 8192)
+        while true {
+            let n = chunk.withUnsafeMutableBufferPointer { reader.read($0.baseAddress, size: 8192) }
+            if n <= 0 { break }
+            read.append(contentsOf: chunk[0..<Int(n)])
+        }
+        #expect(read == initData + payload(2, 64 << 10))
+        let again = try #require(thumbnailSource(provider, atSeconds: 10, initData: initData))
+        #expect(again.identity == source.identity, "a second sample of the same segment is an extractor hit")
+        #expect(cache.bytesWrittenToDisk == written)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: cache.sessionDir.path).sorted() == filesBefore)
+
+        // The same index made again (a restart's re-cut) is other bytes, so another extractor.
+        #expect(try produce(cache, 2, bytes: 64 << 10))
+        let remade = try #require(thumbnailSource(provider, atSeconds: 9, initData: initData))
+        #expect(remade.identity != source.identity)
+    }
 }
