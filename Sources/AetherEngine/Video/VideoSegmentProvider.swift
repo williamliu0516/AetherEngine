@@ -1486,7 +1486,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         stateLock.unlock()
         guard let idx = Self.thumbnailSegmentIndex(atSeconds: seconds, segments: segs) else { return nil }
         // A file or a memory segment (W3169, review M5): a scrub over the memory lead decodes from it too.
-        guard let stored = cache.storedSegment(index: idx) else { return nil }
+        guard let stored = cache.storedSegmentForScrub(index: idx) else { return nil }
         return (idx, segs[idx].startSeconds, segs[idx].durationSeconds, stored)
     }
 

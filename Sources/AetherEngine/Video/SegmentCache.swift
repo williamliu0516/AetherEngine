@@ -92,8 +92,14 @@ final class SegmentCache: @unchecked Sendable {
     /// segment being written counts against B whether or not it is served progressively
     /// (`inProgress` only lists the served ones); a buffer the producer drops unadopted (a restart, a
     /// teardown) stops counting once nothing holds it.
-    private struct WritingBuffer { weak var buffer: SegmentMemoryBuffer? }
-    private var writingMemory: [UInt64: WritingBuffer] = [:]
+    private struct WeakBuffer { weak var buffer: SegmentMemoryBuffer? }
+    private var writingMemory: [UInt64: WeakBuffer] = [:]
+    /// Memory segments a scrub resolved, by buffer id, held weakly (W3171 M2): an extractor's reader
+    /// pins the bytes for as long as it lives, wherever the entry goes, so a lasting pin counts against
+    /// B unless the entry is counted already.
+    private var scrubBuffers: [UInt64: WeakBuffer] = [:]
+    /// The slow re-read of B while the cache holds memory (W3171 L2).
+    private var memoryRefreshTimer: DispatchSourceTimer?
     private var spillScheduled = false
     private var memoryPressureSource: DispatchSourceMemoryPressure?
     private let spillQueue = DispatchQueue(label: "com.aetherengine.segmentcache.spill", qos: .utility)
@@ -230,11 +236,21 @@ final class SegmentCache: @unchecked Sendable {
             source.setEventHandler { [weak self] in self?.noteMemoryPressure() }
             source.resume()
             memoryPressureSource = source
+            // A paused session opens no segment and moves no target, so B also follows the process on
+            // a slow timer while memory is held (W3171 L2).
+            let seconds = self.memoryBudget?.refreshSeconds ?? 2
+            let timer = DispatchSource.makeTimerSource(queue: spillQueue)
+            timer.schedule(deadline: .now() + seconds, repeating: seconds,
+                           leeway: .milliseconds(max(1, Int(seconds * 250))))
+            timer.setEventHandler { [weak self] in self?.refreshMemoryBudget() }
+            timer.resume()
+            memoryRefreshTimer = timer
         }
     }
 
     deinit {
         memoryPressureSource?.cancel()
+        memoryRefreshTimer?.cancel()
         nativeLiveExpiryTimer?.cancel()
         releaseLiveMarker()
     }
@@ -523,10 +539,14 @@ final class SegmentCache: @unchecked Sendable {
         paceSteps.removeAll()
         let pressureSource = memoryPressureSource
         memoryPressureSource = nil
+        let refreshTimer = memoryRefreshTimer
+        memoryRefreshTimer = nil
+        scrubBuffers.removeAll()
         condition.broadcast()
         condition.unlock()
 
         pressureSource?.cancel()
+        refreshTimer?.cancel()
         expiryTimer?.cancel()
         releaseLiveMarker()
         Self.discardQueue.async { try? FileManager.default.removeItem(at: dir) }
@@ -601,6 +621,19 @@ final class SegmentCache: @unchecked Sendable {
                 dropVanishedEntry(index: index, key: stored.key, purged: true)
                 return nil
             }
+        }
+        return stored
+    }
+
+    /// `storedSegment` for a scrub extractor, which pins a memory segment's bytes for as long as it
+    /// keeps its reader (`pinnedData(lasting: true)`): the buffer is remembered so the pin counts
+    /// against B (W3171 M2).
+    func storedSegmentForScrub(index: Int) -> StagedSegment? {
+        let stored = storedSegment(index: index)
+        if case .memory(let buffer)? = stored {
+            condition.lock()
+            scrubBuffers[buffer.id] = WeakBuffer(buffer: buffer)
+            condition.unlock()
         }
         return stored
     }
@@ -882,7 +915,7 @@ final class SegmentCache: @unchecked Sendable {
         var buffer: SegmentMemoryBuffer?
         if !state.holdNew, state.counted + estimate <= state.budget {
             let admitted = SegmentMemoryBuffer(expectedBytes: estimate)
-            writingMemory[admitted.id] = WritingBuffer(buffer: admitted)
+            writingMemory[admitted.id] = WeakBuffer(buffer: admitted)
             buffer = admitted
         }
         condition.unlock()
@@ -917,6 +950,23 @@ final class SegmentCache: @unchecked Sendable {
         finishRebalance(state)
     }
 
+    /// The slow re-read of B (W3171 L2): while memory is held, nothing may open a segment or move the
+    /// target (a paused session), so the process's available memory is followed here too. Runs on
+    /// `spillQueue` every `refreshSeconds`; tests call it directly or shorten the interval.
+    func refreshMemoryBudget() {
+        condition.lock()
+        let holdsMemory = !writingMemory.isEmpty || !scrubBuffers.isEmpty
+            || entries.values.contains { if case .memory = $0 { return true } else { return false } }
+        guard memoryBudget != nil, !closed, holdsMemory else {
+            condition.unlock()
+            return
+        }
+        let state = rebalanceMemoryLocked()
+        condition.unlock()
+        finishRebalance(state)
+        if state.droppedEntries { onResidentSetChanged?() }
+    }
+
     /// What one rebalance found: the counted memory after it, B, the goal a shrink aims for, whether
     /// new segments are held back from memory, and whether entries were dropped or a spill is needed.
     struct MemoryRebalance {
@@ -931,7 +981,11 @@ final class SegmentCache: @unchecked Sendable {
     /// Must be called with condition held. Sets each memory segment's volatility from its place
     /// relative to the target, drops the ones the kernel emptied, caps the volatile history at B, and
     /// when the counted memory exceeds the goal makes the band behind the target volatile too.
-    /// Spilling is left to `finishRebalance`, off the lock.
+    /// A volatile segment the lead now spans (a back-seek into history, a band a shrink let go) is
+    /// reclaimed nearest-first, ahead of the target before behind it, only while the counted memory
+    /// stays within the goal (W3171 M1): the rest stays volatile, where a purge is the remake path.
+    /// So a reclaim never asks for a spill; only counted segments are spilled, by `finishRebalance`,
+    /// off the lock. Scrub-pinned bytes outside the counted lead count too (W3171 M2).
     private func rebalanceMemoryLocked() -> MemoryRebalance {
         var state = MemoryRebalance()
         guard let budget = memoryBudget else { return state }
@@ -939,7 +993,9 @@ final class SegmentCache: @unchecked Sendable {
         let lo = target - Self.memoryKeepBehind
         let hi = max(target + forwardWindow, _highestStoredIndex)
         var counted = inProgressMemoryBytesLocked()
+        var countedIDs = Set<UInt64>()
         var behindBand: [(index: Int, buffer: SegmentMemoryBuffer, bytes: Int)] = []
+        var reclaimable: [(index: Int, buffer: SegmentMemoryBuffer, bytes: Int)] = []
         var history: [(index: Int, bytes: Int)] = []
         var purged: [Int] = []
         for (k, stored) in entries {
@@ -947,27 +1003,48 @@ final class SegmentCache: @unchecked Sendable {
             let bytes = entryBytes[k] ?? 0
             // Before the consumer's first fetch everything stored is the lead it will ask for.
             let inLead = target < 0 || (k >= lo && k <= hi)
-            if inLead {
+            if inLead, !buffer.isWantedVolatile {
                 if buffer.setWantsVolatile(false) {
                     counted += bytes
+                    countedIDs.insert(buffer.id)
                     if target >= 0, k < target { behindBand.append((k, buffer, bytes)) }
                 } else {
                     purged.append(k)
                 }
             } else {
-                buffer.setWantsVolatile(true)
-                if buffer.isEmptied { purged.append(k) } else { history.append((k, bytes)) }
+                if !inLead { buffer.setWantsVolatile(true) }
+                if buffer.isEmptied {
+                    purged.append(k)
+                } else if inLead {
+                    reclaimable.append((k, buffer, bytes))
+                } else {
+                    history.append((k, bytes))
+                }
             }
         }
+        counted += scrubPinnedBytesLocked(excluding: countedIDs)
         state.budget = budget.bytes(heldBytes: counted)
         let recentPressure = lastPressureAt.map { budget.now() - $0 < budget.pressureHoldSeconds } ?? false
         state.holdNew = recentPressure || budget.isCritical
         state.goal = state.holdNew ? state.budget / 2 : state.budget
         if counted > state.goal {
-            // Free without a write first: the handover cushion behind the target.
+            // Free without a write first: the handover cushion behind the target. A scrub pin keeps
+            // its bytes, so they stay counted.
             for item in behindBand.sorted(by: { $0.index < $1.index }) where counted > state.goal {
                 item.buffer.setWantsVolatile(true)
-                counted -= item.bytes
+                if !item.buffer.hasLastingPin { counted -= item.bytes }
+                history.append((item.index, item.bytes))
+            }
+        }
+        var full = false
+        for item in reclaimable.sorted(by: { ($0.index < target ? 1 : 0, abs($0.index - target))
+                                             < ($1.index < target ? 1 : 0, abs($1.index - target)) }) {
+            // A scrub-pinned segment's bytes are counted already.
+            let cost = item.buffer.hasLastingPin ? 0 : item.bytes
+            if !full, counted + cost <= state.goal {
+                if item.buffer.setWantsVolatile(false) { counted += cost } else { purged.append(item.index) }
+            } else {
+                full = true
                 history.append((item.index, item.bytes))
             }
         }
@@ -986,6 +1063,20 @@ final class SegmentCache: @unchecked Sendable {
             state.droppedEntries = true
         }
         return state
+    }
+
+    /// Must be called with condition held. Bytes a scrub extractor's reader pins outside the counted
+    /// lead (W3171 M2); a buffer nothing holds any more is forgotten.
+    private func scrubPinnedBytesLocked(excluding countedIDs: Set<UInt64>) -> Int {
+        var bytes = 0
+        for (id, scrub) in scrubBuffers {
+            guard let buffer = scrub.buffer else {
+                scrubBuffers.removeValue(forKey: id)
+                continue
+            }
+            if buffer.hasLastingPin, !countedIDs.contains(id) { bytes += buffer.length }
+        }
+        return bytes
     }
 
     /// Must be called with condition held. The segments being written into memory (L2), served
@@ -1020,7 +1111,9 @@ final class SegmentCache: @unchecked Sendable {
         var victims: [(index: Int, buffer: SegmentMemoryBuffer)] = []
         if over > 0 {
             for k in entries.keys.sorted(by: >) where over > 0 {
-                guard case .memory(let buffer) = entries[k], !buffer.isVolatile else { continue }
+                // Counted segments only; a scrub-pinned one frees nothing when written (W3171 M1, M2).
+                guard case .memory(let buffer) = entries[k], !buffer.isWantedVolatile,
+                      !buffer.hasLastingPin else { continue }
                 victims.append((k, buffer))
                 over -= entryBytes[k] ?? 0
             }
@@ -1473,7 +1566,10 @@ final class SegmentCache: @unchecked Sendable {
         if retentionBudgetBytes > 0 {
             var extras: [(index: Int, bytes: Int)] = []
             var keptBytes = 0
-            for (k, _) in entries {
+            for (k, stored) in entries {
+                // A disk budget: memory segments are not billed or pruned here, the rebalance caps
+                // their history at B (W3171 L3).
+                if case .memory = stored { continue }
                 let bytes = entryBytes[k] ?? 0
                 if k < lo || k > hi {
                     extras.append((k, bytes))

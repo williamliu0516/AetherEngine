@@ -22,6 +22,8 @@ final class SegmentMemoryBuffer: @unchecked Sendable {
     private var region: PurgeableRegion?
     private var _length = 0
     private var pins = 0
+    /// Pins held for as long as a scrub extractor keeps its reader (W3171 M2), counted against B.
+    private var lastingPins = 0
     private var wantsVolatile = false
     private var emptied = false
 
@@ -82,13 +84,16 @@ final class SegmentMemoryBuffer: @unchecked Sendable {
 
     /// The whole segment as a no-copy `Data` that pins the region until it is released, or nil when the
     /// kernel emptied it. Only for a sealed segment: nothing may be appended while a pin is out.
-    func pinnedData() -> Data? {
+    /// `lasting`: held beyond one serve (a scrub extractor's reader), so the cache counts the bytes
+    /// against B wherever the entry has gone (W3171 M2).
+    func pinnedData(lasting: Bool = false) -> Data? {
         lock.lock(); defer { lock.unlock() }
         guard reclaimLocked() else { return nil }
         guard let region, _length > 0 else { return Data() }
         pins += 1
+        if lasting { lastingPins += 1 }
         return Data(bytesNoCopy: region.base, count: _length, deallocator: .custom { [self, region] _, _ in
-            withExtendedLifetime(region) { self.unpin() }
+            withExtendedLifetime(region) { self.unpin(lasting: lasting) }
         })
     }
 
@@ -112,6 +117,18 @@ final class SegmentMemoryBuffer: @unchecked Sendable {
         return emptied
     }
 
+    /// The cache's last wish (`setWantsVolatile`): false while the cache counts the segment as its lead.
+    var isWantedVolatile: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return wantsVolatile
+    }
+
+    /// Whether a lasting pin (a scrub extractor's reader) holds the bytes.
+    var hasLastingPin: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return lastingPins > 0
+    }
+
     /// Counted memory: true unless the region is volatile.
     var isVolatile: Bool {
         lock.lock(); defer { lock.unlock() }
@@ -131,9 +148,10 @@ final class SegmentMemoryBuffer: @unchecked Sendable {
 
     // MARK: - Private
 
-    private func unpin() {
+    private func unpin(lasting: Bool) {
         lock.lock(); defer { lock.unlock() }
         pins -= 1
+        if lasting { lastingPins -= 1 }
         settleLocked()
     }
 

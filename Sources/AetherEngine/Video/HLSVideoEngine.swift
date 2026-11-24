@@ -2835,7 +2835,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             let bytes: Data?
             switch segment {
             case .file(let url): bytes = try? Data(contentsOf: url, options: .alwaysMapped)
-            case .memory(let buffer): bytes = buffer.pinnedData()
+            case .memory(let buffer): bytes = buffer.pinnedData(lasting: true)
             }
             guard let bytes, !bytes.isEmpty else { return nil }
             return DataIOReader(parts: [initData, bytes])
