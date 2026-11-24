@@ -26,7 +26,7 @@ final class SegmentMemoryBuffer: @unchecked Sendable {
     private var emptied = false
 
     private static let idLock = NSLock()
-    private static var nextID: UInt64 = 0
+    nonisolated(unsafe) private static var nextID: UInt64 = 0 // guarded by idLock
 
     /// `expectedBytes` sizes the first region (the previous segment's size is a good guess); it grows
     /// by doubling past that.

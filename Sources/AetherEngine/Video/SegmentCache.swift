@@ -1036,6 +1036,11 @@ final class SegmentCache: @unchecked Sendable {
         }
     }
 
+    /// Waits for a scheduled spill to finish. Tests only.
+    func drainSpillsForTesting() {
+        spillQueue.sync {}
+    }
+
     func wakeWaiters() {
         condition.lock()
         condition.broadcast()
