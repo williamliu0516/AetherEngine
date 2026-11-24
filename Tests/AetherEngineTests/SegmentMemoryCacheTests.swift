@@ -27,9 +27,11 @@ struct SegmentMemoryCacheTests {
 
     /// `refreshSeconds`: the slow re-read of B (W3171 L2), off unless a test asks for it.
     private func makeCache(capBytes: Int, inputs: Inputs = Inputs(), retentionBytes: Int = 0,
-                           live: LiveDVRRetentionPolicy? = nil, refreshSeconds: Double = 3600) -> SegmentCache {
+                           live: LiveDVRRetentionPolicy? = nil, refreshSeconds: Double = 3600,
+                           zeroMeansNoLimit: Bool = false, hardFloorBytes: Int = 0) -> SegmentCache {
         let budget = SegmentMemoryBudget(availableMemory: { inputs.available }, capBytes: capBytes,
-                                         hardFloorBytes: 0, refreshSeconds: refreshSeconds, now: { inputs.now })
+                                         zeroMeansNoLimit: zeroMeansNoLimit, hardFloorBytes: hardFloorBytes,
+                                         refreshSeconds: refreshSeconds, now: { inputs.now })
         return SegmentCache(forwardWindow: 10, retentionBudgetBytes: retentionBytes,
                             baseDirectory: FileManager.default.temporaryDirectory
                                 .appendingPathComponent("segmem tests 片-\(UUID().uuidString)", isDirectory: true),
@@ -388,9 +390,11 @@ struct SegmentMemoryCacheTests {
         #expect(cache.bytesWrittenToDisk == 0)
         #expect(cache.spilledSegments == 0)
         #expect(segmentFiles(cache).isEmpty)
-        // B - 20 MiB = 10 MiB reclaimed nearest-first, ahead of the target first: 5...14.
-        for i in 5...14 { #expect(buffer(cache, i)?.isVolatile == false, "seg \(i) reclaimed") }
-        for i in [0, 4, 15, 19] { #expect(buffer(cache, i)?.isVolatile == true, "seg \(i) left volatile") }
+        // B - 20 MiB = 10 MiB reclaimed nearest-first, ahead of the target first: 5...14; 15, the
+        // last the player reads next, displaces the farthest of the old lead, 39 (W3173 D-M1).
+        for i in 5...15 { #expect(buffer(cache, i)?.isVolatile == false, "seg \(i) reclaimed") }
+        for i in [0, 4, 16, 19, 39] { #expect(buffer(cache, i)?.isVolatile == true, "seg \(i) left volatile") }
+        #expect(buffer(cache, 38)?.isVolatile == false)
         for i in 0..<40 { #expect(cache.peek(index: i) == payload(i, Self.mib)) }
     }
 
@@ -420,16 +424,57 @@ struct SegmentMemoryCacheTests {
         #expect(try produce(cache, 30, bytes: Self.mib), "the extractors let go: their bytes stop counting")
     }
 
-    @Test("os_proc_available_memory answering 0 is no per-process limit: B is the cap (W3171 L1)")
+    @Test("os_proc_available_memory answering 0 where there is no limit (simulator, Mac) is no limit: B is the cap (W3171 L1)")
     func zeroAvailableIsNoLimit() throws {
-        let budget = SegmentMemoryBudget(availableMemory: { 0 }, capBytes: 64 * Self.mib)
+        let budget = SegmentMemoryBudget(availableMemory: { 0 }, capBytes: 64 * Self.mib, zeroMeansNoLimit: true)
         #expect(budget.bytes(heldBytes: 0) == 64 * Self.mib)
         #expect(!budget.isCritical)
         let inputs = Inputs()
         inputs.available = 0
-        let cache = makeCache(capBytes: 16 * Self.mib, inputs: inputs)
+        let cache = makeCache(capBytes: 16 * Self.mib, inputs: inputs, zeroMeansNoLimit: true)
         defer { cache.close() }
         #expect(try produce(cache, 0, bytes: Self.mib))
+    }
+
+    @Test("on a device, os_proc_available_memory answering 0 is at the limit: critical, nothing to memory (W3173 D-L2)")
+    func zeroAvailableOnDeviceIsCritical() throws {
+        let budget = SegmentMemoryBudget(availableMemory: { 0 }, capBytes: 64 * Self.mib)
+        #expect(budget.isCritical)
+        #expect(budget.bytes(heldBytes: 0) == 0)
+        let inputs = Inputs()
+        inputs.available = 512 * Self.mib
+        let cache = makeCache(capBytes: 16 * Self.mib, inputs: inputs, hardFloorBytes: 256 * Self.mib)
+        defer { cache.close() }
+        for i in 0..<8 { #expect(try produce(cache, i, bytes: Self.mib)) }
+        inputs.available = 0
+        cache.declareTarget(0)
+        cache.drainSpillsForTesting()
+        #expect(!(try produce(cache, 8, bytes: Self.mib)), "a segment at the limit goes to a file")
+        #expect(cache.memoryBytes().counted <= 4 * Self.mib, "what is held shrinks to B / 2 or less")
+        for i in 0...8 { #expect(cache.peek(index: i) == payload(i, Self.mib)) }
+    }
+
+    @Test("a back-seek with the lead at B counts what the player reads next and lets the far lead go: nothing written (W3173 D-M1)")
+    func backSeekDisplacesFarLead() throws {
+        let cache = makeCache(capBytes: 20 * Self.mib, retentionBytes: 1 << 30)
+        defer { cache.close() }
+        for i in 0..<20 { #expect(try produce(cache, i, bytes: Self.mib)) }
+        cache.declareTarget(20)
+        for i in 20..<30 { #expect(try produce(cache, i, bytes: Self.mib)) }
+        cache.declareTarget(30)
+        for i in 30..<40 { #expect(try produce(cache, i, bytes: Self.mib)) }
+        // The lead (20...39) fills B; 0...19 are volatile history.
+        #expect(cache.memoryBytes().counted == 20 * Self.mib)
+
+        cache.declareTarget(10)
+        cache.drainSpillsForTesting()
+        for i in 10...20 { #expect(buffer(cache, i)?.isVolatile == false, "seg \(i) is read next: counted") }
+        for i in 31...39 { #expect(buffer(cache, i)?.isVolatile == true, "seg \(i), the far lead, let go") }
+        #expect(cache.memoryBytes().counted <= 20 * Self.mib)
+        #expect(cache.bytesWrittenToDisk == 0)
+        #expect(cache.spilledSegments == 0)
+        #expect(segmentFiles(cache).isEmpty)
+        for i in 0..<40 { #expect(cache.peek(index: i) == payload(i, Self.mib)) }
     }
 
     @Test("with nothing opened and the target still, B follows available memory on the slow timer (W3171 L2)")
